@@ -1,0 +1,288 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ubersdr-ntp</title>
+<style>
+:root {
+  --bg:#f7f7f6; --panel:#fff; --ink:#1b1b1a; --muted:#6b6b68; --line:#e3e3e0;
+  --ok:#1a7f4b; --warn:#a06000; --bad:#b3261e; --accent:#2d5f8a; --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg:#15161a; --panel:#1e2025; --ink:#e9e9e7; --muted:#9b9b97; --line:#2e3138;
+          --ok:#4cc38a; --warn:#e0a83c; --bad:#f0736a; --accent:#82b6e4; }
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink);
+  font:14px/1.55 ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,sans-serif; }
+.wrap { max-width:1180px; margin:0 auto; padding-block:22px 52px; padding-inline:16px; }
+header { display:flex; flex-wrap:wrap; align-items:baseline; gap:10px 14px; margin-bottom:4px; }
+h1 { font-size:17px; margin:0; letter-spacing:-.01em; }
+h1 span { color:var(--muted); font-weight:400; }
+.sub { color:var(--muted); font-size:12px; margin-bottom:20px; }
+.card { background:var(--panel); border:1px solid var(--line); border-radius:9px;
+  padding:16px; margin-bottom:14px; }
+.label { color:var(--muted); font-size:11px; text-transform:uppercase;
+  letter-spacing:.07em; font-weight:600; }
+
+/* the clock: the one thing worth being large, because it is the product */
+.clock { display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px 26px; }
+.now { font:600 clamp(34px,9vw,58px)/1 var(--mono); letter-spacing:-.02em;
+  font-variant-numeric:tabular-nums; }
+.now .frac { color:var(--muted); font-size:.45em; }
+.date { color:var(--muted); font-size:13px; padding-bottom:6px; }
+.tickdot { width:9px; height:9px; border-radius:50%; background:var(--ok);
+  transition:opacity .12s; opacity:.25; margin-bottom:14px; }
+.tickdot.on { opacity:1; }
+
+.grid { display:grid; gap:18px 34px; margin-top:16px;
+  grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); }
+.figure { font:600 22px/1.15 var(--mono); font-variant-numeric:tabular-nums;
+  letter-spacing:-.01em; margin-top:2px; }
+.note { color:var(--muted); font-size:12px; }
+.pill { display:inline-block; padding:2px 9px; border-radius:99px; font-size:11px;
+  font-weight:600; text-transform:uppercase; letter-spacing:.05em; white-space:nowrap; }
+.ok   { background:color-mix(in srgb,var(--ok) 16%,transparent);   color:var(--ok); }
+.warn { background:color-mix(in srgb,var(--warn) 20%,transparent); color:var(--warn); }
+.bad  { background:color-mix(in srgb,var(--bad) 16%,transparent);  color:var(--bad); }
+.dim  { background:color-mix(in srgb,var(--muted) 16%,transparent); color:var(--muted); }
+
+.scroll { overflow-x:auto; }
+table { width:100%; border-collapse:collapse; font-size:13px; }
+th { text-align:left; font-size:11px; text-transform:uppercase; letter-spacing:.05em;
+  color:var(--muted); font-weight:600; padding:0 12px 8px 0; white-space:nowrap; }
+td { padding:8px 12px 8px 0; border-top:1px solid var(--line); white-space:nowrap;
+  vertical-align:baseline; }
+td:last-child, th:last-child { padding-right:0; }
+.n { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; }
+.name { font-weight:600; }
+.name .used { color:var(--accent); font-weight:400; font-size:11px; }
+.bar { height:5px; border-radius:3px; background:var(--line); overflow:hidden; min-width:56px; }
+.bar i { display:block; height:100%; background:var(--accent); transition:width .4s; }
+.kv td:first-child { color:var(--muted); width:132px; }
+.kv td:last-child { white-space:normal; }
+.foot { color:var(--muted); font-size:12px; margin-top:20px; }
+.foot code { font-family:var(--mono); }
+a { color:var(--accent); }
+.offline { background:color-mix(in srgb,var(--bad) 12%,transparent);
+  border-color:color-mix(in srgb,var(--bad) 35%,transparent); }
+</style>
+
+<div class="wrap">
+  <header>
+    <h1>ubersdr-ntp <span id="ver"></span></h1>
+    <span id="linkpill" class="pill dim">connecting</span>
+  </header>
+  <div class="sub" id="sub">waiting for the event stream&hellip;</div>
+
+  <div class="card" id="clockcard">
+    <div class="label">Broadcast time (UTC)</div>
+    <div class="clock">
+      <div class="now" id="now">--:--:--</div>
+      <div class="tickdot" id="dot"></div>
+      <div class="date" id="date"></div>
+    </div>
+    <div class="grid">
+      <div><div class="label">Status</div><div id="syncpill" style="margin-top:6px"></div>
+        <div class="note" id="syncnote"></div></div>
+      <div><div class="label">Clock offset</div><div class="figure" id="offset">—</div>
+        <div class="note">correction to this host</div></div>
+      <div><div class="label">Root dispersion</div><div class="figure" id="disp">—</div>
+        <div class="note">how far out that could be</div></div>
+      <div><div class="label">Sources</div><div class="figure" id="srccount">—</div>
+        <div class="note" id="srcnames">&nbsp;</div></div>
+      <div><div class="label">Reference age</div><div class="figure" id="refage">—</div>
+        <div class="note">since the newest fix</div></div>
+      <div><div class="label">NTP requests</div><div class="figure" id="ntpreq">—</div>
+        <div class="note" id="ntpnote">&nbsp;</div></div>
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="label" style="margin-bottom:12px">Sources</div>
+    <div class="scroll"><table><thead><tr>
+      <th>Source</th><th>Link</th><th>Station</th><th>Stage</th>
+      <th class="n">Tick</th><th>Vote</th><th class="n">Qual</th>
+      <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">n</th>
+    </tr></thead><tbody id="rows"></tbody></table></div>
+  </div>
+
+  <div id="detail"></div>
+
+  <div class="foot">
+    <code><a href="/api/events">/api/events</a></code> one event per corrected second &middot;
+    <code><a href="/api/time">/api/time</a></code> the time &middot;
+    <code><a href="/api/status">/api/status</a></code> everything &middot;
+    <code><a href="/api/sources">/api/sources</a></code> &middot;
+    <code><a href="/api/health">/api/health</a></code>
+  </div>
+</div>
+
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s == null ? "" : s)
+  .replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
+
+const ms = (v, p = 1) => (v == null || !isFinite(v)) ? "—" : v.toFixed(p) + " ms";
+// A sign always: "34 ms slow" and "34 ms fast" are opposite faults, and the
+// sign is the half that says which. A true minus, because these sit in a
+// column and a hyphen does not line up.
+const signed = (v) => (v == null || !isFinite(v))
+  ? "—" : (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1) + " ms";
+function dur(s) {
+  if (s == null || !isFinite(s) || s >= 1e8) return "never";
+  if (s < 90) return s.toFixed(0) + "s";
+  if (s < 5400) return (s / 60).toFixed(0) + "m";
+  if (s < 172800) return (s / 3600).toFixed(1) + "h";
+  return (s / 86400).toFixed(1) + "d";
+}
+function stageTone(stage, state) {
+  if (state === "locked") return "ok";
+  if (stage === "no audio" || stage === "no tick") return "bad";
+  return "warn";
+}
+// Where a clock stops being interesting and starts being wrong.
+const dispTone = (d) => d == null ? "dim" : (d < 50 ? "ok" : (d < 250 ? "warn" : "bad"));
+
+// The local clock is used only to advance the display BETWEEN ticks — an
+// interval of at most one second, never an absolute reading. The instant always
+// comes from the stream, so a host clock that is hours wrong still shows the
+// right time here.
+let tickAt = 0, tickUnix = 0, haveTick = false;
+
+function paintClock() {
+  if (!haveTick) return;
+  const t = (tickUnix + (performance.now() - tickAt) / 1000) * 1000;
+  const d = new Date(t);
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  $("now").innerHTML = p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" +
+    p(d.getUTCSeconds()) + '<span class="frac">.' + p(d.getUTCMilliseconds(), 3) + "</span>";
+  $("date").textContent = d.toLocaleDateString("en-GB",
+    { timeZone: "UTC", weekday: "short", day: "numeric", month: "short", year: "numeric" });
+  requestAnimationFrame(paintClock);
+}
+
+function onTick(d) {
+  tickUnix = d.unix; tickAt = performance.now();
+  if (!haveTick) { haveTick = true; requestAnimationFrame(paintClock); }
+
+  const dot = $("dot");
+  dot.classList.add("on");
+  setTimeout(() => dot.classList.remove("on"), 140);
+
+  $("ver").textContent = "v" + (d.version || "");
+  $("sub").textContent = "up " + dur(d.uptime_seconds) + " · NTP on port " + d.ntp.port +
+    " · " + d.sources_locked + " of " + d.sources_total + " sources locked";
+
+  const tone = d.synchronised ? dispTone(d.dispersion_ms) : "bad";
+  $("syncpill").innerHTML = '<span class="pill ' + tone + '">' +
+    (d.synchronised ? "stratum 1 · " + esc(d.refid) : "unsynchronised") + "</span>" +
+    (d.leap_pending ? ' <span class="pill warn">leap pending</span>' : "");
+  $("syncnote").textContent = d.note || "";
+  $("clockcard").classList.toggle("offline", !d.synchronised);
+
+  $("offset").textContent = signed(d.offset_ms);
+  $("disp").textContent = ms(d.dispersion_ms);
+  $("srccount").textContent = d.sources_used + " / " + d.sources_candidate;
+  $("srcnames").textContent = (d.used_names && d.used_names.length)
+    ? d.used_names.join(", ") : "none in use";
+  $("refage").textContent = dur(d.reference_age_seconds);
+  $("ntpreq").textContent = d.ntp.requests.toLocaleString();
+  $("ntpnote").textContent = d.ntp.answered.toLocaleString() + " answered, " +
+    d.ntp.ignored.toLocaleString() + " ignored";
+
+  $("rows").innerHTML = d.sources.map((s) => {
+    const stage = s.state === "locked" ? "locked"
+      : s.link !== "streaming" ? "no audio"
+      : !s.tone_detected ? "no tick"
+      : !s.phase_locked ? "no edge"
+      : !s.anchored ? "no frame"
+      : s.refusal !== "none" ? s.refusal
+      : s.frames_in_window < 2 ? "voting" : "waiting";
+    const votePct = s.window_size ? 100 * s.frames_in_window / s.window_size : 0;
+    return "<tr>" +
+      '<td class="name">' + esc(s.name) +
+        (s.in_use ? ' <span class="used">in use</span>' : "") + "</td>" +
+      '<td><span class="pill ' + (s.link === "streaming" ? "ok" : "bad") + '">' +
+        esc(s.link) + "</span></td>" +
+      "<td>" + esc(s.station === "unknown" ? "—" : s.station.toUpperCase()) + "</td>" +
+      '<td><span class="pill ' + stageTone(stage, s.state) + '">' + esc(stage) + "</span></td>" +
+      '<td class="n">' + (s.tone_detected ? s.tone_snr_db.toFixed(1) + " dB" : "—") + "</td>" +
+      '<td><div class="bar" title="' + s.frames_in_window + " of " + s.window_size +
+        ' frames voted"><i style="width:' + votePct + '%"></i></div></td>' +
+      '<td class="n">' + (s.last_quality ? s.last_quality + "%" : "—") + "</td>" +
+      '<td class="n">' + (s.have_offset ? signed(s.offset_ms) : "—") + "</td>" +
+      '<td class="n">' + (s.have_offset ? ms(s.dispersion_ms) : "—") + "</td>" +
+      '<td class="n">' + s.samples + "</td></tr>";
+  }).join("");
+}
+
+function onStatus(d) {
+  $("detail").innerHTML = d.sources.map((x) => {
+    const dec = x.decoder, t = x.timing, dl = x.delay, sc = x.sample_clock,
+          l = x.link, a = x.audio;
+    const rows = [
+      ["Receiver", esc(x.receiver_name || "(unnamed)") + " — " + esc(x.url)],
+      ["Tuning", (x.dial_hz / 1e6).toFixed(6) + " MHz dial for the " +
+        (x.carrier_hz / 1e6).toFixed(3) + " MHz carrier, USB 0–3 kHz, " + esc(x.format) +
+        (a.sample_rate ? " at " + a.sample_rate + " Hz" : "")],
+      ["Link", esc(l.state) + (l.detail ? " (" + esc(l.detail) + ")" : "") +
+        " for " + dur(l.age_seconds) + ", audio " + dur(l.last_audio_age_seconds) + " ago, " +
+        l.packets.toLocaleString() + " packets, " + (l.audio_bytes / 1048576).toFixed(1) +
+        " MiB, " + l.decode_errors + " decode errors, HTTP RTT " + ms(l.http_rtt_ms, 0)],
+      ["Signal", a.snr_db != null
+        ? a.baseband_power_dbfs.toFixed(1) + " dBFS baseband, noise " +
+          a.noise_dbfs.toFixed(1) + " dBFS, SNR " + a.snr_db.toFixed(1) + " dB"
+        : "not reported"],
+      ["Acquisition", "tick " + dec.tone_snr_db.toFixed(1) + " dB " +
+        (dec.tone_detected ? "(detected)" : "(NOT detected)") + ", edge " +
+        (dec.phase_locked ? "locked" : "unlocked") +
+        (dec.delay_est_ms != null ? " at " + dec.delay_est_ms.toFixed(1) + " ms" : "") +
+        ", frame " + (dec.anchored ? "anchored" : "not anchored") +
+        (dec.bad_frame_streak ? " (" + dec.bad_frame_streak + " bad in a row)" : "") +
+        ", vote " + dec.frames_in_window + "/" + dec.window_size +
+        ", refusal " + esc(dec.refusal) + ", " + dur(dec.audio_seconds) + " of audio"],
+      ["Last decode", dec.last_decoded_utc
+        ? esc(dec.last_decoded_utc) + " at quality " + dec.last_quality + "%, " +
+          dur(dec.last_decode_age_seconds) + " ago"
+        : "none yet"],
+      ["Offset", t.have_offset
+        ? signed(t.offset_ms) + " ± " + ms(t.dispersion_ms) + " — raw " + signed(t.raw_offset_ms) +
+          ", jitter " + ms(t.jitter_ms) + ", " + t.samples + " samples, newest " +
+          dur(t.age_seconds) + " old"
+        : "none yet"],
+      ["Delay model", ms(dl.total_ms) + " total = " + ms(dl.propagation_ms) + " propagation + " +
+        ms(dl.network_ms) + " network + " + ms(dl.codec_ms) + " codec + " +
+        ms(dl.configured_ms) + " configured<br>" +
+        '<span class="note">' + esc(dl.path) + "</span>"],
+      ["Sample clock", sc.fitted
+        ? "fit over " + dur(sc.span_seconds) + ", residual " + ms(sc.residual_ms, 2) +
+          ", receiver runs " + sc.ppm.toFixed(1) + " ppm against ours, last packet " +
+          ms(sc.last_excess_delay_ms) + " late"
+        : "not yet fitted"],
+    ];
+    return '<div class="card"><div class="label">' + esc(x.name) + "</div>" +
+      '<div class="scroll"><table class="kv"><tbody>' +
+      rows.map((r) => "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>").join("") +
+      "</tbody></table></div></div>";
+  }).join("");
+}
+
+// EventSource reconnects on its own, with the server's `retry` interval, so
+// there is no reconnect logic here — only a visible state so a stall does not
+// look like a stopped clock.
+function connect() {
+  const es = new EventSource("/api/events");
+  es.addEventListener("open", () => {
+    $("linkpill").className = "pill ok";
+    $("linkpill").textContent = "live";
+  });
+  es.addEventListener("tick", (e) => { try { onTick(JSON.parse(e.data)); } catch (x) {} });
+  es.addEventListener("status", (e) => { try { onStatus(JSON.parse(e.data)); } catch (x) {} });
+  es.addEventListener("error", () => {
+    $("linkpill").className = "pill bad";
+    $("linkpill").textContent = "reconnecting";
+  });
+}
+connect();
+</script>

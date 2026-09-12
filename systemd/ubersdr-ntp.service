@@ -1,0 +1,55 @@
+# Install to /etc/systemd/system/ubersdr-ntp.service, put the configuration at
+# /etc/ubersdr-ntp.json, then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now ubersdr-ntp
+#   journalctl -u ubersdr-ntp -f
+#
+# If the configuration sets log.file, the detailed per-source status blocks go
+# there and the journal keeps the one-line records. Without it, everything goes
+# to the journal.
+
+[Unit]
+Description=NTP server disciplined by WWV/WWVH/WWVB over UberSDR
+Documentation=https://github.com/madpsy/ubersdr-ntp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ubersdr-ntp --config /etc/ubersdr-ntp.json
+# SIGHUP reopens the log file, which is what logrotate wants.
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=always
+RestartSec=10
+
+# Port 123 is privileged, and this is the only privilege needed. Granting just
+# the capability is why the service can still run as an unprivileged dynamic
+# user. Drop both lines if ntp.port is above 1023.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# It reads one config file, opens outbound TLS connections and binds two
+# sockets. Nothing else, so nothing else is permitted.
+DynamicUser=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+# Uncomment, with a matching log.file, to let it write its log:
+# ReadWritePaths=/var/log/ubersdr-ntp
+
+[Install]
+WantedBy=multi-user.target

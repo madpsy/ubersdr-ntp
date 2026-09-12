@@ -1,0 +1,170 @@
+// ubersdr-ntp — example configuration.
+//
+// JSON with comments allowed. Copy to config.json and edit. Every field below
+// is optional except "sources", and every value shown is the default unless the
+// comment says otherwise.
+//
+//   ubersdr-ntp --config config.json
+//
+{
+  // =====================================================================
+  // PORTS
+  //
+  // Both services are here so you can find them. Neither has to be the
+  // default.
+  // =====================================================================
+  "ntp": {
+    // The NTP service. 123 is the default and is PRIVILEGED: either run as
+    // root, grant the one capability
+    //     sudo setcap 'cap_net_bind_service=+ep' ./ubersdr-ntp
+    // or put AmbientCapabilities=CAP_NET_BIND_SERVICE in the systemd unit.
+    //
+    // Anything above 1023 needs no privilege and is fine for testing:
+    //     ntpdate -q -u -p 3 127.0.0.1   (or with :PORT on a chrony client)
+    "port": 123,
+
+    // Which addresses to answer on. ["127.0.0.1"] to serve only this machine.
+    "listen": ["0.0.0.0", "::"],
+
+    // How long to keep answering after the last source loses lock, and how
+    // fast the claimed accuracy decays while doing so. 15 ppm is NTP's own
+    // assumed wander for an undisciplined clock. Past the limit it answers
+    // stratum 16 with LI=3 — unsynchronised — which tells a client to look
+    // elsewhere at once rather than making it wait for a timeout.
+    "coast_seconds": 3600,
+    "coast_drift_ppm": 15.0,
+
+    // Sources that must agree before any time is served. 1 suits a
+    // single-receiver install. 2 makes the agreement test load-bearing, which
+    // buys protection against one receiver producing a CONFIDENT misread — a
+    // real failure mode here, because a deep fade biases the same bits in
+    // every frame of the decoder's voter window and no metric inside one
+    // decoder can catch it. An independent receiver can.
+    "min_sources": 1,
+
+    "answer_when_unsynchronised": true,
+    "honour_leap_warning": true,
+    // Responses per second per client, 0 to disable.
+    "rate_limit_per_client": 10.0
+  },
+
+  "http": {
+    // The read-only status service: the JSON API, the one-event-per-second
+    // stream, and the page. Set "enabled": false, or --http-port 0, to turn it
+    // off entirely.
+    "enabled": true,
+    "port": 1234,
+    // Localhost by default. It serves no passwords, but it does advertise
+    // which receivers this daemon uses — set "0.0.0.0" deliberately, not by
+    // accident.
+    "listen": "127.0.0.1"
+  },
+
+  // =====================================================================
+  // SOURCES — the receivers, and what each listens to.
+  //
+  // More than one because HF propagation makes any single frequency
+  // unreliable: 10 MHz from Fort Collins is excellent in the afternoon and
+  // gone at 3am, 5 MHz is the other way round, and a receiver on another
+  // continent hears a different subset again.
+  //
+  // Note that public receivers usually cap concurrent sessions per IP — two
+  // is common — so several frequencies on ONE receiver often is not
+  // possible. Several receivers is better anyway: it decorrelates the
+  // propagation path as well as the frequency.
+  // =====================================================================
+  "defaults": {
+    // "opus" (default) is about 24 kbps and adds a constant ~8 ms that the
+    // delay model already accounts for. "pcm-v4" is the predictive lossless
+    // codec at roughly four times the bandwidth and no codec delay at all —
+    // worth it on a receiver on your own network, rarely worth it over the
+    // internet.
+    "format": "opus",
+    "verify_tls": true,
+    "auto_delay": true
+  },
+
+  "sources": [
+    {
+      // A receiver on the local network, found by mDNS. The lowest-latency
+      // and best-calibrated case: no internet path in the budget.
+      "name": "local-10",
+      "url": "http://ubersdr.local:8080",
+
+      // The TRANSMITTER's carrier. The dial is derived as 1 kHz below it,
+      // which is the tuning WWV, WWVH and WWVB all want — it puts the carrier
+      // at 1000 Hz audio in USB. DO NOT subtract the kilohertz yourself.
+      "carrier_hz": 10000000,
+
+      // The receiver's bypass password, if it has one. Worth having: a
+      // bypassed session has no time limit, and a session the server kicks
+      // costs about four minutes of clean signal to re-acquire a lock.
+      "password": "",
+
+      // Everything the delay model cannot see, in milliseconds — chiefly the
+      // receiver's own buffering between radiod and the WebSocket, which is
+      // usually the largest remaining term.
+      //
+      // Leave at 0 until you have a reference clock to measure against. Then
+      // set it per source to whatever that source's offset reads when it
+      // disagrees with the reference. Getting it wrong biases the served time
+      // by exactly the amount you got wrong; leaving it at 0 biases it by
+      // whatever the receiver's buffering is.
+      "extra_delay_ms": 0.0,
+
+      // Relative confidence in the combine. A receiver you know to be worse
+      // can be kept and weighted down rather than removed.
+      "weight": 1.0,
+
+      "enabled": true
+    },
+    {
+      // A second frequency on the same receiver. Two independent propagation
+      // paths through one receiver: the best available check that the decode
+      // is right, and in testing two such sources agreed to well under a
+      // millisecond on the raw offset.
+      "name": "local-15",
+      "url": "http://ubersdr.local:8080",
+      "carrier_hz": 15000000
+    },
+    {
+      // A remote receiver, for when the local one cannot hear the station.
+      // Replace the host with a receiver you have permission to use — this is
+      // a long-lived session that occupies one of its listener slots.
+      "name": "remote-10",
+      "url": "https://sdr.example.org",
+      "carrier_hz": 10000000,
+      "enabled": false
+    }
+
+    // WWVB, for a receiver in range of its 60 kHz groundwave. Chosen
+    // automatically for any dial below 1 MHz — it is a genuinely different
+    // decoder, not a setting:
+    // { "name": "wwvb", "url": "http://ubersdr.local:8080", "carrier_hz": 60000 }
+
+    // WWV's two extra outlets. 20 MHz is WWV only; 25 MHz is an experimental
+    // broadcast — real, but intermittent and lower power:
+    // { "name": "local-20", "url": "http://ubersdr.local:8080", "carrier_hz": 20000000 }
+  ],
+
+  // =====================================================================
+  // LOGGING
+  //
+  // With a file set, the same lines go to stderr and to the file, PLUS a
+  // detailed per-source status block every status_interval_seconds — which is
+  // how you see what each source is doing when this runs in the background
+  // with no terminal.
+  //
+  // SIGHUP reopens the file, for logrotate. SIGUSR1 writes a block at once.
+  // =====================================================================
+  "log": {
+    "file": "",
+    "level": "info",
+    "stderr": true,
+    "status_interval_seconds": 30
+  },
+
+  // What a receiver operator sees in their session list. Change it only if you
+  // have a reason to; identifying the program is the point.
+  "user_agent": "ubersdr-ntp/1.0.0 (+https://github.com/madpsy/ubersdr-ntp)"
+}

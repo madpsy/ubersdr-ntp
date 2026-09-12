@@ -1,0 +1,16 @@
+# Install to /etc/logrotate.d/ubersdr-ntp if log.file is set.
+#
+# copytruncate is deliberately NOT used: the daemon reopens its file on SIGHUP,
+# which loses nothing, whereas copytruncate races with a write and can lose a
+# status block mid-line.
+/var/log/ubersdr-ntp/*.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    postrotate
+        systemctl kill -s HUP ubersdr-ntp.service 2>/dev/null || true
+    endscript
+}

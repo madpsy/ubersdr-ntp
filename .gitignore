@@ -1,0 +1,9 @@
+build/
+build-*/
+ubersdr-ntp_*
+!ubersdr-ntp_*.service
+# Generated from src/web/index.html at build time.
+src/IndexHtml.inc
+# Your actual configuration, which holds receiver passwords.
+config.json
+*.log
