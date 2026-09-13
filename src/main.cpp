@@ -91,7 +91,7 @@ void usage() {
         "Overrides (these win over the config file):\n"
         "      --port N             NTP port (default 123, which is privileged)\n"
         "      --http-port N        Status/JSON/SSE port, 0 to disable (default 1234)\n"
-        "      --http-listen ADDR   Status service bind address (default 127.0.0.1)\n"
+        "      --http-listen ADDR   Status service bind address (default 0.0.0.0, all interfaces)\n"
         "      --log-file FILE      Also write the log, and the periodic status block, here\n"
         "      --log-level LEVEL    trace, debug, info (default), warn, error\n"
         "      --status-interval N  Seconds between status blocks, 0 to disable (default 30)\n"

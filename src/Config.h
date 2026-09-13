@@ -116,13 +116,14 @@ struct NtpConfig {
 
 // The read-only status service: a JSON API and a small page that renders it.
 //
-// Read-only without qualification — there is no route that changes anything,
-// no authentication because there is nothing to authorise, and it binds to
-// localhost by default because a receiver password lives in this daemon's
-// configuration and nothing served here should tempt anyone into exposing it.
+// Read-only without qualification — there is no route that changes anything
+// and no authentication because there is nothing to authorise. It binds every
+// interface by default, like the NTP service itself; no route serves the
+// receiver passwords out of the configuration, but it does name the receivers
+// this daemon uses, so set "127.0.0.1" if that should stay on this machine.
 struct HttpConfig {
     bool enabled = true;
-    std::string listen = "127.0.0.1";
+    std::string listen = "0.0.0.0";
     int port = 1234;
 };
 

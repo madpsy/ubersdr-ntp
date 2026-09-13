@@ -424,9 +424,10 @@ the first failing stage of the acquisition funnel is named:
 ## HTTP API
 
 Read-only without qualification: no route changes anything, no route takes a
-body, and anything but `GET`/`HEAD` is answered 405. Binds `127.0.0.1:1234` by
+body, and anything but `GET`/`HEAD` is answered 405. Binds `0.0.0.0:1234` by
 default — it serves no passwords, but it does advertise which receivers this
-daemon uses.
+daemon uses, so set `http.listen` to `127.0.0.1` to keep it on this machine.
+`::` binds IPv6 and IPv4 both.
 
 | Route | |
 |---|---|

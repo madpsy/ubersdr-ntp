@@ -54,10 +54,10 @@
     // off entirely.
     "enabled": true,
     "port": 1234,
-    // Localhost by default. It serves no passwords, but it does advertise
-    // which receivers this daemon uses — set "0.0.0.0" deliberately, not by
-    // accident.
-    "listen": "127.0.0.1"
+    // All interfaces by default, like the NTP service. It serves no passwords,
+    // but it does advertise which receivers this daemon uses — set
+    // "127.0.0.1" to keep it on this machine. "::" binds IPv6 and IPv4 both.
+    "listen": "0.0.0.0"
   },
 
   // =====================================================================

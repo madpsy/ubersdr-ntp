@@ -216,7 +216,11 @@ bool HttpApi::start(std::string& err) {
     struct sockaddr_storage sa{};
     socklen_t salen = 0;
     if (v6) {
-        ::setsockopt(m_listenFd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof one);
+        // "::" is the one address anyone writes meaning "everything", so let
+        // it also accept IPv4 rather than making them choose a family. Any
+        // other v6 address is a specific interface and stays v6-only.
+        const int v6only = (m_cfg.listen == "::") ? 0 : 1;
+        ::setsockopt(m_listenFd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof v6only);
         auto* s = reinterpret_cast<struct sockaddr_in6*>(&sa);
         s->sin6_family = AF_INET6;
         s->sin6_port = htons(static_cast<std::uint16_t>(m_cfg.port));
