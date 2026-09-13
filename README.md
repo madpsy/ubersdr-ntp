@@ -237,11 +237,23 @@ audio stream measures:
 | Term | Typical | How it is obtained |
 |---|---|---|
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
-| Network | 5–100 ms | Measured, as half the TLS round trip to the server |
+| Network | 5–100 ms | Measured, as half the round trip of a WebSocket ping down the audio connection itself |
 | Codec | 8 ms (Opus), 0 (PCM v4) | A measured constant |
 | UberSDR chain | 13.6 ms | A constant: RF reaching the SDR to audio leaving the WebSocket |
 | Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB) | A measured constant, from `tools/decodertest.cpp` |
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
+
+The network term is measured over the **WebSocket**, not with an HTTP request,
+because a TCP handshake ends at whatever accepted the SYN. A receiver behind a
+CDN then has a proxy answering for it: measured here, one served through
+Cloudflare's London edge reported a 13 ms round trip for a path that is really
+91 ms, which cost 40 ms of delay budget and put its offset 39 ms away from a
+receiver on the same band that it should have agreed with to a millisecond. A
+ping down the audio connection has to reach the origin to come back, so it
+measures the path the audio actually takes. On a receiver served directly the
+two agree — 96.3 ms against a 96.6 ms handshake on one measured here — so this
+changes nothing except for the receivers that were being measured wrongly. The
+HTTP figure remains the fallback for a server too old to answer a ping.
 
 The part nothing in the stream can see is the delay inside the receiver —
 `radiod`'s demodulator and filters, its block framing, the server's handling —

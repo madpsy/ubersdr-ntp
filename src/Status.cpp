@@ -268,6 +268,17 @@ std::string renderStatusBlock(const StatusInput& in) {
             o << "    timing: no usable offset yet\n";
         }
 
+        if (s.wsRttMs > 0.0 || s.httpRttMs > 0.0) {
+            o << "    path:   round trip " << f2((s.rttFromWs ? s.wsRttMs : s.httpRttMs), 1)
+              << " ms over " << (s.rttFromWs ? "the audio connection" : "the TCP handshake");
+            // Both measured and disagreeing means something is answering for
+            // the receiver. Worth saying which figure is being believed.
+            if (s.rttFromWs && s.httpRttMs > 0.0 && s.wsRttMs > s.httpRttMs * 1.5) {
+                o << " (handshake said " << f2(s.httpRttMs, 1)
+                  << " ms — a proxy is terminating it short of the receiver)";
+            }
+            o << '\n';
+        }
         o << "    delay:  " << f2(s.delaySec * 1000.0, 1) << " ms total = "
           << f2(s.propagationSec * 1000.0, 1) << " propagation + "
           << f2(s.networkSec * 1000.0, 1) << " network + "
@@ -393,6 +404,8 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         t["jitter_ms"] = s.jitterSec * 1000.0;
         t["dispersion_ms"] = s.dispersionSec * 1000.0;
         t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
+        t["ws_rtt_ms"] = s.wsRttMs;
+        t["rtt_from_websocket"] = s.rttFromWs;
         t["age_seconds"] = s.offsetAgeSec;
         t["samples"] = s.offsetSamples;
         o["timing"] = std::move(t);

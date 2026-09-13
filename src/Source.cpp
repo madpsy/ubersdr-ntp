@@ -103,6 +103,11 @@ constexpr double kDelayUncertaintyFraction = 0.25;
 // the others. See the use site.
 constexpr double kWeightDispersionFloorSec = 0.001;
 
+// Marks a ping payload as ours. IXWebSocket sends its own keepalive pings on a
+// timer and those come back as pongs too; without a tag we would time a round
+// trip whose start we never recorded.
+const char* const kPingPrefix = "ubersdr-ntp:";
+
 std::string makeUuidV4() {
     // The server requires a canonical lowercase v4 UUID and binds it to this
     // host's IP, so it identifies the session rather than securing anything —
@@ -418,6 +423,9 @@ void Source::supervise() {
                     if (msg->binary) onBinary(msg->str);
                     else onText(msg->str);
                     break;
+                case ix::WebSocketMessageType::Pong:
+                    onPong(msg->str);
+                    break;
                 default:
                     break;
             }
@@ -473,6 +481,13 @@ void Source::supervise() {
                 }
                 if (now - lastPing >= 30.0) {
                     ws->send("{\"type\":\"ping\"}");
+                    // And a protocol-level ping carrying the time it was sent.
+                    // RFC 6455 requires the peer to echo a ping's payload, so
+                    // the pong dates itself and the round trip needs no state
+                    // here beyond what is in the frame. This is the measurement
+                    // that matters: it goes to whatever is at the far end of
+                    // the connection the AUDIO arrives on.
+                    ws->ping(kPingPrefix + std::to_string(now));
                     lastPing = now;
                 }
 
@@ -660,6 +675,26 @@ bool Source::fetchDescription() {
         LOG_DEBUG(m_cfg.name.c_str(), "/api/description unparseable: %s", e.what());
         return false;
     }
+}
+
+void Source::onPong(const std::string& payload) {
+    // Ours, and still parseable? IXWebSocket's own keepalive pongs are not.
+    const std::size_t plen = std::char_traits<char>::length(kPingPrefix);
+    if (payload.size() <= plen || payload.compare(0, plen, kPingPrefix) != 0) return;
+
+    double sentAt = 0.0;
+    try {
+        sentAt = std::stod(payload.substr(plen));
+    } catch (const std::exception&) {
+        return;
+    }
+    const double rtt = monotonicNow() - sentAt;
+    // A pong that claims to predate its ping, or that took longer than the
+    // session would survive, is not a measurement of anything.
+    if (!(rtt > 0.0) || rtt > 30.0) return;
+
+    std::lock_guard<std::mutex> lk(m_mu);
+    recordWsRtt(rtt);
 }
 
 void Source::probeRtt() {
@@ -1525,6 +1560,17 @@ void Source::recomputeOffset() {
     m_snap.haveOffset = m_offsets.size() >= 5 && m_snap.clockState == "locked";
 }
 
+void Source::recordWsRtt(double rttSec) {
+    if (!(rttSec > 0.0)) return;
+    m_wsRttProbes.push_back(rttSec);
+    // The same minimum-of-recent rule as the HTTP probe, for the same reason:
+    // a pong that crossed a busy moment describes the moment, not the path.
+    while (m_wsRttProbes.size() > 12) m_wsRttProbes.pop_front();
+    double best = m_wsRttProbes.front();
+    for (double v : m_wsRttProbes) best = std::min(best, v);
+    m_snap.wsRttMs = best * 1000.0;
+}
+
 void Source::recordRtt(double rttSec) {
     if (!(rttSec > 0.0)) return;
     m_rttProbes.push_back(rttSec);
@@ -1575,7 +1621,20 @@ void Source::updateDelayModel() {
     // the minimum of packet arrivals: network delay is bounded below and
     // unbounded above, so a probe that happened to cross a busy moment says
     // nothing about the path and the smallest one says the most.
-    const double net = m_snap.httpRttMs > 0.0 ? (m_snap.httpRttMs / 1000.0) * 0.5 : 0.0;
+    //
+    // Measured over the WEBSOCKET, not over an HTTP request, whenever a pong
+    // has come back. The two agree on a receiver served directly -- 93 ms
+    // against 99 on one measured here -- and disagree by everything that
+    // matters on a receiver behind a CDN: a TCP handshake ends at whatever
+    // accepted the SYN, so a Cloudflare edge 13 ms away answers for an origin
+    // 93 ms away, and the delay model loses 40 ms it cannot get back. The
+    // audio comes from the origin either way, and a ping down the audio
+    // connection has to reach the origin to be answered. The HTTP figure stays
+    // as the fallback for a server too old to pong, where an under-estimate is
+    // still better than dropping the largest correctable term entirely.
+    const double rttMs = m_snap.wsRttMs > 0.0 ? m_snap.wsRttMs : m_snap.httpRttMs;
+    m_snap.rttFromWs = m_snap.wsRttMs > 0.0;
+    const double net = rttMs > 0.0 ? (rttMs / 1000.0) * 0.5 : 0.0;
     // The codec the audio actually came through, not the one asked for: a
     // session that negotiated Opus is sent lossless frames in some modes, and
     // charging 8 ms of Opus delay to those biases the offset by 8 ms.

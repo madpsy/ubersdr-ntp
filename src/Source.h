@@ -138,6 +138,8 @@ struct SourceSnapshot {
     double clockResidualSec = 0.0;
     double clockSpanSec = 0.0;
     double clockPpm = 0.0;          // receiver sample clock against ours
+    double wsRttMs = 0.0;           // round trip over the audio connection
+    bool rttFromWs = false;         // ...and whether the delay model used it
     double clockSlopeUncSec = 0.0;  // bias the slope could be putting on an edge
     bool clockSlopeHeld = false;    // fitted slope refused as implausible
     double lastExcessDelaySec = 0.0;
@@ -194,6 +196,8 @@ private:
     void updateDelayModel();    // caller holds m_mu
     void recordRtt(double rttSec);  // caller holds m_mu
     void probeRtt();
+    void onPong(const std::string& payload);
+    void recordWsRtt(double rttSec);
 
     SourceConfig m_cfg;
     std::string m_sessionId;
@@ -279,6 +283,7 @@ private:
     struct OffsetSample { double at; double offset; };
     std::deque<OffsetSample> m_offsets;
     std::deque<double> m_rttProbes;
+    std::deque<double> m_wsRttProbes;
 };
 
 } // namespace ubersdr_ntp
