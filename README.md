@@ -75,6 +75,13 @@ smoke-tested:
 ./build.sh
 ```
 
+To publish them as a GitHub release as well, add `--release <tag>` (needs the
+`gh` CLI, a clean tree, and HEAD pushed; the tag is created at HEAD if absent):
+
+```bash
+./build.sh --release v0.1.0
+```
+
 That builds amd64 and arm64 inside `ubuntu:24.04` (the image UberSDR's own
 container runtime uses), then runs `tools/selftest.py` against each binary,
 which drives its real NTP socket and its real HTTP service. arm64 is built by

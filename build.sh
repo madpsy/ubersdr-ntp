@@ -30,6 +30,12 @@
 #   --no-check      build only, skip the smoke test
 #   --image IMAGE   build container image (default: ubuntu:24.04)
 #   -j N            parallel jobs (default: all cores)
+#   --release TAG   after building and checking, publish the binaries (plus a
+#                   SHA256SUMS file) as GitHub release TAG, using the gh CLI.
+#                   Creates the tag on GitHub at HEAD if it does not exist;
+#                   replaces the assets if the release already exists.
+#                   Requires a clean tree whose HEAD is already on GitHub
+#   --notes TEXT    release notes (default: generated from commits)
 #
 
 set -euo pipefail
@@ -41,6 +47,8 @@ native=0
 clean=0
 check=1
 jobs=$(nproc 2>/dev/null || echo 4)
+release=""
+notes=""
 
 while [ $# -gt 0 ]; do
     case "$1" in
@@ -51,6 +59,8 @@ while [ $# -gt 0 ]; do
         --image)    image=$2; shift 2 ;;
         -j)         jobs=$2; shift 2 ;;
         -j*)        jobs=${1#-j}; shift ;;
+        --release)  release=$2; shift 2 ;;
+        --notes)    notes=$2; shift 2 ;;
         -h|--help)  sed -n '2,/^$/p' "${BASH_SOURCE[0]}" | sed 's/^#\{0,1\} \{0,1\}//'; exit 0 ;;
         *)          echo "build.sh: unknown option $1" >&2; exit 2 ;;
     esac
@@ -65,6 +75,32 @@ for a in $arches; do
         *) fail "unknown arch '$a' (expected amd64, arm64, arm or 386)" ;;
     esac
 done
+
+# Checked BEFORE building, not after: a qemu arm64 build takes long enough that
+# finding out at the end that the tree was dirty wastes the whole run.
+#
+# A release must be reproducible from its tag, so the binaries have to come
+# from a committed tree, and that commit has to exist on GitHub for the tag to
+# point at it.
+if [ -n "$release" ]; then
+    [ "$native" = 0 ] || fail "--release ships binaries; it cannot be combined with --native"
+    [ "$check" = 1 ]  || fail "--release will not publish binaries that skipped the smoke test"
+    command -v gh >/dev/null 2>&1 || fail "--release needs the gh CLI (https://cli.github.com)"
+    gh auth status >/dev/null 2>&1 || fail "gh is not logged in; run: gh auth login"
+    [ -z "$(git -C "$repo" status --porcelain --untracked-files=no)" ] \
+        || fail "the working tree has uncommitted changes; commit them before releasing"
+    head_sha=$(git -C "$repo" rev-parse HEAD)
+    gh_repo=$(cd "$repo" && gh repo view --json nameWithOwner --jq .nameWithOwner) \
+        || fail "could not work out the GitHub repository for $repo"
+    gh api "repos/$gh_repo/commits/$head_sha" --silent >/dev/null 2>&1 \
+        || fail "HEAD ($head_sha) is not on GitHub; push it before releasing"
+    # An existing tag must already point at HEAD, or the release would carry
+    # binaries that do not match its source.
+    tag_sha=$(gh api "repos/$gh_repo/commits/$release" --jq .sha 2>/dev/null || true)
+    if [ -n "$tag_sha" ] && [ "$tag_sha" != "$head_sha" ]; then
+        fail "tag $release already exists on GitHub at $tag_sha, not HEAD ($head_sha)"
+    fi
+fi
 
 # The packages this needs to BUILD, and the ones it needs to RUN. Kept together
 # because a container image that installs only the first set produces a binary
@@ -240,6 +276,28 @@ say "Done"
 for b in $built; do
     printf '  %s -- %s\n' "$(basename "$b")" "$(file -b "$b" | cut -d, -f1-2)"
 done
+
+if [ -n "$release" ]; then
+    say "Publishing $release to $gh_repo"
+    sums="$repo/build-release/SHA256SUMS"
+    mkdir -p "$(dirname "$sums")"
+    (cd "$repo" && sha256sum $(for b in $built; do basename "$b"; done)) >"$sums"
+    sed 's/^/  /' "$sums"
+
+    # shellcheck disable=SC2086
+    if gh release view "$release" --repo "$gh_repo" >/dev/null 2>&1; then
+        gh release upload "$release" --repo "$gh_repo" --clobber $built "$sums"
+    else
+        if [ -n "$notes" ]; then
+            notes_args=(--notes "$notes")
+        else
+            notes_args=(--generate-notes)
+        fi
+        gh release create "$release" --repo "$gh_repo" --target "$head_sha" \
+            --title "$release" "${notes_args[@]}" $built "$sums"
+    fi
+    echo "  $(gh release view "$release" --repo "$gh_repo" --json url --jq .url)"
+fi
 
 cat <<EOF
 
