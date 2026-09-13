@@ -77,6 +77,11 @@ private:
     double m_lastGoodOffset = 0.0;
     double m_lastGoodDispersion = 0.0;
     double m_lastGoodAt = 0.0;
+    // When the newest measurement behind that offset was taken. Not the same
+    // as m_lastGoodAt, which is refreshed every combine while synchronised:
+    // coasting from it would report an age up to a candidate's maximum age too
+    // young, and the reference timestamp with it.
+    double m_lastGoodMeasuredAt = 0.0;
 
     double m_coastSeconds;
     double m_coastDriftPpm;

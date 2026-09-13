@@ -349,7 +349,7 @@ is the point.
 
 It keeps answering, coasting on the last good offset with root dispersion
 growing at `coast_drift_ppm` (15 ppm, NTP's own assumed wander for an
-undisciplined clock) until `coast_seconds`. Past that it answers stratum 16 with
+undisciplined clock) until `coast_seconds`. Past that it answers stratum 0 with
 LI=3 — unsynchronised — which tells a client to look elsewhere immediately
 rather than making it wait for a timeout. That is what a real refclock does.
 

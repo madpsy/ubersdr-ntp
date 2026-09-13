@@ -150,6 +150,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         m_lastGoodOffset = offset;
         m_lastGoodDispersion = dispersion;
         m_lastGoodAt = nowRealtime;
+        m_lastGoodMeasuredAt = nowRealtime - newest;
         m_last = c;
         return c;
     }
@@ -166,7 +167,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
             // undisciplined clock. This is the whole content of coasting: the
             // offset does not change, the honesty about it does.
             c.dispersionSec = m_lastGoodDispersion + age * (m_coastDriftPpm * 1e-6);
-            c.ageSec = age;
+            c.ageSec = nowRealtime - m_lastGoodMeasuredAt;
             c.used = 0;
             c.refid = m_last.refid;
             c.note = cand.empty() ? "coasting: no source has a lock"
@@ -176,7 +177,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
             c.synchronised = false;
             c.offsetSec = m_lastGoodOffset;
             c.dispersionSec = m_lastGoodDispersion + age * (m_coastDriftPpm * 1e-6);
-            c.ageSec = age;
+            c.ageSec = nowRealtime - m_lastGoodMeasuredAt;
             c.refid = m_last.refid;
             c.note = "unsynchronised: no lock for longer than the coast limit";
         }

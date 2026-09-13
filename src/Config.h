@@ -96,7 +96,7 @@ struct NtpConfig {
     // plausibility gate exists for.
     int minSources = 1;
 
-    // Answer with LI=3 / stratum 16 when unsynchronised, rather than falling
+    // Answer with LI=3 / stratum 0 when unsynchronised, rather than falling
     // silent. A client learns to look elsewhere immediately from the first and
     // only on timeout from the second.
     bool answerWhenUnsynchronised = true;

@@ -9,6 +9,7 @@
 #include <cerrno>
 #include <cmath>
 #include <cstring>
+#include <ctime>
 #include <netinet/in.h>
 #include <poll.h>
 #include <sys/socket.h>
@@ -66,19 +67,28 @@ std::uint32_t toShortFormat(double seconds) {
     return static_cast<std::uint32_t>(seconds * 65536.0);
 }
 
-// The precision field: the base-2 logarithm of the claimed resolution, as a
-// signed 8-bit value.
+// The precision field: the base-2 logarithm of the resolution this server
+// reads its clock to, as a signed 8-bit value.
 //
-// Deliberately derived from the dispersion rather than from clock_getres. The
-// host clock resolves nanoseconds and this server's time is good to some tens
-// of milliseconds; reporting -29 because the syscall is precise would be a lie
-// that some clients weight their selection on.
-std::int8_t precisionFor(double dispersionSec) {
-    if (!(dispersionSec > 0.0)) return -20;
-    int p = static_cast<int>(std::floor(std::log2(dispersionSec)));
-    if (p < -20) p = -20;
-    if (p > 0) p = 0;
-    return static_cast<std::int8_t>(p);
+// NOT the accuracy. RFC 5905 defines it as the precision of the system clock,
+// and clients add 2^precision to the dispersion they compute for this server
+// on top of root dispersion. Deriving it from the radio error budget, as this
+// once did, counted that error twice. The accuracy belongs in root dispersion.
+//
+// Floored at -20 (about a microsecond): every timestamp passes through a double
+// of NTP seconds, whose 53 bits leave roughly 2^-21 s below the 32-bit seconds,
+// so the nanoseconds clock_getres reports would be a claim this cannot keep.
+std::int8_t clockPrecision() {
+    static const std::int8_t precision = [] {
+        struct timespec res{};
+        double sec = 1e-9;
+        if (::clock_getres(CLOCK_REALTIME, &res) == 0) {
+            sec = static_cast<double>(res.tv_sec) + static_cast<double>(res.tv_nsec) * 1e-9;
+        }
+        const int p = sec > 0.0 ? static_cast<int>(std::ceil(std::log2(sec))) : -20;
+        return static_cast<std::int8_t>(std::clamp(p, -20, 0));
+    }();
+    return precision;
 }
 
 std::string addressText(const struct sockaddr_storage& sa) {
@@ -126,6 +136,18 @@ bool NtpServer::start(std::string& err) {
         // platform without it falls back to reading the clock on wake-up.
 #ifdef SO_TIMESTAMPNS
         ::setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof one);
+#endif
+        // The address each request was sent TO, so the reply can be sent FROM
+        // it. A wildcard socket otherwise lets the routing table pick the reply's
+        // source, and on a host with more than one address -- a VPN, a Docker
+        // bridge, a secondary IP -- that can be a different address from the one
+        // the client asked. chrony and ntpd both discard such a reply, so the
+        // server looks up and answering while no client ever synchronises.
+#ifdef IP_PKTINFO
+        if (!v6) ::setsockopt(fd, IPPROTO_IP, IP_PKTINFO, &one, sizeof one);
+#endif
+#ifdef IPV6_RECVPKTINFO
+        if (v6) ::setsockopt(fd, IPPROTO_IPV6, IPV6_RECVPKTINFO, &one, sizeof one);
 #endif
 
         struct sockaddr_storage sa{};
@@ -262,16 +284,32 @@ void NtpServer::serve(int fd, const std::string& label) {
 
         // The moment the packet actually arrived, from the kernel if it said.
         double recvRealtime = realtimeNow();
-#ifdef SO_TIMESTAMPNS
+        // And the local address it arrived on, to answer from (see start()).
+        bool haveDst4 = false, haveDst6 = false;
+        struct in_pktinfo dst4{};
+        struct in6_pktinfo dst6{};
         for (struct cmsghdr* cm = CMSG_FIRSTHDR(&mh); cm; cm = CMSG_NXTHDR(&mh, cm)) {
+#ifdef SO_TIMESTAMPNS
             if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SO_TIMESTAMPNS) {
                 struct timespec ts;
                 std::memcpy(&ts, CMSG_DATA(cm), sizeof ts);
                 recvRealtime = static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
-                break;
             }
-        }
 #endif
+#ifdef IP_PKTINFO
+            if (cm->cmsg_level == IPPROTO_IP && cm->cmsg_type == IP_PKTINFO) {
+                std::memcpy(&dst4, CMSG_DATA(cm), sizeof dst4);
+                haveDst4 = true;
+            }
+#endif
+#ifdef IPV6_PKTINFO
+            if (cm->cmsg_level == IPPROTO_IPV6 && cm->cmsg_type == IPV6_PKTINFO) {
+                std::memcpy(&dst6, CMSG_DATA(cm), sizeof dst6);
+                // A multicast destination is not an address a reply can come from.
+                haveDst6 = !IN6_IS_ADDR_MULTICAST(&dst6.ipi6_addr);
+            }
+#endif
+        }
 
         {
             std::lock_guard<std::mutex> lk(m_mu);
@@ -288,12 +326,14 @@ void NtpServer::serve(int fd, const std::string& label) {
         const int version = (li_vn_mode >> 3) & 0x07;
         const int mode = li_vn_mode & 0x07;
 
-        // Mode 3 is a client asking the time. Mode 1 (symmetric active) is a
-        // peer offering to exchange it, which is answered because it costs
-        // nothing and some clients use it. Everything else — and in particular
-        // modes 6 and 7, the control and private modes that every ntpd
-        // amplification advisory is about — is dropped without a reply.
-        if (mode != 3 && mode != 1) {
+        // Mode 3 is a client asking the time, and the only thing answered.
+        //
+        // Not mode 1 (symmetric active), which this once answered with a mode-4
+        // server reply. RFC 5905 answers an unconfigured symmetric peer with
+        // mode 2, a peer that sent mode 1 discards mode 4 anyway, and symmetric
+        // mode is its own history of advisories. Nor modes 6 and 7, the control
+        // and private modes every ntpd amplification advisory is about.
+        if (mode != 3) {
             std::lock_guard<std::mutex> lk(m_mu);
             m_stats.ignored++;
             continue;
@@ -333,7 +373,9 @@ void NtpServer::serve(int fd, const std::string& label) {
         int stratum = 1;
         if (!c.synchronised) {
             leap = 3;       // unsynchronised
-            stratum = 16;   // and therefore unusable, which is the honest answer
+            // Stratum 16 means unsynchronised INSIDE an implementation; RFC 5905
+            // section 7.3 has it transmitted as 0, "unspecified or invalid".
+            stratum = 0;
         } else if (c.leapPending && m_cfg.honourLeapWarning) {
             // WWV asserts its warning bit for the whole month leading up to a
             // leap second; NTP's leap indicator means "in the last minute of
@@ -357,7 +399,7 @@ void NtpServer::serve(int fd, const std::string& label) {
             if (poll > 17) poll = 17;
             out[2] = static_cast<std::uint8_t>(poll);
         }
-        out[3] = static_cast<std::uint8_t>(precisionFor(c.dispersionSec));
+        out[3] = static_cast<std::uint8_t>(clockPrecision());
 
         // Root delay is zero and means it: there is no NTP path above this
         // server. The entire error budget is in root dispersion.
@@ -365,17 +407,22 @@ void NtpServer::serve(int fd, const std::string& label) {
         put32(out + 8, toShortFormat(c.dispersionSec));
 
         // Reference identifier: four ASCII characters naming the radio source,
-        // as RFC 5905 specifies for stratum 1.
-        std::string refid = c.refid.empty() ? "WWV" : c.refid;
+        // as RFC 5905 specifies for stratum 1. Before the first lock there is no
+        // source to name, and stratum 0 makes this field a kiss code: INIT is
+        // the one RFC 5905 defines for "not yet synchronised".
+        std::string refid = !c.valid ? "INIT" : c.refid.empty() ? "WWV" : c.refid;
         refid.resize(4, '\0');
         std::memcpy(out + 12, refid.data(), 4);
 
         // Reference timestamp: when this server's clock was last set from the
-        // radio, which is the age of the newest contributing measurement.
+        // radio, which is the age of the newest contributing measurement. Left
+        // zero if it never has been, which is what RFC 5905 says zero means.
         const double corrected = recvRealtime + c.offsetSec;
-        const NtpTime ref = toNtpTime(corrected - c.ageSec);
-        put32(out + 16, ref.sec);
-        put32(out + 20, ref.frac);
+        if (c.valid) {
+            const NtpTime ref = toNtpTime(corrected - c.ageSec);
+            put32(out + 16, ref.sec);
+            put32(out + 20, ref.frac);
+        }
 
         // Originate: the client's transmit timestamp, echoed back verbatim.
         // Verbatim matters — it is how the client matches the reply to its
@@ -392,8 +439,38 @@ void NtpServer::serve(int fd, const std::string& label) {
         put32(out + 40, xmt.sec);
         put32(out + 44, xmt.frac);
 
-        const ssize_t sent = ::sendto(fd, out, sizeof out, 0,
-                                      reinterpret_cast<struct sockaddr*>(&from), mh.msg_namelen);
+        // Sent from the address the request arrived on (see start()).
+        struct iovec oiov{out, sizeof out};
+        alignas(struct cmsghdr) char ocontrol[CMSG_SPACE(sizeof(struct in6_pktinfo))] = {};
+        struct msghdr omh{};
+        omh.msg_name = &from;
+        omh.msg_namelen = mh.msg_namelen;
+        omh.msg_iov = &oiov;
+        omh.msg_iovlen = 1;
+        if (haveDst4) {
+            omh.msg_control = ocontrol;
+            omh.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+            struct cmsghdr* cm = CMSG_FIRSTHDR(&omh);
+            cm->cmsg_level = IPPROTO_IP;
+            cm->cmsg_type = IP_PKTINFO;
+            cm->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+            // ipi_spec_dst, not ipi_addr: for a unicast request they are the
+            // same address, and for a broadcast one only spec_dst is a usable
+            // source. The interface is left to routing.
+            struct in_pktinfo pi{};
+            pi.ipi_spec_dst = dst4.ipi_spec_dst;
+            std::memcpy(CMSG_DATA(cm), &pi, sizeof pi);
+        } else if (haveDst6) {
+            omh.msg_control = ocontrol;
+            omh.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
+            struct cmsghdr* cm = CMSG_FIRSTHDR(&omh);
+            cm->cmsg_level = IPPROTO_IPV6;
+            cm->cmsg_type = IPV6_PKTINFO;
+            cm->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+            // The interface too: a link-local address means nothing without it.
+            std::memcpy(CMSG_DATA(cm), &dst6, sizeof dst6);
+        }
+        const ssize_t sent = ::sendmsg(fd, &omh, 0);
         std::lock_guard<std::mutex> lk(m_mu);
         if (sent < 0) {
             m_stats.sendErrors++;

@@ -29,7 +29,7 @@
     // How long to keep answering after the last source loses lock, and how
     // fast the claimed accuracy decays while doing so. 15 ppm is NTP's own
     // assumed wander for an undisciplined clock. Past the limit it answers
-    // stratum 16 with LI=3 — unsynchronised — which tells a client to look
+    // stratum 0 with LI=3 — unsynchronised — which tells a client to look
     // elsewhere at once rather than making it wait for a timeout.
     "coast_seconds": 3600,
     "coast_drift_ppm": 15.0,

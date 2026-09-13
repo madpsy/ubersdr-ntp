@@ -13,10 +13,9 @@
 // server. That does not make it accurate, and the fields that say how accurate
 // are the ones that matter here. Root delay is genuinely zero — there is no NTP
 // path above us — and root dispersion carries the whole error budget from the
-// Selector, propagation model included. Precision is reported from the measured
-// dispersion rather than from the clock's resolution, because a client that
-// reads `precision` as microseconds and `rootdisp` as 40 ms will trust the
-// wrong one.
+// Selector, propagation model included. Precision is the clock's reading
+// resolution, as RFC 5905 defines it, and nothing more: a client adds it to
+// root dispersion, so carrying the error budget in both would count it twice.
 //
 // TIMESTAMPS
 //
@@ -44,7 +43,7 @@ struct NtpStats {
     std::uint64_t answered = 0;
     std::uint64_t ignored = 0;       // wrong mode, wrong version, too short
     std::uint64_t rateLimited = 0;
-    std::uint64_t unsynchronised = 0; // answered with LI=3 / stratum 16
+    std::uint64_t unsynchronised = 0; // answered with LI=3 / stratum 0
     std::uint64_t sendErrors = 0;
 };
 

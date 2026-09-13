@@ -14,7 +14,7 @@ real failure mode that a clean compile does not rule out:
   * the binary starts and reads a configuration file;
   * the NTP socket binds and answers a genuine mode-3 client request with a
     well-formed mode-4 reply;
-  * that reply says stratum 16 / LI=3 while nothing is locked, rather than
+  * that reply says stratum 0 / LI=3 while nothing is locked, rather than
     claiming stratum 1 with a garbage offset -- which is the single most
     important thing this server does, because a client that believes an
     unsynchronised radio clock is worse off than one with no radio clock;
@@ -223,7 +223,8 @@ def main():
             'url': 'http://127.0.0.1:1',
             'carrier_hz': 10000000,
         }],
-        'ntp': {'listen': ['127.0.0.1'], 'port': NTP_PORT,
+        # The wildcard, so the reply source address can be checked (below).
+        'ntp': {'listen': ['0.0.0.0'], 'port': NTP_PORT,
                 'answer_when_unsynchronised': True},
         'http': {'enabled': True, 'listen': '127.0.0.1', 'port': HTTP_PORT},
         'log': {'level': 'warn', 'status_interval_seconds': 0},
@@ -267,7 +268,7 @@ def main():
                   'version=%d' % r['version'])
             # The point of the whole exercise: with nothing locked it must say
             # so, not claim stratum 1.
-            check('unsynchronised reply is stratum 16', r['stratum'] == 16,
+            check('unsynchronised reply is stratum 0 on the wire', r['stratum'] == 0,
                   'stratum=%d' % r['stratum'])
             check('unsynchronised reply sets LI=3', r['leap'] == 3, 'leap=%d' % r['leap'])
             check('root delay is zero (we are the reference)', r['rootdelay'] == 0.0,
@@ -277,10 +278,37 @@ def main():
                   '%s != %s' % (r['originate'].hex(), r['sent_xmt'].hex()))
             check('reference id is ASCII', all(ch == 0 or 32 <= ch < 127 for ch in r['refid']),
                   r['refid'].hex())
+            check('never-synchronised reply names INIT', r['refid'] == b'INIT', r['refid'].hex())
+            check('never-synchronised reference timestamp is zero',
+                  r['raw'][16:24] == bytes(8), r['raw'][16:24].hex())
+            # Clock resolution, not the radio error budget: that is root
+            # dispersion, and a client adds the two together.
+            check('precision is the clock resolution', -20 <= r['precision'] <= -10,
+                  'precision=%d' % r['precision'])
 
-        # Mode 6 and 7 are the reflection-amplification modes. Silence is the
-        # only correct answer.
-        for bad_mode in (6, 7):
+        # Answered from the address that was asked. The server listens on the
+        # wildcard; asking 127.0.0.2 from a socket on 127.0.0.1 is the loopback
+        # version of a client reaching a multihomed host on a secondary address,
+        # and a connected socket -- as chrony uses -- drops a reply from anywhere
+        # else.
+        c = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        c.settimeout(2.0)
+        try:
+            c.bind(('127.0.0.1', 0))
+            c.connect(('127.0.0.2', NTP_PORT))
+            c.send(b'\x23' + bytes(47))
+            c.recv(1024)
+            check('replies from the address it was asked on', True)
+        except socket.timeout:
+            check('replies from the address it was asked on', False,
+                  'no reply on a socket connected to 127.0.0.2')
+        finally:
+            c.close()
+
+        # Mode 6 and 7 are the reflection-amplification modes, and mode 1 is a
+        # symmetric peer a server-mode reply would be wrong for. Silence is the
+        # only correct answer to all three.
+        for bad_mode in (1, 6, 7):
             check('ignores mode %d' % bad_mode,
                   ntp_query(NTP_PORT, mode=bad_mode, timeout=1.0) is None)
         # A truncated packet must not be answered either.
