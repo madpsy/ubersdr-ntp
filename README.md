@@ -19,46 +19,69 @@ about hardware.
 It is a **stratum-1 radio clock**: its reference is not another NTP server. That
 is a statement about topology, not accuracy.
 
-**Measured**, against a public receiver in the north-eastern US hearing Fort
-Collins on 10 and 15 MHz, with the receiver 2516 km away and 97 ms of network
-round trip between it and the client:
+### How accurate is it, actually
+
+It will never be exact. What follows is what it measured, under conditions that
+are stated so the number can be read for what it is.
+
+**Measured 2026-09-13, 23:42–00:49 UTC**, 122 samples at 30 s intervals. Two
+public receivers in the north-eastern US, both hearing Fort Collins on 10 MHz,
+about 2500 km from the transmitter and about 95 ms of network round trip from
+the client. The reference is the client's own host, disciplined by `ntpd` and
+sitting 0.15 ms from its server.
 
 | | |
 |---|---|
-| Raw offset, 10 MHz | −67.6 ms |
-| Raw offset, 15 MHz | −67.3 ms |
-| **Agreement between two independent frequencies** | **0.3 ms** |
-| Modelled delay (8.8 propagation + 48.3 network + 8.0 codec) | 65.1 ms |
-| Served offset after correction | −0.8 ms |
-| **Disagreement with a reference NTP server** | **2.5 ms** |
-| Root dispersion it claimed while doing so | 24.2 ms |
+| **Served offset against the reference** | **+3.4 ms mean** |
+| Stability of that, over the hour | 1.7 ms sd, +1.5 to +8.6 ms |
+| Agreement between the two receivers | 2.3 ms mean, ±11 ms worst |
+| Root dispersion it claimed while doing so | 17–27 ms |
 
-Do not read 2.5 ms as the general figure. The two terms that dominate the
-remaining error are *path-specific*: how symmetric the network route is, and how
-much the receiver buffers between `radiod` and the WebSocket. Both happened to
-be small here. On a path where the route is asymmetric, or the receiver buffers
-more, the error is tens of milliseconds until `extra_delay_ms` is set — and
-that is what the root dispersion is claiming, rather than the 2.5 ms it
-actually achieved.
+So: **a few milliseconds, biased a few milliseconds fast, on a path the delay
+model fits.** The true error stayed well inside the dispersion advertised, which
+is the property that matters — a client is told to trust it less than it
+deserves, never more.
 
-So: **tens of milliseconds by default, single-digit milliseconds when the delay
+Three things that number is not:
+
+- **It is not exact, and about 3 ms of it is a known systematic.** Every source
+  shares the chain constant, so no arrangement of receivers can measure it and
+  only an absolute reference can; see [the delay model](#the-delay-model). It is
+  written down rather than tuned away.
+- **It is one evening, one band, one client location.** HF propagation is not
+  the same at 03:00 as at 23:00, and the same two receivers wandered ±11 ms
+  against *each other* over this hour — which bounds how well the per-source
+  delay models fit, and is larger than the bias being chased.
+- **The reference is `ntpd`, not GPS.** It is good to well under a millisecond
+  here, but it is not an independent primary standard.
+
+The terms that dominate the remaining error are *path-specific*: how symmetric
+the network route is, and how much the receiver buffers between `radiod` and the
+WebSocket. Both were small here. On a path where the route is asymmetric, or the
+receiver buffers more, the error is tens of milliseconds until `extra_delay_ms`
+is set — and that is what the root dispersion is claiming.
+
+**Tens of milliseconds by default, single-digit milliseconds when the delay
 model fits the path.** A client weighing this against a GPS source will
 correctly prefer the GPS, which is the intended outcome.
 
-The 0.3 ms agreement between two frequencies is the more transferable number.
-Those are two independent decoders on two independent propagation paths sharing
-only a receiver and a network link, so it bounds everything except what they
-share — which is exactly the part the delay model is for.
+An earlier session on one receiver, hearing 10 and 15 MHz at once, agreed with
+itself across the two frequencies to **0.3 ms** — the more transferable number
+of the two. Those are independent decoders on independent propagation paths
+sharing only a receiver and a network link, so that figure bounds everything
+except what they share, which is exactly the part the delay model is for. The
+3.4 ms above is what happens when the shared part is included.
 
 It is **not** a substitute for a local GPS reference, and it should not be the
 only source on a machine that has one. What it is good for is a machine with no
 reference of its own, a sanity check against a clock you do not trust, or the
 pleasure of running a clock off a shortwave broadcast.
 
-Sub-100 ms claims are unproven in one specific respect, and it is worth knowing
-which: the decoder carries a chain-delay constant calibrated upstream against
-real WWV audio through a real receive chain, and it has never been validated
-against an off-air recording at the two rates used here. See *Provenance*.
+The residual uncertainty is concentrated in the constants every source shares,
+and they are the ones nothing in this arrangement can measure: the chain-delay
+constant, the codec delay, and the decoder's edge bias all cancel between
+receivers. The chain constant is known to be about 3 ms large and has never been
+validated against an off-air recording at the two rates used here.
 
 ## Build
 
