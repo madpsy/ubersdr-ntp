@@ -84,8 +84,8 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // It is a property of the software, the same on every instance, so it is one
 // constant rather than something each operator has to calibrate.
 //
-// Measured live, 2026-09-13, against K3FEF (Milford PA) hearing WWV on 10 and
-// 15 MHz for 14 minutes of lock, from a host disciplined by ntpd to about
+// Measured live, 2026-09-13, against a north-eastern US receiver hearing WWV on
+// 10 and 15 MHz for 14 minutes of lock, from a host disciplined by ntpd to about
 // 1.4 ms: with this term equal to the decoder bias above, the served offset
 // averaged +0.1 ms and stayed within ±2.6 ms. One receiver and one session, so
 // good to perhaps ±2.5 ms; worth refining against more receivers.
@@ -1157,18 +1157,18 @@ bool Source::ensureDecoder(int rate) {
     auto reference = [] { return hostNowFields(static_cast<long long>(realtimeNow() * 1000.0)); };
 
     if (wwvb) {
-        m_wwvb = std::make_unique<AetherSDR::WwvbDecoder>(rate);
-        m_wwvb->onStateChanged = [this](AetherSDR::ClockLockState s) { onClockState(s); };
-        m_wwvb->onSecond = [this](const AetherSDR::ClockSecondInfo& i) { onClockSecond(i); };
-        m_wwvb->onFrame = [this](const AetherSDR::ClockFrameInfo& f) { onClockFrame(f); };
-        m_wwvb->onTime = [this](const AetherSDR::ClockTimeInfo& t) { onClockTime(t); };
+        m_wwvb = std::make_unique<clockdec::WwvbDecoder>(rate);
+        m_wwvb->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
+        m_wwvb->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
+        m_wwvb->onFrame = [this](const clockdec::ClockFrameInfo& f) { onClockFrame(f); };
+        m_wwvb->onTime = [this](const clockdec::ClockTimeInfo& t) { onClockTime(t); };
         m_wwvb->setPlausibility(reference, 24 * 60);
     } else {
-        m_wwv = std::make_unique<AetherSDR::WwvDecoder>(rate);
-        m_wwv->onStateChanged = [this](AetherSDR::ClockLockState s) { onClockState(s); };
-        m_wwv->onSecond = [this](const AetherSDR::ClockSecondInfo& i) { onClockSecond(i); };
-        m_wwv->onFrame = [this](const AetherSDR::ClockFrameInfo& f) { onClockFrame(f); };
-        m_wwv->onTime = [this](const AetherSDR::ClockTimeInfo& t) { onClockTime(t); };
+        m_wwv = std::make_unique<clockdec::WwvDecoder>(rate);
+        m_wwv->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
+        m_wwv->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
+        m_wwv->onFrame = [this](const clockdec::ClockFrameInfo& f) { onClockFrame(f); };
+        m_wwv->onTime = [this](const clockdec::ClockTimeInfo& t) { onClockTime(t); };
         m_wwv->setPlausibility(reference, 24 * 60);
     }
 
@@ -1215,17 +1215,17 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     m_snap.windowSize = d.windowSize;
     m_snap.voteQuality = d.voteQuality;
     m_snap.samplesConsumed = consumed;
-    switch (static_cast<AetherSDR::ClockLockRefusal>(d.refusalReason)) {
-        case AetherSDR::ClockLockRefusal::QualityFloor: m_snap.refusal = "quality_floor"; break;
-        case AetherSDR::ClockLockRefusal::Plausibility: m_snap.refusal = "plausibility"; break;
-        case AetherSDR::ClockLockRefusal::Staleness:    m_snap.refusal = "staleness"; break;
-        case AetherSDR::ClockLockRefusal::Contested:    m_snap.refusal = "contested"; break;
+    switch (static_cast<clockdec::ClockLockRefusal>(d.refusalReason)) {
+        case clockdec::ClockLockRefusal::QualityFloor: m_snap.refusal = "quality_floor"; break;
+        case clockdec::ClockLockRefusal::Plausibility: m_snap.refusal = "plausibility"; break;
+        case clockdec::ClockLockRefusal::Staleness:    m_snap.refusal = "staleness"; break;
+        case clockdec::ClockLockRefusal::Contested:    m_snap.refusal = "contested"; break;
         default: m_snap.refusal = "none"; break;
     }
     switch (st) {
-        case AetherSDR::ClockStation::Wwv:  m_snap.station = "wwv"; break;
-        case AetherSDR::ClockStation::Wwvh: m_snap.station = "wwvh"; break;
-        case AetherSDR::ClockStation::Wwvb: m_snap.station = "wwvb"; break;
+        case clockdec::ClockStation::Wwv:  m_snap.station = "wwv"; break;
+        case clockdec::ClockStation::Wwvh: m_snap.station = "wwvh"; break;
+        case clockdec::ClockStation::Wwvb: m_snap.station = "wwvb"; break;
         default: m_snap.station = "unknown"; break;
     }
 
@@ -1277,17 +1277,17 @@ void Source::resetStream(const char* why) {
 // ---------------------------------------------------------------------------
 // Decoder callbacks
 
-void Source::onClockState(AetherSDR::ClockLockState s) {
+void Source::onClockState(clockdec::ClockLockState s) {
     const char* name = "nosignal";
     switch (s) {
-        case AetherSDR::ClockLockState::Locked:    name = "locked"; break;
-        case AetherSDR::ClockLockState::Acquiring: name = "acquiring"; break;
+        case clockdec::ClockLockState::Locked:    name = "locked"; break;
+        case clockdec::ClockLockState::Acquiring: name = "acquiring"; break;
         default: break;
     }
     {
         std::lock_guard<std::mutex> lk(m_mu);
         m_snap.clockState = name;
-        if (s != AetherSDR::ClockLockState::Locked) {
+        if (s != clockdec::ClockLockState::Locked) {
             // An anchor that outlived its lock would keep extending one second
             // at a time through a signal the decoder no longer trusts, quietly
             // manufacturing offsets from nothing.
@@ -1297,7 +1297,7 @@ void Source::onClockState(AetherSDR::ClockLockState s) {
     LOG_INFO(m_cfg.name.c_str(), "state -> %s", name);
 }
 
-void Source::onClockFrame(const AetherSDR::ClockFrameInfo& f) {
+void Source::onClockFrame(const clockdec::ClockFrameInfo& f) {
     std::lock_guard<std::mutex> lk(m_mu);
     // Recorded whether or not anything is emitted: onClockTime composes its
     // timestamp against this frame's second 0, and a `time` event that arrived
@@ -1329,7 +1329,7 @@ long long leapBoundaryAfter(long long ms) {
 
 } // namespace
 
-void Source::onClockTime(const AetherSDR::ClockTimeInfo& t) {
+void Source::onClockTime(const clockdec::ClockTimeInfo& t) {
     if (t.year2 < 0 || t.doy < 1 || t.hour < 0 || t.minute < 0) return;
 
     // Composed exactly as the reference front end does: the voted frame's
@@ -1367,7 +1367,7 @@ void Source::onClockTime(const AetherSDR::ClockTimeInfo& t) {
     m_snap.lastDecodedUtc = iso8601(decodedMs);
 }
 
-void Source::onClockSecond(const AetherSDR::ClockSecondInfo& i) {
+void Source::onClockSecond(const clockdec::ClockSecondInfo& i) {
     // Only an edge the decoder actually measured becomes an offset sample.
     // Second 0 carries no pulse, and a weak or coasted second reports where the
     // tracker expects the edge rather than where it was heard: correct, but it

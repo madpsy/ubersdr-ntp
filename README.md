@@ -19,9 +19,9 @@ about hardware.
 It is a **stratum-1 radio clock**: its reference is not another NTP server. That
 is a statement about topology, not accuracy.
 
-**Measured**, against K3FEF in Milford PA hearing Fort Collins on 10 and 15 MHz,
-with the receiver 2516 km away and 97 ms of network round trip between it and
-the client:
+**Measured**, against a public receiver in the north-eastern US hearing Fort
+Collins on 10 and 15 MHz, with the receiver 2516 km away and 97 ms of network
+round trip between it and the client:
 
 | | |
 |---|---|
@@ -248,7 +248,7 @@ The part nothing in the stream can see is the delay inside the receiver —
 because a constant delay is indistinguishable from a clock that is simply wrong.
 But it is a property of the software, the same on every UberSDR instance, so it
 is one built-in constant rather than something to calibrate per receiver. It was
-measured live against K3FEF hearing WWV on 10 and 15 MHz, from a host
+measured live against one receiver hearing WWV on 10 and 15 MHz, from a host
 disciplined by ntpd: served time averaged +0.1 ms and stayed within ±2.6 ms over
 14 minutes of lock. That is one receiver, so treat the constant as good to a few
 milliseconds.
@@ -327,7 +327,7 @@ decode, and no protection against a bad delay model. Several receivers is both.
 
 ### A practical limit
 
-Public receivers usually cap concurrent sessions per IP — K3FEF allows two — so
+Public receivers usually cap concurrent sessions per IP — two is typical — so
 several frequencies on one receiver often is not possible. Multi-source
 redundancy in practice means several *receivers*, which is better anyway: it
 decorrelates the propagation path as well as the frequency. A bypass password,
@@ -481,10 +481,9 @@ across a change in the offset, because the boundary moves with the correction.
 
 `src/clock/WwvDecoder.*`, `src/clock/WwvbDecoder.*` and
 `src/clock/TimeFrameVoter.*` come from
-[ubersdr-clock](https://github.com/madpsy/ubersdr-clock), which took them from
-[AetherSDR](https://github.com/aethersdr/AetherSDR), where they are the DSP half
-of its AetherClock feature. They have since been changed here, so an upstream
-fix needs a diff rather than a `cp`:
+[ubersdr-clock](https://github.com/madpsy/ubersdr-clock), where they are the DSP
+half of its clock feature. They have since been changed here, so an upstream fix
+needs a diff rather than a `cp`:
 
 - sub-sample second edges: WWVB from the carrier-drop crossing, WWV from a
   smoothed matched-filter shift;
@@ -509,5 +508,5 @@ Format facts throughout are per NIST SP 432 (WWV/WWVH) and NIST SP 250-67
 
 ## Licence
 
-GPL-3.0-or-later, inherited from AetherSDR by way of ubersdr-clock. See
+GPL-3.0-or-later, inherited with the decoders by way of ubersdr-clock. See
 [LICENSE](LICENSE).

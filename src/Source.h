@@ -173,10 +173,10 @@ private:
     void resetStream(const char* why);
 
     // Decoder callbacks.
-    void onClockState(AetherSDR::ClockLockState s);
-    void onClockSecond(const AetherSDR::ClockSecondInfo& i);
-    void onClockFrame(const AetherSDR::ClockFrameInfo& f);
-    void onClockTime(const AetherSDR::ClockTimeInfo& t);
+    void onClockState(clockdec::ClockLockState s);
+    void onClockSecond(const clockdec::ClockSecondInfo& i);
+    void onClockFrame(const clockdec::ClockFrameInfo& f);
+    void onClockTime(const clockdec::ClockTimeInfo& t);
 
     void addOffsetSample(double offsetSec, double atRealtime);
     void recomputeOffset();     // caller holds m_mu
@@ -228,8 +228,8 @@ private:
     std::vector<std::int16_t> m_silence;
 
     // clock decoder
-    std::unique_ptr<AetherSDR::WwvDecoder> m_wwv;
-    std::unique_ptr<AetherSDR::WwvbDecoder> m_wwvb;
+    std::unique_ptr<clockdec::WwvDecoder> m_wwv;
+    std::unique_ptr<clockdec::WwvbDecoder> m_wwvb;
     int m_decoderRate = 0;
     bool m_rateRefused = false;
     std::int64_t m_samplesWritten = 0;

@@ -42,7 +42,7 @@ target_compile_options(ixwebsocket_vendored PRIVATE -w)
 # ---------------------------------------------------------------------------
 # The time-code decoders.
 #
-# Taken from ubersdr-clock, which took them from AetherSDR, and since changed
+# Taken from ubersdr-clock and since changed
 # here: sub-sample edge timing, the WWV/WWVH station tag, leap-second minutes
 # and the WWVB DST bits. An upstream fix is no longer a straight `cp` -- diff
 # first. The voter's calibration constants, and WwvDecoder's

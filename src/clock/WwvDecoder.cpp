@@ -4,11 +4,11 @@
 
 // WWV/WWVH 100 Hz-subcarrier BCD time-code decoder — streaming implementation.
 //
-// Ports the MATH of the gate-passed AetherClock reference chain
+// Ports the MATH of the gate-passed reference chain
 // (research/wwv_decode_proto.py) to a sample-streaming front-end: the
 // prototype's whole-file FFT stages become biquad cascades + running mixers +
 // decimated per-second work, per the NIST WWV/WWVH time-code table (NIST
-// SP 432) and the AetherClock reference chain documented in WwvDecoder.h.
+// SP 432) and the reference chain documented in WwvDecoder.h.
 //
 // Chain (identical intent to the prototype, streaming realization):
 //   analytic bandpass 700-1300 Hz (biquad cascade) -> rectify+LPF envelope
@@ -30,7 +30,7 @@
 #include <limits>
 #include <vector>
 
-namespace AetherSDR {
+namespace clockdec {
 
 namespace {
 
@@ -1111,4 +1111,4 @@ ClockDecoderDiagnostics WwvDecoder::diagnostics() const {
     return g;
 }
 
-} // namespace AetherSDR
+} // namespace clockdec

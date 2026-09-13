@@ -5,7 +5,7 @@
 #include <utility>
 #include <vector>
 
-// Cross-frame confidence-weighted voting per the AetherClock reference decoder:
+// Cross-frame confidence-weighted voting per the upstream reference decoder:
 // a bit's vote is the sum of its per-frame matched-filter margins (floored at
 // 0.01), with older frames discounted by agingFactor^age. Markers and Unknown
 // symbols never vote. The timestamp vote is NORMALIZE-then-COHERENCE-GATED-
@@ -20,7 +20,7 @@
 // never disagree. Lock gates on consecutive +1 minute increments plus
 // self-consistent static fields.
 
-namespace AetherSDR {
+namespace clockdec {
 
 namespace {
 
@@ -631,4 +631,4 @@ float TimeFrameVoter::lockConfidence() const {
     return static_cast<float>(std::clamp(quality, 0.0, 1.0));
 }
 
-} // namespace AetherSDR
+} // namespace clockdec

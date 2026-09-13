@@ -41,7 +41,7 @@
 #include <thread>
 #include <vector>
 
-using namespace AetherSDR;
+using namespace clockdec;
 namespace civ = ubersdr_ntp;
 
 namespace {

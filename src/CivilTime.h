@@ -71,13 +71,13 @@ inline std::string iso8601(long long ms) {
 
 // The host clock in the form the voter's plausibility gate wants. Called from
 // inside process() on the audio thread, so it stays four integer divisions.
-inline AetherSDR::TimeFields hostNowFields(long long hostMs) {
+inline clockdec::TimeFields hostNowFields(long long hostMs) {
     const long long secs = floorDiv(hostMs, 1000);
     const long long days = floorDiv(secs, 86400);
     const long long rem = floorMod(secs, 86400);
     int y = 0; unsigned mo = 0, d = 0;
     civilFromDays(days, y, mo, d);
-    AetherSDR::TimeFields tf;
+    clockdec::TimeFields tf;
     tf.minute = static_cast<int>((rem / 60) % 60);
     tf.hour = static_cast<int>(rem / 3600);
     tf.doy = static_cast<int>(days - daysFromCivil(y, 1, 1)) + 1;

@@ -32,7 +32,7 @@
 // classify (0.2/0.5/0.8 s low durations; confidence = correlation margin) ->
 // double-marker minute sync -> NIST WWVB BCD map -> TimeFrameVoter.
 
-namespace AetherSDR {
+namespace clockdec {
 
 namespace {
 
@@ -911,4 +911,4 @@ ClockDecoderDiagnostics WwvbDecoder::diagnostics() const {
     return g;
 }
 
-} // namespace AetherSDR
+} // namespace clockdec

@@ -1,7 +1,7 @@
 #pragma once
 
 // WWV/WWVH 100 Hz-subcarrier BCD time-code decoder — streaming port of the
-// gate-passed AetherClock reference chain (research/wwv_decode_proto.py).
+// gate-passed reference chain (research/wwv_decode_proto.py).
 // Format facts per the NIST WWV/WWVH time-code table (NIST SP 432).
 //
 // Input contract: 24 kHz mono float32 from a slice tuned USB at
@@ -27,7 +27,7 @@
 #include <functional>
 #include <memory>
 
-namespace AetherSDR {
+namespace clockdec {
 
 class WwvDecoder {
 public:
@@ -70,4 +70,4 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
-} // namespace AetherSDR
+} // namespace clockdec

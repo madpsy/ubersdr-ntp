@@ -28,7 +28,7 @@
 #include <functional>
 #include <memory>
 
-namespace AetherSDR {
+namespace clockdec {
 
 class WwvbDecoder {
 public:
@@ -70,4 +70,4 @@ private:
     std::unique_ptr<Impl> m_impl;
 };
 
-} // namespace AetherSDR
+} // namespace clockdec

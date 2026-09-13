@@ -1,6 +1,6 @@
 #pragma once
 
-// AetherClock shared time-frame machinery: the per-second/per-frame result
+// Shared time-frame machinery: the per-second/per-frame result
 // types both time-signal decoders emit, plus cross-frame confidence-weighted
 // bit voting over a sliding window of decoded frames.
 //
@@ -18,7 +18,7 @@
 #include <limits>
 #include <vector>
 
-namespace AetherSDR {
+namespace clockdec {
 
 // Classified per-second symbol of an AM time-code frame.
 enum class ClockSymbol : int8_t {
@@ -374,4 +374,4 @@ private:
     LockVerdict lockVerdict() const;
 };
 
-} // namespace AetherSDR
+} // namespace clockdec
