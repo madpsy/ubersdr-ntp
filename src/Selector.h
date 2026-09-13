@@ -43,12 +43,34 @@
 
 #include "Source.h"
 
+#include <map>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
 
 namespace ubersdr_ntp {
+
+// What one source's corrected offset says against the others'.
+//
+// Every source is listening to the same transmitter, so once each one's delay
+// model has done its job they must all report the same offset -- not nearly,
+// exactly, because the event they are timing is one event. Whatever is left
+// over is model error by construction, and it is the only part of the delay
+// budget that can be observed at all: the terms every source shares (the
+// receiver chain, the codec, the decoder's bias) cancel in the comparison and
+// no amount of agreement between receivers can measure them. What survives is
+// the part that differs -- the network path and the propagation path -- which
+// is also the part that goes wrong.
+struct SourceResidual {
+    std::string name;
+    double instantSec = 0.0;  // against the median of the OTHERS, right now
+    double averagedSec = 0.0; // ...smoothed, because one edge proves nothing
+    bool haveAverage = false;
+    int peers = 0;            // how many others it was compared against
+    bool refused = false;     // ...and it disagreed with them past explaining
+    double settledForSec = 0.0; // how long it has been measured at all
+};
 
 struct Combined {
     bool valid = false;         // an offset is available at all
@@ -63,6 +85,7 @@ struct Combined {
     std::vector<std::string> usedNames;
     std::vector<std::string> rejectedNames;
     std::string note;           // why it is not synchronised, when it is not
+    std::vector<SourceResidual> residuals;
 };
 
 class Selector {
@@ -80,6 +103,18 @@ public:
 private:
     mutable std::mutex m_mu;
     Combined m_last;
+
+    // Per-source agreement with the consensus, smoothed over TIME rather than
+    // over calls: combine() runs four times a second, so a per-call smoothing
+    // factor describes a window that changes whenever that rate does, and a
+    // figure meant to average out a fade would instead average out five
+    // seconds of it.
+    struct ResidualState {
+        double averagedSec = 0.0;
+        double lastAtSec = 0.0;
+        double firstAtSec = 0.0;
+    };
+    std::map<std::string, ResidualState> m_residualAvg;
 
     // The coasting state: the last good offset and when it was good.
     bool m_haveLast = false;

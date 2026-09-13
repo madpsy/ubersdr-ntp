@@ -1043,6 +1043,23 @@ void Source::trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamp
 
     constexpr double kBlockSec = 1.0;
     constexpr double kMaxFillSec = 1.5;
+    // How far the block minimum may wander BACKWARDS before the mapping is
+    // treated as broken rather than noisy.
+    //
+    // This was half a frame, 10 ms, and that is inside the noise. The figure
+    // compared is a MINIMUM over the block, which is the statistic a single
+    // early-stamped frame moves the furthest, and a receiver measured here
+    // tripped it five times in seven minutes with steps of 11 to 16 ms --
+    // every one of them just past the line. Each trip threw away the sample
+    // clock and every offset behind it, so the source never held a lock long
+    // enough to contribute, while its signal was the best of the three.
+    //
+    // 100 ms is five frames: far above the jitter that was tripping it, and
+    // far below a genuine discontinuity, which means a restarted stream or a
+    // changed origin and arrives in tens of milliseconds at least. Absorbing a
+    // small backward step costs nothing anyway -- the baseline simply follows
+    // it, and the sample-to-host mapping is the arrival fit, not this.
+    constexpr double kMaxBackStepSec = 0.1;
 
     if (!m_tsHave) {
         m_tsHave = true;
@@ -1076,14 +1093,18 @@ void Source::trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamp
                 feedSilence(fill, rate);
             }
             m_tsBaseline = m_tsBlockMin - static_cast<double>(fill) / rate;
-        } else if (step > kMaxFillSec || step < -0.5 * frameSec) {
+        } else if (step > kMaxFillSec || step < -kMaxBackStepSec) {
             LOG_WARN(m_cfg.name.c_str(), "stream timestamps stepped %+.0f ms against the sample "
                      "count; rebuilding the sample clock", step * 1000.0);
             discardTiming("stream timestamp discontinuity");
             m_tsBaseline = m_tsBlockMin;
         } else {
-            // Within half a frame: the ordinary wander of the minimum and the
-            // slow drift between radiod's sample clock and the server's.
+            // Ordinary wander of the minimum, and the slow drift between
+            // radiod's sample clock and the server's.
+            if (step < -0.5 * frameSec) {
+                LOG_DEBUG(m_cfg.name.c_str(), "stream timestamps wandered %+.0f ms; absorbed",
+                          step * 1000.0);
+            }
             m_tsBaseline = m_tsBlockMin;
         }
         m_tsBlockHave = false;

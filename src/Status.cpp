@@ -160,6 +160,18 @@ std::string renderStatusBlock(const StatusInput& in) {
     }
     o << '\n';
 
+    if (in.combined.residuals.size() >= 2) {
+        o << "agreement: ";
+        bool first = true;
+        for (const SourceResidual& r : in.combined.residuals) {
+            if (!first) o << ",  ";
+            first = false;
+            o << r.name << ' ' << formatOffsetMs(r.averagedSec);
+            if (r.refused) o << " REFUSED";
+        }
+        o << "   (each against its peers — same transmitter, so this is model error)\n";
+    }
+
     o << "ntp :123 -> " << in.ntpPort << ": " << in.ntp.requests << " requests, "
       << in.ntp.answered << " answered, " << in.ntp.ignored << " ignored, "
       << in.ntp.rateLimited << " rate-limited";
@@ -317,6 +329,17 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
     served["refid"] = in.combined.refid;
     served["offset_ms"] = in.combined.offsetSec * 1000.0;
     served["root_dispersion_ms"] = in.combined.dispersionSec * 1000.0;
+    {
+        json ag = json::array();
+        for (const SourceResidual& r : in.combined.residuals) {
+            ag.push_back({{"name", r.name},
+                          {"residual_ms", r.averagedSec * 1000.0},
+                          {"instant_ms", r.instantSec * 1000.0},
+                          {"peers", r.peers},
+                          {"refused", r.refused}});
+        }
+        served["agreement"] = std::move(ag);
+    }
     served["age_seconds"] = in.combined.ageSec;
     served["sources_used"] = in.combined.used;
     served["sources_candidate"] = in.combined.candidates;

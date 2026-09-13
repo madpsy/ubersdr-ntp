@@ -239,7 +239,7 @@ audio stream measures:
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
 | Network | 5–100 ms | Measured, as half the round trip of a WebSocket ping down the audio connection itself |
 | Codec | 8 ms (Opus), 0 (PCM v4) | A measured constant |
-| UberSDR chain | 13.6 ms | A constant: RF reaching the SDR to audio leaving the WebSocket |
+| UberSDR chain | 13.6 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. **Known to be about 3 ms too large** — see below |
 | Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB) | A measured constant, from `tools/decodertest.cpp` |
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
 
@@ -254,6 +254,28 @@ measures the path the audio actually takes. On a receiver served directly the
 two agree — 96.3 ms against a 96.6 ms handshake on one measured here — so this
 changes nothing except for the receivers that were being measured wrongly. The
 HTTP figure remains the fallback for a server too old to answer a ping.
+
+### The chain constant is about 3 ms too large
+
+Measured over an evening against two receivers and a host disciplined to
++0.15 ms, served time ran **+3.4 ms** (sd 1.7, n=122); an earlier session gave
++5.4 ms. Something common to every source over-counts by a few milliseconds,
+and the chain constant is the loosest term in the budget, so it is the
+suspect.
+
+It has not been changed, for a reason worth stating. The terms every source
+shares cannot be measured by comparing sources: two receivers hearing the same
+transmitter cancel the chain delay, the codec delay and the decoder bias
+exactly, so they agree just as well whatever those are set to. Only an absolute
+reference can see the common mode, and over the same evening the two receivers
+wandered ±11 ms against *each other* — so a single evening cannot separate a
+fixed over-count from the ionosphere, and re-deriving the constant from one
+session would bake that night's propagation into a figure that claims to
+describe a buffer. Pinning it wants a run spanning day and night.
+
+Until then the bias is inside the dispersion the server advertises, which is
+the honest place for it: the answer is a few milliseconds high and says it
+could be sixteen out.
 
 The part nothing in the stream can see is the delay inside the receiver —
 `radiod`'s demodulator and filters, its block framing, the server's handling —
@@ -324,6 +346,33 @@ hand, and regains it when the stream settles.
 
 With one source there is nothing to intersect and the answer is that source's
 offset and its dispersion — the correct and slightly humbling result.
+
+### The consensus veto
+
+Every source hears the same transmitter, so once each delay model has done its
+job they must all report the same offset — not nearly, exactly, because the
+event they are timing is one event. Each source's smoothed distance from the
+median of all of them is therefore model error by construction, and it is
+reported per source as `agreement`.
+
+A source more than 30 ms from that median is refused outright. Nothing the
+sources do not share reaches that far: the propagation difference between two
+receivers on one continent is under 20 ms, and the largest genuine
+disagreement available — one hearing WWVH in Hawaii while the others hear WWV
+in Colorado — is about 19 ms and is modelled from the decoder's own station
+tag. Out there, a source has decoded something else. Live, a receiver whose
+edge tracker had locked about 100 ms late was refused 3325 times over forty
+minutes while the other two were never refused once.
+
+It is deliberately a veto and not a correction. Learning a per-source offset
+that made a disagreeing receiver agree would have absorbed that 100 ms into its
+delay model and reported a healthy source, turning the one fault the
+arrangement can detect into one it cannot. The agreement figure says which
+source to distrust; it is not licence to bend the model until nobody disagrees.
+
+Two sources cannot use any of this: their residuals come out equal and opposite
+whichever of them is wrong, which is not a defect to be worked around but what
+two measurements of one event can tell you. Three is where it starts to work.
 
 Set `ntp.min_sources: 2` if you want the agreement test to be load-bearing.
 

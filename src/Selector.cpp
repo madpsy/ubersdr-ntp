@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <set>
 
 namespace ubersdr_ntp {
 
@@ -14,6 +15,42 @@ namespace {
 // decoder itself holds a lock through, short enough that a dead source is not
 // still voting ten minutes later.
 constexpr double kCandidateMaxAgeSec = 180.0;
+
+// The time constant of a source's running disagreement with the consensus.
+// Five minutes: long enough that a fade, or one badly placed second edge, is
+// averaged away, short enough that a receiver that has genuinely gone wrong is
+// caught before it has served much.
+constexpr double kResidualTauSec = 300.0;
+
+// And how long a source must have been measured before that average is allowed
+// to convict it. A source that has just become a candidate has an average made
+// of one reading, and the reading it starts on is the one taken while its
+// offsets were still settling -- which is exactly when it looks worst. Live,
+// that refused a good receiver six times in the seconds after a third source
+// joined, on a transient that was gone by the next minute.
+constexpr double kResidualSettleSec = 120.0;
+
+constexpr const char* kTag = "selector";
+
+// A source must be judged against at least this many others before its
+// disagreement means anything. Two sources produce equal and opposite
+// residuals whichever of them is wrong, so one peer is not enough to convict.
+constexpr int kMinPeersToJudge = 2;
+
+// How far a source may sit from the consensus before it is refused outright.
+//
+// Everything the sources genuinely do not share is bounded and small: the
+// propagation difference between two receivers on this continent is under
+// 20 ms, and the largest real disagreement available -- one receiver hearing
+// WWVH in Hawaii while the others hear WWV in Colorado -- is about 19 ms, and
+// is modelled anyway from the decoder's own station tag. Past 30 ms there is
+// no physical arrangement of receivers that explains it: they are listening to
+// one transmitter and one second edge. So a source out there is not a source
+// with a bad delay model, it is a source that has decoded something else, and
+// it is refused rather than averaged in. Measured live, a receiver whose edge
+// tracker had locked about 100 ms late sat at -103 ms while the other two
+// agreed to half a millisecond.
+constexpr double kMaxDisagreementSec = 0.030;
 
 // NTP reference identifiers for a stratum-1 server, as registered in RFC 5905.
 // Four ASCII characters, left-justified and null-padded.
@@ -59,6 +96,81 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
                                  s.weight > 0.0 ? s.weight : 1.0});
     }
     c.candidates = static_cast<int>(cand.size());
+
+    // --- agreement ----------------------------------------------------------
+    //
+    // Against the median of ALL of them, self included, and not against each
+    // source's peers alone. Leave-one-out is the obvious construction and it is
+    // wrong here: with three sources each one has two peers, the median of two
+    // is their mean, and one source that is badly wrong therefore drags the
+    // figure every OTHER source is judged against. Measured live, a receiver
+    // 103 ms out made the two good ones read 36 ms out. The median of three
+    // survives one outlier, which is the whole reason to prefer a median, and
+    // the source that is actually wrong is the one left standing apart.
+    //
+    // With two sources the median is their mean and neither can be told from
+    // the other: the residuals come out as equal and opposite whatever the
+    // truth is. That is not a defect to be worked around, it is what two
+    // measurements of one event can tell you. Hence kMinPeersToJudge.
+    std::set<std::string> refused;
+    std::vector<double> all;
+    all.reserve(cand.size());
+    for (const Candidate& k : cand) all.push_back(k.offset);
+    std::sort(all.begin(), all.end());
+    const std::size_t amid = all.size() / 2;
+    const double consensus = all.empty() ? 0.0
+                           : ((all.size() % 2) ? all[amid] : 0.5 * (all[amid - 1] + all[amid]));
+
+    for (const Candidate& k : cand) {
+        SourceResidual r;
+        r.name = k.s->name;
+        r.instantSec = k.offset - consensus;
+        r.peers = static_cast<int>(cand.size()) - 1;
+
+        auto it = m_residualAvg.find(r.name);
+        if (it == m_residualAvg.end()) {
+            ResidualState fresh;
+            fresh.averagedSec = r.instantSec;
+            fresh.lastAtSec = nowRealtime;
+            fresh.firstAtSec = nowRealtime;
+            it = m_residualAvg.emplace(r.name, fresh).first;
+        } else {
+            const double dt = nowRealtime - it->second.lastAtSec;
+            if (dt > 0.0) {
+                const double alpha = 1.0 - std::exp(-dt / kResidualTauSec);
+                it->second.averagedSec += alpha * (r.instantSec - it->second.averagedSec);
+                it->second.lastAtSec = nowRealtime;
+            }
+        }
+        r.averagedSec = it->second.averagedSec;
+        r.settledForSec = nowRealtime - it->second.firstAtSec;
+        r.haveAverage = true;
+        r.refused = r.peers >= kMinPeersToJudge &&
+                    r.settledForSec >= kResidualSettleSec &&
+                    std::abs(r.averagedSec) > kMaxDisagreementSec;
+        if (r.refused) refused.insert(r.name);
+        c.residuals.push_back(std::move(r));
+    }
+
+    // Drop what the consensus refuses. This is deliberately NOT a correction:
+    // a source that disagrees is telling you it decoded something else, and
+    // learning an offset that makes it agree would turn a detected fault into
+    // an undetectable one.
+    if (!refused.empty()) {
+        std::vector<Candidate> kept;
+        for (const Candidate& k : cand) {
+            if (refused.count(k.s->name)) {
+                LOG_WARN(kTag, "%s disagrees with the other sources by %+.0f ms; "
+                         "not a delay model this far out — refusing it",
+                         k.s->name.c_str(), m_residualAvg[k.s->name].averagedSec * 1000.0);
+                c.rejectedNames.push_back(k.s->name);
+            } else {
+                kept.push_back(k);
+            }
+        }
+        cand.swap(kept);
+        c.candidates = static_cast<int>(cand.size());
+    }
 
     // --- Marzullo / Mills intersection -------------------------------------
     //
@@ -200,6 +312,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
     }
 
     c.candidates = static_cast<int>(cand.size());
+
     m_last = c;
     return c;
 }
