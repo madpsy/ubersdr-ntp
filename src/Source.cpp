@@ -2,6 +2,7 @@
 
 #include "CivilTime.h"
 #include "Log.h"
+#include "Version.h"
 #include "../third_party/json.hpp"
 #include "../third_party/pcm_v4.hpp"
 
@@ -68,6 +69,27 @@ constexpr double kAnchorMaxAgeSec = 300.0;
 // bias rather than noise: across clean and 3 dB-SNR signals the shift did not
 // move.
 constexpr double kOpusDelaySec = 0.008;
+
+// Where the WWV/WWVH decoder puts a second edge relative to the true edge in
+// its input: 13.6 ms EARLY, the matched filter's chain delay being taken as 7
+// series samples where it is 4.27. Measured, not estimated: tools/decodertest
+// generates WWV and WWVH and reports this mean over every edge it checks
+// (-13.645 / -13.637 ms, spread about ±1 ms). The WWVB decoder's edges are
+// exact to 0.02 ms, so it has no such term. Kept as a correction here rather
+// than fixed in the decoder, whose tracker is built around the upstream value.
+constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
+
+// The delay from RF reaching the SDR to the audio leaving UberSDR's WebSocket:
+// radiod's demodulator and filters, its block framing, the server's handling.
+// It is a property of the software, the same on every instance, so it is one
+// constant rather than something each operator has to calibrate.
+//
+// Measured live, 2026-09-13, against K3FEF (Milford PA) hearing WWV on 10 and
+// 15 MHz for 14 minutes of lock, from a host disciplined by ntpd to about
+// 1.4 ms: with this term equal to the decoder bias above, the served offset
+// averaged +0.1 ms and stayed within ±2.6 ms. One receiver and one session, so
+// good to perhaps ±2.5 ms; worth refining against more receivers.
+constexpr double kUberSdrChainDelaySec = 0.0136;
 
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
@@ -188,9 +210,8 @@ std::string httpToWs(const std::string& url) {
 
 // ---------------------------------------------------------------------------
 
-Source::Source(SourceConfig cfg, std::string userAgent)
+Source::Source(SourceConfig cfg)
     : m_cfg(std::move(cfg)),
-      m_userAgent(std::move(userAgent)),
       m_sessionId(makeUuidV4()),
       m_clock(12000) {
     m_snap.name = m_cfg.name;
@@ -222,20 +243,19 @@ void Source::start() {
 
 void Source::stop() {
     if (!m_running.exchange(false)) return;
+    // The wake mutex is taken, empty, before notifying. Without it the flag can
+    // flip and the notification fire between the supervisor testing its
+    // predicate and blocking, and a lost wakeup there costs a whole backoff
+    // interval — up to 37 s — on SIGTERM.
+    { std::lock_guard<std::mutex> lk(m_wake); }
     m_wakeCv.notify_all();
 
-    // A shared_ptr copy taken under the lock, so the socket cannot be destroyed
-    // underneath this call while the supervisor is replacing it. Stopping it
-    // here rather than only setting the flag matters because the supervisor may
-    // be waiting on a socket that will never say anything again, and a SIGTERM
-    // should not take a whole reconnect interval to act on.
-    std::shared_ptr<ix::WebSocket> ws;
-    {
-        std::lock_guard<std::mutex> lk(m_wsMu);
-        ws = m_ws;
-    }
-    if (ws) ws->stop();
-
+    // The socket is NOT stopped here. ix::WebSocket::stop() joins the socket's
+    // thread unguarded and the supervisor stops the same socket on its way out,
+    // so doing it from both threads is a double join. Nor does it need to be:
+    // the supervisor never waits on the socket, only on m_wakeCv, which the
+    // notify above ends at once — it then stops the socket itself, as promptly
+    // as this thread could have.
     if (m_thread.joinable()) m_thread.join();
     {
         std::lock_guard<std::mutex> lk(m_wsMu);
@@ -254,6 +274,11 @@ void Source::supervise() {
              m_cfg.url.c_str(), m_cfg.dialHz / 1e6, m_cfg.carrierHz / 1e6,
              formatName(m_cfg.format));
 
+    // At boot for the receiver's name and coordinates, and again after each
+    // successful connection for as long as the coordinates are still unknown —
+    // see the stream loop. Once only was not enough: a receiver unreachable at
+    // the moment this daemon started left the propagation term at zero for the
+    // life of the process, which is 9-15 ms of bias on a transatlantic path.
     fetchDescription();
 
     // Reconnection policy: forever, with exponential backoff capped at 30 s,
@@ -358,7 +383,7 @@ void Source::supervise() {
             m_ws = ws;
         }
         ws->setUrl(buildWsUrl());
-        ws->setExtraHeaders({{"User-Agent", m_userAgent}});
+        ws->setExtraHeaders({{"User-Agent", kUserAgent}});
         ws->disableAutomaticReconnection();   // reconnection is this loop's job,
                                                 // because it must re-POST /connection first
         ws->setHandshakeTimeout(20);
@@ -420,6 +445,18 @@ void Source::supervise() {
             if (!m_running.load()) break;
 
             if (m_socketOpen.load()) {
+                // Once per connection, after it has opened: the receiver has
+                // just answered HTTP, so this is the best moment to retry a
+                // description that failed. After the open rather than between
+                // /connection and the socket, so a slow description cannot
+                // delay the WebSocket past the session the handshake reserved.
+                bool locationKnown;
+                {
+                    std::lock_guard<std::mutex> lk(m_mu);
+                    locationKnown = m_snap.receiverLocation.valid;
+                }
+                if (!sawOpen && !locationKnown) fetchDescription();
+
                 sawOpen = true;
                 const double now = monotonicNow();
                 // Proved itself: it has been delivering for long enough that
@@ -509,11 +546,15 @@ bool Source::sessionHandshake(std::string& err) {
     json body;
     body["user_session_id"] = m_sessionId;
     if (!m_cfg.password.empty()) body["password"] = m_cfg.password;
-    const std::string payload = body.dump();
+    // Non-strict: a --password given on the command line is not validated as
+    // UTF-8 the way one from the JSON config is, and the strict dump() throws
+    // on invalid bytes — uncaught, on this thread, which terminates the daemon.
+    // Replacing them sends a password the server will refuse, and says so.
+    const std::string payload = body.dump(-1, ' ', false, json::error_handler_t::replace);
 
     std::string resp, curlErr;
     double rtt = 0.0;
-    const long code = httpRequest(m_cfg.url + "/connection", &payload, m_userAgent,
+    const long code = httpRequest(m_cfg.url + "/connection", &payload, kUserAgent,
                                   m_cfg.verifyTls, resp, rtt, curlErr);
     if (code < 0) { err = "POST /connection: " + curlErr; return false; }
 
@@ -552,23 +593,25 @@ bool Source::sessionHandshake(std::string& err) {
     return true;
 }
 
-void Source::fetchDescription() {
+bool Source::fetchDescription() {
     // Informational, and the source of the receiver's coordinates — which is
     // what makes the propagation delay computable rather than guessed. A
     // failure here is not fatal: the delay model falls back to whatever was
-    // configured.
+    // configured, and the supervisor tries again on the next connection.
     std::string resp, err;
     double rtt = 0.0;
-    const long code = httpRequest(m_cfg.url + "/api/description", nullptr, m_userAgent,
+    const long code = httpRequest(m_cfg.url + "/api/description", nullptr, kUserAgent,
                                   m_cfg.verifyTls, resp, rtt, err);
     if (code != 200) {
         LOG_DEBUG(m_cfg.name.c_str(), "/api/description unavailable (%ld %s)", code, err.c_str());
-        return;
+        return false;
     }
 
     try {
         const json j = json::parse(resp);
         std::lock_guard<std::mutex> lk(m_mu);
+        const bool hadLocation = m_snap.receiverLocation.valid;
+        m_snap.receiverName.clear();   // rebuilt below; a retry must not append twice
         recordRtt(rtt);
         if (j.contains("receiver") && j["receiver"].is_object()) {
             const json& r = j["receiver"];
@@ -594,22 +637,31 @@ void Source::fetchDescription() {
             }
         }
         updateDelayModel();
-        LOG_INFO(m_cfg.name.c_str(), "receiver: %s%s, http rtt %.0f ms",
-                 m_snap.receiverName.empty() ? "(unnamed)" : m_snap.receiverName.c_str(),
-                 m_snap.receiverLocation.valid ? "" : ", no coordinates published",
-                 m_snap.httpRttMs);
-        if (m_snap.receiverLocation.valid) {
-            LOG_INFO(m_cfg.name.c_str(), "path: %s", m_snap.pathDescription.c_str());
+        // Said at INFO the first time and when coordinates newly appear; a
+        // receiver that publishes none is retried on every reconnection, and
+        // repeating "no coordinates" each time would bury the log.
+        const bool worthSaying = !m_haveDescription || (!hadLocation && m_snap.receiverLocation.valid);
+        m_haveDescription = true;
+        if (worthSaying) {
+            LOG_INFO(m_cfg.name.c_str(), "receiver: %s%s, http rtt %.0f ms",
+                     m_snap.receiverName.empty() ? "(unnamed)" : m_snap.receiverName.c_str(),
+                     m_snap.receiverLocation.valid ? "" : ", no coordinates published",
+                     m_snap.httpRttMs);
+            if (m_snap.receiverLocation.valid) {
+                LOG_INFO(m_cfg.name.c_str(), "path: %s", m_snap.pathDescription.c_str());
+            }
         }
+        return true;
     } catch (const std::exception& e) {
         LOG_DEBUG(m_cfg.name.c_str(), "/api/description unparseable: %s", e.what());
+        return false;
     }
 }
 
 void Source::probeRtt() {
     std::string resp, err;
     double rtt = 0.0;
-    const long code = httpRequest(m_cfg.url + "/health", nullptr, m_userAgent,
+    const long code = httpRequest(m_cfg.url + "/health", nullptr, kUserAgent,
                                   m_cfg.verifyTls, resp, rtt, err);
     if (code < 0) {
         LOG_DEBUG(m_cfg.name.c_str(), "rtt probe failed: %s", err.c_str());
@@ -709,11 +761,30 @@ void Source::onText(const std::string& msg) {
 }
 
 void Source::onBinary(const std::string& msg) {
-    // The arrival timestamp is taken FIRST, before any parsing or decoding, and
-    // on CLOCK_REALTIME because that is the clock being measured. Everything
-    // below — header parsing, Opus, the whole DSP chain — happens after this
-    // read, so none of it can add to the number.
-    const double arrival = realtimeNow();
+    // The arrival timestamp is taken FIRST, before any parsing or decoding.
+    // Everything below — header parsing, Opus, the whole DSP chain — happens
+    // after this read, so none of it can add to the number.
+    //
+    // On CLOCK_MONOTONIC, and converted to REALTIME only where an offset is
+    // formed; SampleClock.h has why.
+    const double arrival = monotonicNow();
+
+    // A step of the host clock. The fit is immune, but every offset already in
+    // the window was measured against the clock as it was, and is now wrong by
+    // exactly the step: the median of them would go on serving the old error
+    // for up to two minutes. ntpd's slew is at most 500 ppm, ten microseconds
+    // between packets, so 5 ms can only be a step.
+    const double rtMinusMono = realtimeMinusMonotonic();
+    if (m_haveRtMinusMono && std::abs(rtMinusMono - m_lastRtMinusMono) > 0.005) {
+        LOG_WARN(m_cfg.name.c_str(), "host clock stepped by %+.1f ms; discarding offsets "
+                 "measured against the old clock", (rtMinusMono - m_lastRtMinusMono) * 1000.0);
+        std::lock_guard<std::mutex> lk(m_mu);
+        m_offsets.clear();
+        recomputeOffset();
+    }
+    m_lastRtMinusMono = rtMinusMono;
+    m_haveRtMinusMono = true;
+
     handleAudio(reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size(), arrival);
 }
 
@@ -728,6 +799,28 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
         m_lastAudioAt = monotonicNow();
     }
 
+    // A packet that cannot be decoded still happened, and still occupied its
+    // stretch of the stream. Dropping it without advancing the sample count
+    // slips every later sample index 20 ms earlier than the instant it was
+    // captured — a slip the SampleClock fit then averages in for five minutes.
+    // So a lost packet is replaced by something of the same length: Opus's own
+    // concealment where there is a decoder to ask, silence otherwise. Only once
+    // a timeline exists — before the first good packet there is nothing to
+    // keep in step.
+    auto concealLost = [this](int frameSamples) {
+        if (m_decoderRate <= 0 || m_samplesWritten <= 0) return;
+        const int n = frameSamples > 0 ? frameSamples : m_lastFrameSamples;
+        if (n <= 0) return;
+        if (m_opus && m_opusRate == m_decoderRate && n <= static_cast<int>(m_opusPcm.size())) {
+            const int got = opus_decode(m_opus, nullptr, 0, m_opusPcm.data(), n, 0);
+            if (got > 0) {
+                feedSamples(m_opusPcm.data(), got, m_decoderRate, 0.0, false);
+                return;
+            }
+        }
+        feedSilence(n, m_decoderRate);
+    };
+
     // A session that negotiated Opus still receives lossless frames the moment
     // it tunes to an IQ mode, so the frame itself has to say which it is. The
     // four-byte "PCM4" magic exists for exactly this; an Opus frame has no
@@ -737,15 +830,29 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
         ubersdr::PCMv4Header h;
         std::string err;
         if (!m_pcmv4->dec.decode(pkt, len, h, err)) {
-            std::lock_guard<std::mutex> lk(m_mu);
-            if (m_snap.decodeErrors++ % 200 == 0)
-                LOG_WARN(m_cfg.name.c_str(), "pcm v4 decode: %s", err.c_str());
+            {
+                std::lock_guard<std::mutex> lk(m_mu);
+                if (m_snap.decodeErrors++ % 200 == 0)
+                    LOG_WARN(m_cfg.name.c_str(), "pcm v4 decode: %s", err.c_str());
+            }
+            // The header is parsed before the body, so a sample count means
+            // the header survived and its timestamp can still be trusted. No
+            // count means the header itself failed, and the next timestamp is
+            // not to be read as a gap (see trackTimeline).
+            if (h.sampleCount > 0 && h.channels == 1 && h.sampleRate == m_decoderRate) {
+                trackTimeline(h.timestampNanos, h.sampleRate, h.sampleCount);
+                concealLost(h.sampleCount);
+            } else {
+                m_tsHave = false;
+                concealLost(0);
+            }
             return;
         }
         {
             std::lock_guard<std::mutex> lk(m_mu);
             m_snap.basebandPowerDb = h.basebandPower;
             m_snap.noiseDb = h.noise;
+            m_feedingOpus = 0;
         }
         if (h.channels != 1) {
             // Two channels means an IQ mode, which this is never tuned to.
@@ -753,6 +860,10 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
             // like a signal and decode to nothing.
             return;
         }
+        // ensureDecoder before the tracker, as on the Opus path: a rate change
+        // restarts the sample count the tracker is measuring against.
+        if (!ensureDecoder(h.sampleRate)) return;
+        trackTimeline(h.timestampNanos, h.sampleRate, h.sampleCount);
         feedSamples(m_pcmv4->dec.samples(), h.sampleCount, h.sampleRate, arrivalSec);
         return;
     }
@@ -772,20 +883,32 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
     std::size_t off = 0;
     std::string err;
     if (!m_opusHeader.decode(pkt, len, h, off, err)) {
-        std::lock_guard<std::mutex> lk(m_mu);
-        if (m_snap.decodeErrors++ % 200 == 0)
-            LOG_WARN(m_cfg.name.c_str(), "opus header: %s", err.c_str());
+        {
+            std::lock_guard<std::mutex> lk(m_mu);
+            if (m_snap.decodeErrors++ % 200 == 0)
+                LOG_WARN(m_cfg.name.c_str(), "opus header: %s", err.c_str());
+        }
+        // Every delta after this is relative to one never applied, so the
+        // timestamps are off by this packet's delta until the next full one.
+        m_tsHave = false;
+        m_tsWaitResync = true;
+        concealLost(0);
         return;
     }
     {
         std::lock_guard<std::mutex> lk(m_mu);
         m_snap.basebandPowerDb = h.basebandPower;
         m_snap.noiseDb = h.noise;
+        m_feedingOpus = 1;
     }
     if (h.channels != 1) return;
+    if (m_tsWaitResync && m_opusHeader.lastWasResync()) m_tsWaitResync = false;
 
+    // No minimum body length. A one-byte packet is a bare TOC and a valid Opus
+    // frame of the length it declares, and a zero-byte body asks the decoder
+    // for concealment; both occupy their 20 ms of the stream, and dropping them
+    // was a timeline slip.
     const std::size_t bodyLen = len - off;
-    if (bodyLen < 3) return;   // a squelched packet carries almost nothing
 
     if (!m_opus || m_opusRate != h.sampleRate) {
         if (m_opus) opus_decoder_destroy(m_opus);
@@ -804,19 +927,156 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
         LOG_INFO(m_cfg.name.c_str(), "opus decoder: %d Hz mono", h.sampleRate);
     }
 
-    const int n = opus_decode(m_opus, pkt + off, static_cast<opus_int32>(bodyLen),
-                              m_opusPcm.data(), static_cast<int>(m_opusPcm.size()), 0);
+    // The packet's own declared length, when it declares one, so a lost frame
+    // is concealed for as long as it actually was.
+    int declared = bodyLen > 0
+        ? opus_packet_get_nb_samples(pkt + off, static_cast<opus_int32>(bodyLen), h.sampleRate)
+        : 0;
+    if (declared <= 0 || declared > static_cast<int>(m_opusPcm.size())) declared = 0;
+
+    // ensureDecoder first, for the timeline: a rate change restarts the sample
+    // count, and the gap tracker must see the count it is about to extend.
+    if (!ensureDecoder(h.sampleRate)) return;
+    if (!m_tsWaitResync) {
+        trackTimeline(h.timestampNanos, h.sampleRate,
+                      declared > 0 ? declared : m_lastFrameSamples);
+    }
+
+    int n;
+    if (bodyLen == 0) {
+        const int frame = m_lastFrameSamples > 0 ? m_lastFrameSamples : h.sampleRate / 50;
+        n = opus_decode(m_opus, nullptr, 0, m_opusPcm.data(), frame, 0);
+    } else {
+        n = opus_decode(m_opus, pkt + off, static_cast<opus_int32>(bodyLen),
+                        m_opusPcm.data(), static_cast<int>(m_opusPcm.size()), 0);
+    }
     if (n < 0) {
-        std::lock_guard<std::mutex> lk(m_mu);
-        if (m_snap.decodeErrors++ % 200 == 0)
-            LOG_WARN(m_cfg.name.c_str(), "opus_decode: %s", opus_strerror(n));
+        {
+            std::lock_guard<std::mutex> lk(m_mu);
+            if (m_snap.decodeErrors++ % 200 == 0)
+                LOG_WARN(m_cfg.name.c_str(), "opus_decode: %s", opus_strerror(n));
+        }
+        concealLost(declared);
         return;
     }
     feedSamples(m_opusPcm.data(), n, h.sampleRate, arrivalSec);
 }
 
-void Source::ensureDecoder(int rate) {
-    if (m_decoderRate == rate && (m_wwv || m_wwvb)) return;
+void Source::feedSilence(int count, int rate) {
+    // In pieces of at most a second, so a long gap does not allocate its whole
+    // length and the decoders see blocks the size they are used to.
+    const int chunk = std::max(1, rate);
+    if (m_silence.size() < static_cast<std::size_t>(chunk)) m_silence.assign(chunk, 0);
+    while (count > 0) {
+        const int n = std::min(count, chunk);
+        feedSamples(m_silence.data(), n, rate, 0.0, false);
+        count -= n;
+    }
+}
+
+// Keeps m_samplesWritten in step with the stream as the server sent it.
+//
+// Every frame carries the server's time for its first sample, taken when radiod
+// delivered it. `stamp - samples/rate` is then constant for as long as nothing
+// goes missing between radiod and this decoder, and steps up by exactly the
+// missing duration when something does. Things do go missing where nothing here
+// can see them: the server drops a frame when a session's queue is full, drops
+// any that is not exactly 20 ms, skips one its encoder refuses, and radiod's
+// multicast is UDP. A lost frame that is not replaced slips every later sample
+// index one frame early against when it was captured.
+//
+// The stamp is the server's receive time, so it carries the server's scheduling
+// jitter: a Go collector pause makes a run of frames look late and then catch
+// up. That delay, like the network's, is bounded below and not above, so the
+// test is on the MINIMUM over one-second blocks: a late burst does not move a
+// block's minimum, a genuine loss moves every later one. A detected loss is
+// filled with silence up to a second after it happened — a second edge in that
+// second can be one frame out, which is one sample the offset median discards.
+//
+// A step down, or a step up too large to be a loss, is something the samples
+// cannot be made consistent with: the server's clock was stepped, or a filled
+// gap was not one. Then the sample-to-host mapping and anything derived from it
+// is dropped and rebuilt rather than trusted; the decoder keeps its lock.
+void Source::trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamples) {
+    if (rate <= 0 || rate != m_decoderRate) { m_tsHave = false; return; }
+    if (frameSamples > 0) m_lastFrameSamples = frameSamples;
+    if (m_lastFrameSamples <= 0) m_lastFrameSamples = rate / 50;
+
+    constexpr double kBlockSec = 1.0;
+    constexpr double kMaxFillSec = 1.5;
+
+    if (!m_tsHave) {
+        m_tsHave = true;
+        m_tsOriginNanos = timestampNanos;
+        m_tsOriginSample = m_samplesWritten;
+        m_tsBaseline = 0.0;
+        m_tsBlockHave = false;
+    }
+
+    // Relative to an origin so the doubles hold nanoseconds, not 1.7e9 seconds.
+    auto driftOf = [&](std::uint64_t ts) {
+        const double stamp = static_cast<double>(static_cast<std::int64_t>(ts - m_tsOriginNanos)) * 1e-9;
+        return stamp - static_cast<double>(m_samplesWritten - m_tsOriginSample) / rate;
+    };
+
+    if (m_tsBlockHave &&
+        static_cast<std::int64_t>(timestampNanos - m_tsBlockStartNanos) >= static_cast<std::int64_t>(kBlockSec * 1e9)) {
+        const double step = m_tsBlockMin - m_tsBaseline;
+        const double frameSec = static_cast<double>(m_lastFrameSamples) / rate;
+        if (step > 0.5 * frameSec && step <= kMaxFillSec) {
+            // Whole frames: the server only ever loses whole ones, and rounding
+            // to them keeps the estimate's jitter out of the fill.
+            const long long frames = std::llround(step / frameSec);
+            const int fill = static_cast<int>(frames * m_lastFrameSamples);
+            if (fill > 0) {
+                if (m_gapFills++ % 50 == 0) {
+                    LOG_INFO(m_cfg.name.c_str(), "stream lost %.0f ms of audio upstream; "
+                             "filled to keep the sample timeline (%llu fills so far)",
+                             fill * 1000.0 / rate, static_cast<unsigned long long>(m_gapFills));
+                }
+                feedSilence(fill, rate);
+            }
+            m_tsBaseline = m_tsBlockMin - static_cast<double>(fill) / rate;
+        } else if (step > kMaxFillSec || step < -0.5 * frameSec) {
+            LOG_WARN(m_cfg.name.c_str(), "stream timestamps stepped %+.0f ms against the sample "
+                     "count; rebuilding the sample clock", step * 1000.0);
+            discardTiming("stream timestamp discontinuity");
+            m_tsBaseline = m_tsBlockMin;
+        } else {
+            // Within half a frame: the ordinary wander of the minimum and the
+            // slow drift between radiod's sample clock and the server's.
+            m_tsBaseline = m_tsBlockMin;
+        }
+        m_tsBlockHave = false;
+    }
+
+    const double d = driftOf(timestampNanos);
+    if (!m_tsBlockHave) {
+        m_tsBlockHave = true;
+        m_tsBlockStartNanos = timestampNanos;
+        m_tsBlockMin = d;
+    } else {
+        m_tsBlockMin = std::min(m_tsBlockMin, d);
+    }
+}
+
+void Source::discardTiming(const char* why) {
+    // The decoder's own sample indices stay consistent with each other, so its
+    // lock survives; what cannot be trusted is their mapping to host time, and
+    // the UTC anchor that was composed through it.
+    m_clock.reset();
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_haveAnchor = false;
+    m_offsets.clear();
+    m_snap.haveOffset = false;
+    m_snap.offsetSamples = 0;
+    m_snap.clockFitValid = false;
+    LOG_DEBUG(m_cfg.name.c_str(), "timing discarded (%s)", why);
+}
+
+bool Source::ensureDecoder(int rate) {
+    if (m_decoderRate == rate && (m_wwv || m_wwvb)) return true;
+    if (m_decoderRate == rate && m_rateRefused) return false;   // said once, not per packet
 
     // The decoders decimate to a fixed series rate — 200 Hz for WWV/WWVH,
     // 100 Hz for WWVB — so a rate that is not a multiple of it decimates
@@ -827,11 +1087,31 @@ void Source::ensureDecoder(int rate) {
         LOG_ERROR(m_cfg.name.c_str(),
                   "sample rate %d Hz is not a multiple of 200 Hz and cannot be decimated evenly",
                   rate);
-        m_decoderRate = rate;   // so this is said once, not once per packet
+        m_decoderRate = rate;
+        m_rateRefused = true;
         m_wwv.reset();
         m_wwvb.reset();
-        return;
+        m_samplesWritten = 0;
+        m_tsHave = false;
+        m_clock.reset();
+        // Everything the old decoder left behind goes with it. A source that
+        // was locked at 12 kHz and is now fed an unusable rate would otherwise
+        // go on reporting "locked" and a current offset while nothing is being
+        // decoded at all — until staleness caught it three minutes later.
+        std::lock_guard<std::mutex> lk(m_mu);
+        m_haveAnchor = false;
+        m_haveFrame = false;
+        m_offsets.clear();
+        m_leapFrames = 0;
+        m_snap.leapPending = false;
+        m_snap.haveOffset = false;
+        m_snap.offsetSamples = 0;
+        m_snap.clockFitValid = false;
+        m_snap.sampleRate = rate;
+        m_snap.clockState = "stopped";
+        return false;
     }
+    m_rateRefused = false;
 
     if (m_decoderRate != 0) {
         LOG_WARN(m_cfg.name.c_str(), "sample rate changed %d -> %d Hz; restarting the decoder "
@@ -843,6 +1123,8 @@ void Source::ensureDecoder(int rate) {
     m_wwvb.reset();
     m_decoderRate = rate;
     m_samplesWritten = 0;
+    m_lastFrameSamples = rate / 50;
+    m_tsHave = false;
     m_clock.setSampleRate(rate);
     m_clock.reset();
     {
@@ -850,6 +1132,8 @@ void Source::ensureDecoder(int rate) {
         m_haveAnchor = false;
         m_haveFrame = false;
         m_offsets.clear();
+        m_leapFrames = 0;
+        m_snap.leapPending = false;
         m_snap.sampleRate = rate;
         // The decoders start in nosignal and onStateChanged only fires on a
         // CHANGE, so without this the snapshot sits at "stopped" while audio is
@@ -889,19 +1173,22 @@ void Source::ensureDecoder(int rate) {
     }
 
     LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz", wwvb ? "WWVB" : "WWV/WWVH", rate);
+    return true;
 }
 
-void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double arrivalSec) {
+void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double arrivalSec,
+                         bool observeArrival) {
     if (!pcm || count <= 0) return;
-    ensureDecoder(rate);
-    if (!m_wwv && !m_wwvb) return;
+    if (!ensureDecoder(rate)) return;
 
     m_samplesWritten += count;
 
     // The packet's arrival is taken as the time of its LAST sample: the audio
     // was captured before it was sent, so the end of the block is the edge
-    // closer to the moment it landed here.
-    m_clock.observe(m_samplesWritten, arrivalSec);
+    // closer to the moment it landed here. Synthesised samples arrived at no
+    // particular time and are not observed; the next real packet's arrival is
+    // observed against a count that includes them, which is the point.
+    if (observeArrival) m_clock.observe(m_samplesWritten, arrivalSec);
 
     if (m_mono.size() < static_cast<std::size_t>(count)) m_mono.resize(count);
     for (int i = 0; i < count; ++i) m_mono[i] = pcm[i] * (1.0f / 32768.0f);
@@ -918,6 +1205,7 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
 
     std::lock_guard<std::mutex> lk(m_mu);
     m_snap.toneSnrDb = d.toneSnrDb;
+    m_snap.tickBandRatioDb = d.tickBandRatioDb;
     m_snap.toneDetected = d.toneDetected;
     m_snap.phaseLocked = d.phaseLocked;
     m_snap.delayEstMs = d.delayEstMs;
@@ -957,14 +1245,27 @@ void Source::resetStream(const char* why) {
     m_clock.reset();
     m_opusHeader.reset();
     if (m_pcmv4) m_pcmv4->dec.reset();
+    // The Opus decoder's prediction state and its lookahead buffer belong to
+    // the last connection's stream. Carried over, the first frames of the new
+    // one are reconstructed against audio from before the gap.
+    if (m_opus) opus_decoder_ctl(m_opus, OPUS_RESET_STATE);
     m_samplesWritten = 0;
     m_decoderRate = 0;
+    m_rateRefused = false;
+    m_lastFrameSamples = 0;
+    m_tsHave = false;
+    m_tsWaitResync = false;
+    m_haveRtMinusMono = false;
     m_wwv.reset();
     m_wwvb.reset();
 
     std::lock_guard<std::mutex> lk(m_mu);
     m_haveAnchor = false;
+    m_haveFrame = false;
     m_offsets.clear();
+    m_leapFrames = 0;
+    m_snap.leapPending = false;
+    m_feedingOpus = -1;
     m_snap.haveOffset = false;
     m_snap.offsetSamples = 0;
     m_snap.clockState = "stopped";
@@ -1004,8 +1305,29 @@ void Source::onClockFrame(const AetherSDR::ClockFrameInfo& f) {
     m_frameStartSample = f.frameStartSample;
     m_haveFrame = true;
     m_snap.dut1Tenths = f.dut1Tenths;
-    m_snap.leapPending = f.leapPending;
+
+    // Three consecutive frames before the warning is believed, and one frame
+    // without it to drop it. The bit is a single BCD position decoded afresh
+    // each minute, and a fade that flips it would otherwise put LI=1 on every
+    // reply for that minute — telling clients to insert a second that is not
+    // coming. WWV asserts the real warning for the whole month, so three
+    // minutes of latency costs nothing.
+    constexpr int kLeapConfirmFrames = 3;
+    m_leapFrames = f.leapPending ? std::min(m_leapFrames + 1, kLeapConfirmFrames) : 0;
+    m_snap.leapPending = m_leapFrames >= kLeapConfirmFrames;
 }
+
+namespace {
+
+// The next UTC midnight after `ms`, when `ms` falls on the last day of a month,
+// or -1. A leap second is inserted as 23:59:60 immediately before exactly such
+// a midnight, and nowhere else.
+long long leapBoundaryAfter(long long ms) {
+    if (!isLastDayOfMonth(ms)) return -1;
+    return (floorDiv(floorDiv(ms, 1000), 86400) + 1) * 86400LL * 1000LL;
+}
+
+} // namespace
 
 void Source::onClockTime(const AetherSDR::ClockTimeInfo& t) {
     if (t.year2 < 0 || t.doy < 1 || t.hour < 0 || t.minute < 0) return;
@@ -1026,6 +1348,15 @@ void Source::onClockTime(const AetherSDR::ClockTimeInfo& t) {
         static_cast<double>(t.lastEdgeSample - m_frameStartSample) / m_decoderRate);
     const long long decodedMs = baseMs + elapsedSec * 1000LL;
 
+    // Counting whole seconds from a frame that began before a possible leap
+    // second to an edge after it would be a second out if one was inserted.
+    // Such an anchor is refused; the next frame begins after the boundary.
+    const long long boundary = leapBoundaryAfter(baseMs);
+    if (boundary > 0 && decodedMs >= boundary) {
+        m_haveAnchor = false;
+        return;
+    }
+
     m_anchorEdgeSample = t.lastEdgeSample;
     m_anchorUtcMs = decodedMs;
     m_haveAnchor = true;
@@ -1037,8 +1368,18 @@ void Source::onClockTime(const AetherSDR::ClockTimeInfo& t) {
 }
 
 void Source::onClockSecond(const AetherSDR::ClockSecondInfo& i) {
-    double hostSec = 0.0;
-    if (!m_clock.hostTimeAt(i.edgeSample, hostSec)) return;
+    // Only an edge the decoder actually measured becomes an offset sample.
+    // Second 0 carries no pulse, and a weak or coasted second reports where the
+    // tracker expects the edge rather than where it was heard: correct, but it
+    // is the tracker's opinion counted again, and it would weigh the median
+    // towards the estimate instead of the signal.
+    if (!i.edgeMeasured) return;
+
+    // The fit is on CLOCK_MONOTONIC; the offset is against CLOCK_REALTIME as it
+    // stands NOW, which is what the served time is formed from.
+    double hostMono = 0.0;
+    if (!m_clock.hostTimeAt(i.edgeSample, hostMono)) return;
+    const double hostSec = hostMono + realtimeMinusMonotonic();
 
     std::lock_guard<std::mutex> lk(m_mu);
     if (!m_haveAnchor) return;
@@ -1058,6 +1399,24 @@ void Source::onClockSecond(const AetherSDR::ClockSecondInfo& i) {
     // from the anchor, something has resynchronised and the extension is not
     // sound.
     if (std::abs(elapsed - static_cast<double>(wholeSeconds)) > 0.25) return;
+
+    // Every minute is sixty seconds to this count, and the minute before a leap
+    // second is sixty-one: past the boundary each extended edge would be dated
+    // a second late. Rather than trust a decoded warning bit to say whether
+    // this month has one, the anchor is dropped at EVERY month-end midnight —
+    // it costs one minute of offsets twelve times a year, and the next `time`
+    // event re-anchors on a frame that knows what minute it is. Offsets taken
+    // before the boundary were right and are kept. (The 23:59:60 edge itself
+    // counts as 00:00:00 here, so it is refused too.)
+    const long long edgeMs = m_anchorUtcMs + wholeSeconds * 1000LL;
+    const long long boundary = leapBoundaryAfter(m_anchorUtcMs);
+    if (boundary > 0 && edgeMs >= boundary) {
+        if (m_snap.leapPending) {
+            LOG_INFO(m_cfg.name.c_str(), "leap second boundary: dropping the UTC anchor until re-anchored");
+        }
+        m_haveAnchor = false;
+        return;
+    }
 
     const double utcSec = (static_cast<double>(m_anchorUtcMs) / 1000.0) +
                           static_cast<double>(wholeSeconds);
@@ -1162,6 +1521,8 @@ void Source::updateDelayModel() {
         m_snap.propagationSec = 0.0;
         m_snap.networkSec = 0.0;
         m_snap.codecSec = 0.0;
+        m_snap.decoderSec = 0.0;
+        m_snap.chainSec = 0.0;
         m_snap.extraSec = m_cfg.delayMs / 1000.0;
         m_snap.pathDescription = "configured delay";
         return;
@@ -1193,13 +1554,24 @@ void Source::updateDelayModel() {
     // unbounded above, so a probe that happened to cross a busy moment says
     // nothing about the path and the smallest one says the most.
     const double net = m_snap.httpRttMs > 0.0 ? (m_snap.httpRttMs / 1000.0) * 0.5 : 0.0;
-    const double codec = m_cfg.format == AudioFormat::Opus ? kOpusDelaySec : 0.0;
+    // The codec the audio actually came through, not the one asked for: a
+    // session that negotiated Opus is sent lossless frames in some modes, and
+    // charging 8 ms of Opus delay to those biases the offset by 8 ms.
+    const bool opus = m_feedingOpus >= 0 ? m_feedingOpus == 1 : m_cfg.format == AudioFormat::Opus;
+    const double codec = opus ? kOpusDelaySec : 0.0;
+
+    // The decoder's own edge bias, by which decoder is running -- chosen from
+    // the dial exactly as ensureDecoder chooses it. Negative: an edge reported
+    // early makes the offset read large, so it is taken back off.
+    const double decoder = m_cfg.dialHz < kWwvbCeilingHz ? 0.0 : kWwvDecoderEdgeBiasSec;
 
     m_snap.propagationSec = prop;
     m_snap.networkSec = net;
     m_snap.codecSec = codec;
+    m_snap.decoderSec = decoder;
+    m_snap.chainSec = kUberSdrChainDelaySec;
     m_snap.extraSec = m_cfg.extraDelayMs / 1000.0;
-    m_snap.delaySec = prop + net + codec + m_snap.extraSec;
+    m_snap.delaySec = prop + net + codec + decoder + kUberSdrChainDelaySec + m_snap.extraSec;
 }
 
 // ---------------------------------------------------------------------------

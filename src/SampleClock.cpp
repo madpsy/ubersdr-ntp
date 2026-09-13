@@ -17,6 +17,13 @@ double monotonicNow() {
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
+double realtimeMinusMonotonic() {
+    const double m0 = monotonicNow();
+    const double r = realtimeNow();
+    const double m1 = monotonicNow();
+    return r - 0.5 * (m0 + m1);
+}
+
 SampleClock::SampleClock(int sampleRate, double bucketSec, double windowSec)
     : m_rate(sampleRate > 0 ? sampleRate : 12000),
       m_bucketSec(bucketSec),

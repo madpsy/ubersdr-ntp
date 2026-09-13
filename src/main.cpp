@@ -246,7 +246,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    LOG_INFO(kTag, "ubersdr-ntp %s starting (User-Agent: %s)", kVersion, cfg.userAgent.c_str());
+    LOG_INFO(kTag, "ubersdr-ntp %s starting (User-Agent: %s)", kVersion, kUserAgent);
     for (const SourceConfig& s : cfg.sources) {
         LOG_INFO(kTag, "source %-14s %s  dial %.6f MHz (carrier %.3f MHz) %s%s%s",
                  s.name.c_str(), s.url.c_str(), s.dialHz / 1e6, s.carrierHz / 1e6,
@@ -279,7 +279,7 @@ int main(int argc, char** argv) {
 
     std::vector<std::unique_ptr<Source>> sources;
     for (const SourceConfig& s : cfg.sources) {
-        sources.push_back(std::make_unique<Source>(s, cfg.userAgent));
+        sources.push_back(std::make_unique<Source>(s));
     }
 
     Selector selector(cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm, cfg.ntp.minSources);
@@ -361,8 +361,13 @@ int main(int argc, char** argv) {
         const bool due = cfg.log.statusIntervalSeconds > 0 && now >= nextStatus;
         if (due || g_dump) {
             if (g_dump) g_dump = 0;
-            if (cfg.log.statusIntervalSeconds > 0) {
-                while (nextStatus <= now) nextStatus += cfg.log.statusIntervalSeconds;
+            // One step, then a resync if that was not enough, rather than a
+            // loop: after a long stall (a suspended VM, a debugger) a loop
+            // would emit nothing but spin through every missed interval, and
+            // an interval too small to change a double would never end.
+            if (cfg.log.statusIntervalSeconds > 0 && nextStatus <= now) {
+                nextStatus += cfg.log.statusIntervalSeconds;
+                if (nextStatus <= now) nextStatus = now + cfg.log.statusIntervalSeconds;
             }
             StatusInput in = statusInput();
             in.combined = c;

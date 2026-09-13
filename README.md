@@ -135,25 +135,56 @@ chronyc -h 127.0.0.1 -p 12300 tracking
 
 ### As a service
 
-```ini
-[Unit]
-Description=NTP server disciplined by WWV over UberSDR
-After=network-online.target
-Wants=network-online.target
+A hardened unit is in [`systemd/ubersdr-ntp.service`](systemd/ubersdr-ntp.service).
+It runs as a dynamic user with only `CAP_NET_BIND_SERVICE`, and needs
+**systemd 247 or later** (Ubuntu 22.04, Debian 11 and newer):
 
+```bash
+sudo install -m 0755 ubersdr-ntp_amd64 /usr/local/bin/ubersdr-ntp
+sudo install -m 0600 -o root -g root config.json /etc/ubersdr-ntp.json
+sudo install -m 0644 systemd/ubersdr-ntp.service /etc/systemd/system/
+sudo install -m 0644 logrotate.ubersdr-ntp /etc/logrotate.d/ubersdr-ntp   # if log.file is set
+sudo systemctl daemon-reload
+sudo systemctl enable --now ubersdr-ntp
+```
+
+The essential lines:
+
+```ini
 [Service]
-ExecStart=/usr/local/bin/ubersdr-ntp --config /etc/ubersdr-ntp.json
+LoadCredential=config:/etc/ubersdr-ntp.json
+ExecStart=/usr/local/bin/ubersdr-ntp --config ${CREDENTIALS_DIRECTORY}/config
 ExecReload=/bin/kill -HUP $MAINPID
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
-NoNewPrivileges=yes
+LogsDirectory=ubersdr-ntp
 DynamicUser=yes
+NoNewPrivileges=yes
+ProtectSystem=strict
 Restart=always
 RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
 ```
+
+Two of those are there because of `DynamicUser=`, whose UID is not known until
+the service starts:
+
+- **The configuration holds receiver passwords**, so it stays `0600 root`.
+  The service could not read it directly without making it world-readable, so
+  `LoadCredential=` has systemd read it at start and hand the service a private
+  copy under `$CREDENTIALS_DIRECTORY`. After editing `/etc/ubersdr-ntp.json`,
+  restart the service. Reloading does not refresh the copy.
+- **The log file must live in `/var/log/ubersdr-ntp/`**, which `LogsDirectory=`
+  creates and gives to the service's UID on every start. Set
+  `"log": { "file": "/var/log/ubersdr-ntp/ubersdr-ntp.log" }`. Anywhere else is
+  read-only under `ProtectSystem=strict`, and the daemon exits if it cannot open
+  its log file.
+
+On a systemd older than 247, use a fixed user instead:
+`sudo useradd --system --no-create-home ubersdr-ntp`. In the unit, replace
+`DynamicUser=yes` and `LoadCredential=` with `User=ubersdr-ntp` and
+`Group=ubersdr-ntp`, and point `--config` at `/etc/ubersdr-ntp.json`. Make that
+file `root:ubersdr-ntp 0640`, and give the user `/var/log/ubersdr-ntp` if you
+set `log.file`.
 
 `SIGHUP` reopens the log file, for logrotate. `SIGUSR1` writes a status block
 immediately instead of waiting for the next interval.
@@ -208,22 +239,29 @@ audio stream measures:
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
 | Network | 5–100 ms | Measured, as half the TLS round trip to the server |
 | Codec | 8 ms (Opus), 0 (PCM v4) | A measured constant |
-| `extra_delay_ms` | **unknown** | Yours to set — chiefly the receiver's internal buffering |
+| UberSDR chain | 13.6 ms | A constant: RF reaching the SDR to audio leaving the WebSocket |
+| Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB) | A measured constant, from `tools/decodertest.cpp` |
+| `extra_delay_ms` | 0 | Yours, for anything genuinely local |
 
-The first three are handled. The fourth is the one that matters and the one
-nothing here can see: the buffering between `radiod` and the WebSocket is real,
-is tens of milliseconds, and is invisible from this end because a constant delay
-is indistinguishable from a clock that is simply wrong — which is the very thing
-being measured.
+The part nothing in the stream can see is the delay inside the receiver —
+`radiod`'s demodulator and filters, its block framing, the server's handling —
+because a constant delay is indistinguishable from a clock that is simply wrong.
+But it is a property of the software, the same on every UberSDR instance, so it
+is one built-in constant rather than something to calibrate per receiver. It was
+measured live against K3FEF hearing WWV on 10 and 15 MHz, from a host
+disciplined by ntpd: served time averaged +0.1 ms and stayed within ±2.6 ms over
+14 minutes of lock. That is one receiver, so treat the constant as good to a few
+milliseconds.
 
-Leave `extra_delay_ms` at zero until you have something to calibrate against.
-Then set it per source to whatever that source's offset reads when it disagrees
-with a reference you trust. The status page and `/api/status` break the total
-down term by term so you can see what you are adjusting.
+The decoder bias is separate because it differs by decoder: the WWV/WWVH decoder
+reports second edges 13.6 ms early, the WWVB decoder is exact. On WWV the two
+cancel almost exactly, which is why the earlier measurement below came out
+near zero with neither term modelled; on WWVB only the chain term applies.
 
-Getting it wrong does not break anything; it biases the served time by exactly
-the amount you got it wrong by. Leaving it at zero biases the served time by
-whatever the receiver's buffering is.
+Leave `extra_delay_ms` at zero unless one source disagrees with a reference you
+trust for a reason of its own. Getting it wrong biases the served time by
+exactly the amount you got it wrong by. The status page and `/api/status` break
+the total down term by term.
 
 ### How the offset is measured at all
 
@@ -342,8 +380,8 @@ User-Agent: ubersdr-ntp/1.0.0 (+https://github.com/madpsy/ubersdr-ntp)
 That is the only thing telling a receiver operator what has taken one of their
 slots, so it names the program, the version and where to look it up — and it
 lets a receiver that filters by User-Agent allow or refuse this specifically
-rather than guessing. Overridable with `user_agent`, but identifying the program
-is the point.
+rather than guessing. It is fixed in the code and not configurable, for the same
+reason: an operator can only trust what it says if nobody can change it.
 
 ## When nothing is locked
 
@@ -441,13 +479,22 @@ across a change in the offset, because the boundary moves with the correction.
 ## What is in here from elsewhere
 
 `src/clock/WwvDecoder.*`, `src/clock/WwvbDecoder.*` and
-`src/clock/TimeFrameVoter.*` are copied **verbatim** from
-[ubersdr-clock](https://github.com/madpsy/ubersdr-clock), which took them
-verbatim from [AetherSDR](https://github.com/aethersdr/AetherSDR), where they are
-the DSP half of its AetherClock feature. They are kept byte-identical on purpose:
-it makes an upstream fix a straight `cp`, and the voter in particular carries
-calibration constants tuned against live WWV corpora that should not drift
-without upstream's evidence behind the change.
+`src/clock/TimeFrameVoter.*` come from
+[ubersdr-clock](https://github.com/madpsy/ubersdr-clock), which took them from
+[AetherSDR](https://github.com/aethersdr/AetherSDR), where they are the DSP half
+of its AetherClock feature. They have since been changed here, so an upstream
+fix needs a diff rather than a `cp`:
+
+- sub-sample second edges: WWVB from the carrier-drop crossing, WWV from a
+  smoothed matched-filter shift;
+- the WWV/WWVH tag, decided from each tick band's energy above its own
+  background (the old peak-to-mean test could call a lone WWV "WWVH", which
+  costs about 19 ms of propagation on an eastern-US path);
+- leap-second (61-second) minutes, and the WWVB DST bits.
+
+The voter's calibration constants and `kNominalDelaySamples` are still
+upstream's. `tools/decodertest.cpp` (`ubersdr-ntp-decodertest`) generates all
+three stations and checks every timestamp and edge against the truth.
 
 `third_party/pcm_v4.hpp` is shared verbatim with `ka9q_ubersdr/clients` — keep it
 in step with the copies there. It has no Opus reader, because the C++ clients

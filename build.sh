@@ -85,6 +85,12 @@ done
 if [ -n "$release" ]; then
     [ "$native" = 0 ] || fail "--release ships binaries; it cannot be combined with --native"
     [ "$check" = 1 ]  || fail "--release will not publish binaries that skipped the smoke test"
+    # Every released arch in one run. The upload uses --clobber on what was
+    # built, so a partial --arch would leave the other arch's asset from an
+    # earlier build in place -- from a different commit -- next to a
+    # SHA256SUMS that does not list it.
+    [ "$(printf '%s\n' $arches | sort -u | tr '\n' ' ')" = "amd64 arm64 " ] \
+        || fail "--release publishes amd64 and arm64 together; drop --arch (got: $arches)"
     command -v gh >/dev/null 2>&1 || fail "--release needs the gh CLI (https://cli.github.com)"
     gh auth status >/dev/null 2>&1 || fail "gh is not logged in; run: gh auth login"
     [ -z "$(git -C "$repo" status --porcelain --untracked-files=no)" ] \
@@ -216,25 +222,44 @@ build only for this host"
 # nor the reboot. Worth knowing before concluding the host cannot do it: the
 # check below distinguishes "never set up" from "set up and lost", which are
 # the same fix but not the same diagnosis.
+# The binfmt handler a container of each arch needs on this host, by the name
+# binfmt_misc registers it under. Empty when none is needed: the host arch
+# itself, and 386 on amd64, which the kernel runs natively.
+binfmt_handler() {
+    case "$1:$2" in
+        "$2:$2")     echo "" ;;
+        386:amd64)   echo "" ;;
+        arm64:*)     echo qemu-aarch64 ;;
+        # Including on arm64: plenty of arm64 CPUs (Graviton, Apple silicon)
+        # have no AArch32 mode, and whether this one does is not knowable here.
+        arm:*)       echo qemu-arm ;;
+        386:*)       echo qemu-i386 ;;
+        amd64:*)     echo qemu-x86_64 ;;
+    esac
+}
+
+host_arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
 for a in $arches; do
-    [ "$a" = "$(dpkg --print-architecture 2>/dev/null || echo amd64)" ] && continue
-    if ! ls /proc/sys/fs/binfmt_misc/ 2>/dev/null | grep -qi "qemu-aarch64\|qemu-arm"; then
+    handler=$(binfmt_handler "$a" "$host_arch")
+    [ -n "$handler" ] || continue
+    # Each arch against its own handler. Checking for any qemu handler at all
+    # passed an arm build on a host that only had aarch64 registered.
+    if [ ! -e "/proc/sys/fs/binfmt_misc/$handler" ]; then
         hint=""
-        if ls "$repo"/build-arm64/ubersdr-ntp_* >/dev/null 2>&1 \
-           || ls "$repo"/ubersdr-ntp_arm64 >/dev/null 2>&1; then
+        if ls "$repo"/build-"$a"/ubersdr-ntp_* >/dev/null 2>&1 \
+           || ls "$repo"/ubersdr-ntp_"$a" >/dev/null 2>&1; then
             hint="
-This host HAS built $a before -- there is an arm64 binary in the tree -- so the
+This host HAS built $a before -- there is a $a binary in the tree -- so the
 registration was simply lost, almost certainly to a reboot. The command above
 puts it back."
         fi
-        fail "no qemu binfmt handler registered, so a $a container cannot run here.
+        fail "no $handler binfmt handler registered, so a $a container cannot run here.
 Register it with:
   docker run --privileged --rm tonistiigi/binfmt --install all
 
 It is a runtime registration and is lost on every reboot, so this is a thing
 that recurs rather than a thing you set up once.$hint"
     fi
-    break
 done
 
 failed=0

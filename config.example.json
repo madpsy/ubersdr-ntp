@@ -101,15 +101,13 @@
       // costs about four minutes of clean signal to re-acquire a lock.
       "password": "",
 
-      // Everything the delay model cannot see, in milliseconds — chiefly the
-      // receiver's own buffering between radiod and the WebSocket, which is
-      // usually the largest remaining term.
+      // Anything the delay model cannot see, in milliseconds. The receiver's
+      // own delay (radiod to the WebSocket) is the same on every UberSDR
+      // instance and already built in, as is the decoder's edge bias.
       //
-      // Leave at 0 until you have a reference clock to measure against. Then
-      // set it per source to whatever that source's offset reads when it
-      // disagrees with the reference. Getting it wrong biases the served time
-      // by exactly the amount you got wrong; leaving it at 0 biases it by
-      // whatever the receiver's buffering is.
+      // Leave at 0 unless this one source disagrees with a reference clock
+      // you trust for a reason of its own. Getting it wrong biases the served
+      // time by exactly the amount you got wrong.
       "extra_delay_ms": 0.0,
 
       // Relative confidence in the combine. A receiver you know to be worse
@@ -162,9 +160,5 @@
     "level": "info",
     "stderr": true,
     "status_interval_seconds": 30
-  },
-
-  // What a receiver operator sees in their session list. Change it only if you
-  // have a reason to; identifying the program is the point.
-  "user_agent": "ubersdr-ntp/1.0.0 (+https://github.com/madpsy/ubersdr-ntp)"
+  }
 }

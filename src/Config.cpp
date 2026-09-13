@@ -2,6 +2,7 @@
 
 #include "../third_party/json.hpp"
 
+#include <cmath>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -139,8 +140,6 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         if (!getOpt(h, "port", c.http.port, err)) return false;
     }
 
-    if (!getOpt(j, "user_agent", c.userAgent, err)) return false;
-
     if (auto it = j.find("defaults"); it != j.end() && it->is_object()) {
         if (!getSource(*it, c.defaults, err)) { err = "in \"defaults\": " + err; return false; }
     }
@@ -186,7 +185,33 @@ bool Config::finalise(std::string& err) {
         return false;
     }
     if (ntp.minSources < 1) ntp.minSources = 1;
-    if (ntp.coastDriftPpm < 0.0) ntp.coastDriftPpm = 0.0;
+
+    // Numbers that are NaN, infinite or negative where negative means nothing
+    // are refused rather than clamped. JSON cannot spell NaN, but the command
+    // line can (`--status-interval nan` is a valid strtod), and a NaN passes
+    // every `< 0` guard downstream and then poisons whatever it touches: a NaN
+    // weight makes every combined offset NaN, a NaN coast never expires.
+    auto finiteAtLeast = [&err](double v, double lo, const std::string& what) {
+        if (std::isfinite(v) && v >= lo) return true;
+        std::ostringstream os;
+        os << what << " is " << v << "; it must be a finite number >= " << lo;
+        err = os.str();
+        return false;
+    };
+    if (!finiteAtLeast(ntp.coastSeconds, 0.0, "ntp.coast_seconds")) return false;
+    if (!finiteAtLeast(ntp.coastDriftPpm, 0.0, "ntp.coast_drift_ppm")) return false;
+    if (!finiteAtLeast(ntp.rateLimitPerClient, 0.0, "ntp.rate_limit_per_client")) return false;
+    // 0 disables the block. Anything else under a second is not a status
+    // interval anybody wants, and a tiny one (1e-12) made the main loop's
+    // schedule arithmetic spin: adding it to a monotonic time is a no-op.
+    if (!finiteAtLeast(log.statusIntervalSeconds, 0.0, "log.status_interval_seconds")) return false;
+    if (log.statusIntervalSeconds > 0.0 && log.statusIntervalSeconds < 1.0) {
+        std::ostringstream os;
+        os << "log.status_interval_seconds is " << log.statusIntervalSeconds
+           << "; use 0 to disable the status block, or at least 1";
+        err = os.str();
+        return false;
+    }
 
     std::set<std::string> names;
     int autoName = 0;
@@ -223,8 +248,18 @@ bool Config::finalise(std::string& err) {
             return false;
         }
 
-        if (s.weight <= 0.0) {
-            err = "source \"" + s.name + "\": weight must be positive";
+        // !(> 0) rather than <= 0, so NaN is refused too.
+        if (!(s.weight > 0.0) || !std::isfinite(s.weight)) {
+            err = "source \"" + s.name + "\": weight must be a positive finite number";
+            return false;
+        }
+        const std::string label = "source \"" + s.name + "\": ";
+        // extra_delay_ms may be negative -- it is a correction on top of the
+        // auto estimate, and that estimate can be too high -- but delay_ms is
+        // a total one-way delay, and a signal cannot arrive before it was sent.
+        if (!finiteAtLeast(s.delayMs, 0.0, label + "delay_ms")) return false;
+        if (!std::isfinite(s.extraDelayMs)) {
+            err = label + "extra_delay_ms must be a finite number";
             return false;
         }
         if (s.enabled) ++enabled;

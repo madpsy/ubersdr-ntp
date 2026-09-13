@@ -237,6 +237,33 @@ bool NtpServer::rateLimitAllows(const std::string& key, double now) {
     const double burst = std::max(1.0, m_cfg.rateLimitPerClient);
     auto it = m_buckets.find(key);
     if (it == m_buckets.end()) {
+        // The minute sweep bounds the map for honest traffic, not for a flood
+        // of spoofed source addresses, which can add a fresh key every packet.
+        // So there is a hard cap: when it is reached, sweep now (with a shorter
+        // idle threshold than the minute, since a bucket idle for burst/rate
+        // seconds is already full and forgetting it changes nothing), and if
+        // the map is still full, answer this client WITHOUT tracking it. At
+        // most one such sweep a second: under a sustained flood every packet
+        // is a new key, and an O(n) walk of the map per packet, under the
+        // lock every listener shares, would be a denial of service by itself.
+        //
+        // Fail-open rather than fail-closed: refusing untracked keys would let
+        // the same flood lock out every legitimate client that had not been
+        // seen before it began, which turns a memory bound into a denial of
+        // service. The cost of fail-open is that a flood of >kMaxBuckets
+        // distinct addresses is not rate-limited -- but each of those gets
+        // one reply the size of its request, gain 1, which is exactly what it
+        // would get if it were within its limit anyway.
+        if (m_buckets.size() >= kMaxBuckets) {
+            if (now - m_lastSweep < 1.0) return true;
+            const double idle = std::min(60.0, burst / m_cfg.rateLimitPerClient);
+            for (auto sit = m_buckets.begin(); sit != m_buckets.end();) {
+                if (now - sit->second.at > idle) sit = m_buckets.erase(sit);
+                else ++sit;
+            }
+            m_lastSweep = now;
+            if (m_buckets.size() >= kMaxBuckets) return true;
+        }
         m_buckets.emplace(key, Bucket{burst - 1.0, now});
         return true;
     }

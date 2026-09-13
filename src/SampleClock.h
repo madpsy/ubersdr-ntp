@@ -47,7 +47,7 @@ namespace ubersdr_ntp {
 
 struct ClockFit {
     bool valid = false;
-    double anchorSec = 0.0;   // host CLOCK_REALTIME (seconds) at sample 0
+    double anchorSec = 0.0;   // host CLOCK_MONOTONIC (seconds) at sample 0
     double secPerSample = 0.0; // 1 / effective rate, absorbing eps
     double residualRms = 0.0;  // spread of the low-envelope points about the fit (s)
     double spanSec = 0.0;      // how much stream the fit covers
@@ -67,7 +67,16 @@ public:
     int sampleRate() const { return m_rate; }
 
     // Records that the block ENDING at sample index `endSample` arrived at
-    // host time `hostSec` (CLOCK_REALTIME, seconds).
+    // host time `hostSec` (CLOCK_MONOTONIC, seconds).
+    //
+    // MONOTONIC, not REALTIME, although REALTIME is the clock being measured.
+    // The fit spans five minutes of arrivals; a step of the host clock in the
+    // middle of it — ntpd's own step, an operator's `date -s` — would put a
+    // one-sided discontinuity into a regression that assumes a straight line,
+    // and bias the anchor for the whole window. Fitted on MONOTONIC, a step
+    // cannot reach the fit at all, and the caller converts to REALTIME at the
+    // moment of use with a fresh realtimeMinusMonotonic(), where a step shows
+    // up immediately and exactly. Frequency slewing affects both clocks alike.
     //
     // The end of the block, not the start: its audio was captured before it was
     // sent, so the last sample is the edge closest to the moment it landed.
@@ -119,5 +128,11 @@ private:
 // status timer fire in 1970.
 double realtimeNow();
 double monotonicNow();
+
+// CLOCK_REALTIME minus CLOCK_MONOTONIC, now. Adding it to a MONOTONIC instant
+// gives the REALTIME instant under the host clock as it currently stands.
+// Read as mono / real / mono and averaged, so a preemption between the two
+// reads is halved rather than counted whole.
+double realtimeMinusMonotonic();
 
 } // namespace ubersdr_ntp

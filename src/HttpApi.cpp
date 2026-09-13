@@ -18,6 +18,7 @@
 #include <sstream>
 #include <thread>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 namespace ubersdr_ntp {
@@ -30,6 +31,19 @@ constexpr const char* kTag = "http";
 // costs a thread. Generous for a status service; small enough that a stuck
 // client cannot exhaust the process.
 constexpr int kMaxConnections = 64;
+
+// Of those, how many may be SSE streams. A stream holds its slot for as long as
+// the client cares to listen, so without a separate, smaller cap 64 open pages
+// (or one script opening 64 streams) would leave nothing for /api/health --
+// which is the one request a monitoring system makes, and it would read the
+// 503 as the daemon being down. Requests other than streams are short, so the
+// remaining slots are effectively always available to them.
+constexpr int kMaxStreams = 16;
+
+// Send and receive timeout on every accepted socket. The sockets are blocking,
+// and a client that stops reading would otherwise pin its thread in send()
+// forever: a stuck stream never notices, and stop() is left waiting on it.
+constexpr int kSocketTimeoutSec = 5;
 
 // How often the event stream sends the full status document alongside the
 // one-second ticks. The ticks carry everything the summary needs; this is for
@@ -44,17 +58,25 @@ constexpr int kRequestTimeoutMs = 5000;
 
 #include "IndexHtml.inc"
 
+// Replace, not the strict default: strings in these documents include bytes
+// that came off the network unvalidated (a source's link detail is
+// IXWebSocket's raw HTTP status reason), nlohmann throws type_error.316 on
+// invalid UTF-8, and an exception out of a detached connection thread is
+// std::terminate. U+FFFD in one field is the right outcome.
+std::string dumpJson(const nlohmann::json& j, bool pretty) {
+    return j.dump(pretty ? 2 : -1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 bool writeAll(int fd, const char* data, std::size_t len) {
     std::size_t sent = 0;
     while (sent < len) {
         const ssize_t n = ::send(fd, data + sent, len - sent, MSG_NOSIGNAL);
         if (n > 0) { sent += static_cast<std::size_t>(n); continue; }
         if (n < 0 && (errno == EINTR)) continue;
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            struct pollfd pfd{fd, POLLOUT, 0};
-            if (::poll(&pfd, 1, 5000) <= 0) return false;
-            continue;
-        }
+        // EAGAIN on these blocking sockets means SO_SNDTIMEO expired: the
+        // client has not taken a byte in kSocketTimeoutSec. Give up on it
+        // rather than waiting again, or a reader that trickles one byte every
+        // few seconds keeps a thread indefinitely.
         return false;
     }
     return true;
@@ -148,6 +170,9 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowRealtim
         o["station"] = s.station;
         o["tone_snr_db"] = s.toneSnrDb;
         o["tone_detected"] = s.toneDetected;
+        // NaN has no JSON spelling; null means there is no tick to compare.
+        o["tick_band_ratio_db"] = std::isfinite(s.tickBandRatioDb)
+                                      ? nlohmann::json(s.tickBandRatioDb) : nlohmann::json(nullptr);
         o["phase_locked"] = s.phaseLocked;
         o["anchored"] = s.anchored;
         o["frames_in_window"] = s.framesInWindow;
@@ -165,7 +190,7 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowRealtim
     j["sources_total"] = static_cast<int>(in.sources.size());
     j["sources"] = std::move(arr);
 
-    return j.dump();
+    return dumpJson(j, false);
 }
 
 } // namespace
@@ -229,12 +254,15 @@ bool HttpApi::start(std::string& err) {
 
 void HttpApi::stop() {
     if (!m_running.exchange(false)) return;
+    // Shutdown, join, THEN close. Closing first would pull the fd out from
+    // under an acceptor still in poll/accept on it, and the number could be
+    // reused by another socket before the acceptor notices m_running.
+    if (m_listenFd >= 0) ::shutdown(m_listenFd, SHUT_RDWR);
+    if (m_acceptor.joinable()) m_acceptor.join();
     if (m_listenFd >= 0) {
-        ::shutdown(m_listenFd, SHUT_RDWR);
         ::close(m_listenFd);
         m_listenFd = -1;
     }
-    if (m_acceptor.joinable()) m_acceptor.join();
 
     // Break every live connection out of whatever it is blocked in. An SSE
     // stream sits in poll with a timeout of up to a second; shutting its socket
@@ -246,15 +274,20 @@ void HttpApi::stop() {
 
     // Then wait for them, because they hold references to the Selector and the
     // status provider, both of which are about to be destroyed. The deadline is
-    // a backstop against a thread wedged in a kernel call: leaking a thread at
-    // shutdown is survivable, and a use-after-free is not, but neither is a
-    // daemon that will not exit.
+    // a backstop against a thread wedged in a kernel call. Returning past it
+    // would let the caller destroy what that thread is still using -- a
+    // use-after-free at exit, which can corrupt the log's last lines or hang
+    // in a destructor -- so the process ends here instead, without running
+    // destructors. Non-zero, because a shutdown that had to abandon a thread
+    // is worth systemd recording as a failure.
     const double deadline = monotonicNow() + 5.0;
     while (m_connections.load() > 0 && monotonicNow() < deadline) {
         std::this_thread::sleep_for(std::chrono::milliseconds(20));
     }
     if (m_connections.load() > 0) {
-        LOG_WARN(kTag, "%d connection(s) did not close within 5s", m_connections.load());
+        LOG_ERROR(kTag, "%d connection(s) did not close within 5s; exiting without cleanup",
+                  m_connections.load());
+        std::_Exit(EXIT_FAILURE);
     }
 }
 
@@ -273,6 +306,13 @@ void HttpApi::accept() {
             continue;
         }
 
+        // Before anything is written to it, including the 503 below: that
+        // write runs on the acceptor thread, which must not be the one a
+        // non-reading client wedges.
+        const struct timeval tv{kSocketTimeoutSec, 0};
+        ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+
         if (m_connections.load() >= kMaxConnections) {
             const std::string body = "too many connections\n";
             writeAll(fd, httpResponse(503, "Service Unavailable", "text/plain; charset=utf-8",
@@ -287,7 +327,17 @@ void HttpApi::accept() {
             m_liveFds.insert(fd);
         }
         std::thread([this, fd] {
-            serveConnection(fd);
+            // Nothing may escape this thread: it is detached, so an exception
+            // is std::terminate and takes the NTP server down with a status
+            // page. Whatever went wrong, the connection is closed and counted
+            // out below as for any other request.
+            try {
+                serveConnection(fd);
+            } catch (const std::exception& e) {
+                LOG_WARN(kTag, "connection aborted: %s", e.what());
+            } catch (...) {
+                LOG_WARN(kTag, "connection aborted by an unknown exception");
+            }
             {
                 std::lock_guard<std::mutex> lk(m_fdMu);
                 m_liveFds.erase(fd);
@@ -299,9 +349,11 @@ void HttpApi::accept() {
 }
 
 void HttpApi::serveConnection(int fd) {
-    // Taken first, so /api/time's receive timestamp is when the request
-    // arrived rather than when the JSON was finished.
-    const double arrived = realtimeNow();
+    // /api/time's receive timestamp: when the request's first bytes arrived,
+    // set at the first successful recv below. Not when this thread started --
+    // that is when the TCP connection was accepted, and a client may take a
+    // while to send its request after connecting, which would read as delay.
+    double arrived = 0.0;
 
     int one = 1;
     ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof one);
@@ -319,6 +371,7 @@ void HttpApi::serveConnection(int fd) {
         if (::poll(&pfd, 1, remaining) <= 0) return;
         const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
         if (n <= 0) return;
+        if (arrived == 0.0) arrived = realtimeNow();
         head.append(buf, static_cast<std::size_t>(n));
         if (head.size() > 16384) return;   // no legitimate GET is this large
     }
@@ -389,7 +442,7 @@ void HttpApi::serveConnection(int fd) {
             // a second serialiser that could disagree with the first.
             try {
                 auto j = nlohmann::json::parse(renderStatusJson(in, false));
-                body = pretty ? j["sources"].dump(2) : j["sources"].dump();
+                body = dumpJson(j["sources"], pretty);
             } catch (const std::exception&) {
                 body = renderStatusJson(in, pretty);
             }
@@ -430,7 +483,21 @@ void HttpApi::serveConnection(int fd) {
 }
 
 void HttpApi::serveEvents(int fd) {
-    m_streams.fetch_add(1);
+    // Counted in and out by a guard, so an exception on the way out of here
+    // (caught in the connection thread) cannot leak a stream slot for good.
+    struct StreamSlot {
+        std::atomic<int>& n;
+        ~StreamSlot() { n.fetch_sub(1); }
+    };
+    // Claimed first and checked after, so two clients racing for the last slot
+    // cannot both get it.
+    const int streams = m_streams.fetch_add(1) + 1;
+    StreamSlot slot{m_streams};
+    if (streams > kMaxStreams) {
+        writeAll(fd, httpResponse(503, "Service Unavailable", "text/plain; charset=utf-8",
+                                  "too many event streams\n", false, "Retry-After: 10"));
+        return;
+    }
 
     std::ostringstream hdr;
     hdr << "HTTP/1.1 200 OK\r\n"
@@ -446,7 +513,7 @@ void HttpApi::serveEvents(int fd) {
         // seconds, because losing two ticks is a visible stall on a clock.
         << "retry: 2000\n\n";
 
-    if (!writeAll(fd, hdr.str())) { m_streams.fetch_sub(1); return; }
+    if (!writeAll(fd, hdr.str())) return;
 
     // Both documents immediately, so a client that has just connected draws
     // everything at once. Sending only the status and letting the first tick
@@ -457,10 +524,10 @@ void HttpApi::serveEvents(int fd) {
     {
         const StatusInput in = m_provider();
         const std::string status = "event: status\ndata: " + renderStatusJson(in, false) + "\n\n";
-        if (!writeAll(fd, status)) { m_streams.fetch_sub(1); return; }
+        if (!writeAll(fd, status)) return;
         const std::string tick = "event: tick\ndata: " +
                                  tickJson(m_selector.current(), in, realtimeNow()) + "\n\n";
-        if (!writeAll(fd, tick)) { m_streams.fetch_sub(1); return; }
+        if (!writeAll(fd, tick)) return;
     }
 
     double lastFull = monotonicNow();
@@ -487,7 +554,10 @@ void HttpApi::serveEvents(int fd) {
             const ssize_t n = ::recv(fd, discard, sizeof discard, 0);
             if (n <= 0) break;   // the client has gone
             // Anything a client sends on an SSE stream is ignored: this is a
-            // read-only service and the stream is one-directional.
+            // read-only service and the stream is one-directional. Back to
+            // waiting for the boundary rather than falling through, which
+            // would send an extra tick for every packet the client sent.
+            continue;
         }
 
         if (!m_running.load()) break;
@@ -507,8 +577,6 @@ void HttpApi::serveEvents(int fd) {
             if (!writeAll(fd, full)) break;
         }
     }
-
-    m_streams.fetch_sub(1);
 }
 
 } // namespace ubersdr_ntp

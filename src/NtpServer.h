@@ -84,6 +84,10 @@ private:
     struct Bucket { double tokens; double at; };
     std::unordered_map<std::string, Bucket> m_buckets;
     double m_lastSweep = 0.0;
+    // A hard ceiling on m_buckets, for a spoofed-source flood the periodic
+    // sweep cannot keep up with. ~100 bytes an entry, so ~10 MB at the cap;
+    // see rateLimitAllows for what happens beyond it.
+    static constexpr std::size_t kMaxBuckets = 100000;
 };
 
 } // namespace ubersdr_ntp

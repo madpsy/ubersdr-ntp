@@ -46,6 +46,7 @@ public:
 
     void reset() {
         m_haveMetadata = false;
+        m_lastWasResync = false;
         m_lastTS = 0;
         m_rate = 0;
         m_channels = 0;
@@ -71,6 +72,7 @@ public:
         }
         std::size_t off = 1;
         const bool resync = (flags & kFlagMetadata) != 0;
+        m_lastWasResync = false;
 
         if (resync) {
             if (len < off + 8) { err = "opus v4 header: truncated timestamp"; return false; }
@@ -130,11 +132,20 @@ public:
         h.silent = false;
 
         bodyOff = off;
+        m_lastWasResync = resync;
         return true;
     }
 
+    // Whether the packet just decoded carried a full timestamp. After a packet
+    // that failed to parse, every delta that follows is relative to a timestamp
+    // this reader never applied, so the timestamps are wrong by that packet's
+    // delta until the next full one — which the caller needs to know before it
+    // reads a gap into them.
+    bool lastWasResync() const { return m_lastWasResync; }
+
 private:
     bool m_haveMetadata = false;
+    bool m_lastWasResync = false;
     std::uint64_t m_lastTS = 0;
     int m_rate = 0;
     int m_channels = 0;

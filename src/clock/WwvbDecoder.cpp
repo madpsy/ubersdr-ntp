@@ -2,6 +2,8 @@
 
 #include "WwvbDecoder.h"
 
+#include "CivilTime.h"
+
 #include <algorithm>
 #include <array>
 #include <cmath>
@@ -39,6 +41,12 @@ constexpr int    kEnvRateHz   = 100;    // decoded envelope series rate
 constexpr int    kEnvCap      = 1024;   // envelope ring capacity (>10 s)
 constexpr int    kPctWin      = 300;    // adaptive-threshold window (3 s)
 constexpr int    kEdgeTol     = 12;     // +/- env samples searched per second
+// Envelope history an edge candidate needs on either side: the sustained-low
+// check and the low-level estimate look up to 10 samples past it, the high-
+// level estimate 8 before. Classification waits for this much lookahead so a
+// candidate near the end of the search band is judged on real samples, not on
+// a truncated window that silently fails it.
+constexpr int    kEdgeLook    = 12;
 constexpr int    kWarmEnv     = 200;    // env samples before seeding phase
 constexpr double kMinContrast = 1.4;    // p90 >= 1.4*p10 => a real AM drop exists
 constexpr double kLpfCutHz    = 150.0;  // I/Q low-pass corner
@@ -54,6 +62,25 @@ constexpr std::array<int, 7> kMarkerSeconds = {0, 9, 19, 29, 39, 49, 59};
 
 // Low-duration (in 100 Hz env samples) of each symbol: 0.2/0.5/0.8 s.
 constexpr std::array<int, 3> kSymbolLowLen = {20, 50, 80};
+
+// Minimum matched-filter margin for a single second to count as structural
+// evidence that the frame alignment is wrong (a marker where none belongs, or
+// a non-marker where one must be). Low enough that a clean marker always
+// clears it, high enough that a coin-flip read under noise does not throw
+// away a good lock.
+constexpr float kStructConf = 0.10f;
+
+// Edge tracker gains (see trackEdge): phase weight ~1/8 (tau ~8 s) once warm,
+// period weight near critical damping for that alpha, first kTrkWarm measured
+// seconds a plain running mean.
+constexpr double kTrkAlpha = 1.0 / 8.0;
+constexpr double kTrkBeta  = 1.0 / 128.0;
+constexpr int    kTrkWarm  = 8;
+
+inline bool isWwvbMarkerSecond(int s) {
+    for (int m : kMarkerSeconds) if (m == s) return true;
+    return false;
+}
 
 // Transposed-direct-form-II biquad, runtime-designed Butterworth low-pass.
 struct Biquad {
@@ -177,9 +204,14 @@ struct WwvbDecoder::Impl {
         env.fill(0.0f); envCount = 0; envBaseSample = 0;
         pP10 = 0.0f; pP90 = 0.0f;
         phaseKnown = false; curStart = 0; scanPos = 0;
+        curEdge = 0.0; curEdgeMeasured = false;
+        trkValid = false; trkEdge = 0.0; trkPeriod = 0.0; trkCount = 0; trkOutliers = 0;
         anchored = false; sofNext = 0; prevSym = ClockSymbol::Unknown; havePrev = false;
+        prevPrevSym = ClockSymbol::Unknown;
         frFilledCount = 0; frStartSample = 0;
         haveLastFrame = false; lastFrameS0Env = 0;
+        leapInserted = false; haveLastFields = false; lastFields = TimeFields{};
+        lastLeapWarn = false;
         haveVoted = false;
         votedMinute = votedHour = votedDoy = votedYear = -1; votedQuality = 0.0f;
         voter.reset();
@@ -239,6 +271,13 @@ struct WwvbDecoder::Impl {
         oscRe = 1.0; oscIm = 0.0; oscRenorm = 0;
         lpI = Biquad::lowpass(sr, kLpfCutHz);
         lpQ = Biquad::lowpass(sr, kLpfCutHz);
+        // DC group delay of that low-pass in input samples (~1.5 ms at 150 Hz):
+        // the first moment of its impulse response, which is exactly how late a
+        // step comes out of it. For b(1 + 2z^-1 + z^-2) / (1 + a1 z^-1 + a2 z^-2)
+        // the symmetric numerator contributes 1 sample and the denominator
+        // -(a1 + 2 a2) / (1 + a1 + a2). Derived from the coefficients rather
+        // than calibrated, so a changed corner keeps edges honest.
+        lpfDelay = 1.0 - (lpI.a1 + 2.0 * lpI.a2) / (1.0 + lpI.a1 + lpI.a2);
         magAccum = 0.0; magCount = 0;
         setLockState(ClockLockState::Acquiring);
     }
@@ -311,40 +350,143 @@ struct WwvbDecoder::Impl {
             trySeed();
             if (!phaseKnown) return;
         }
-        while (phaseKnown && envCount >= curStart + kEnvRateHz + kEdgeTol)
+        while (phaseKnown && envCount >= curStart + kEnvRateHz + kEdgeTol + kEdgeLook)
             classifyAndAdvance();
+    }
+
+    // Is env[i] the first envelope sample below the 50% level of a real carrier
+    // drop? The drop only has to cross the MIDPOINT between env[i-1] and env[i]:
+    // an earlier form demanded env[i-1] >= 60% and env[i] < 40%, and when the
+    // drop landed 40-60% of the way into a 10 ms averaging block that block sat
+    // between the two thresholds, so no second ever qualified and the decoder
+    // never seeded (the reviewer's 0-seconds-in-6-minutes run). A full-carrier
+    // sample must still appear within the three before the crossing, and the
+    // sustained-low gate still rejects the ~1-sample BPSK flip notch.
+    bool isFallingEdge(int64_t i, float thrHi, float thrMid, float thrLo) const {
+        if (!(envAt(i - 1) >= thrMid && envAt(i) < thrMid)) return false;
+        bool high = false;
+        for (int d = 1; d <= 3 && !high; ++d) high = envAt(i - d) >= thrHi;
+        return high && sustainedLow(i, thrLo);
+    }
+
+    // Sub-block position of the drop that crosses at env[i], as a (fractional)
+    // input-sample index. The 10 ms boxcar that makes the envelope is also what
+    // lets the edge be recovered finely: a block holding a step at fraction f
+    // averages to L + (1 - f)(H - L), so the step's position is in the AREA of
+    // the transition, sum((env - L) / (H - L)) over blocks spanning it, not in
+    // which block happens to cross a threshold. That sum measures the FILTERED
+    // step; for the unity-DC-gain I/Q low-pass it is the true step delayed by
+    // exactly the filter's DC group delay, which is subtracted analytically.
+    // H and L are local means either side, so fading and the adaptive
+    // percentiles' lag do not bias it.
+    double edgeSampleAt(int64_t i) const {
+        double hi = 0.0, lo = 0.0;
+        for (int d = 4; d <= 8; ++d) hi += envAt(i - d);
+        for (int d = 4; d <= 10; ++d) lo += envAt(i + d);
+        hi /= 5.0;
+        lo /= 7.0;
+        double pos = static_cast<double>(i);
+        const double span = hi - lo;
+        if (span > 1e-9) {
+            // Blocks i-2 .. i+3 cover the step wherever the crossing rule can
+            // place it (within a block either side of i) plus the filter's
+            // few-ms settling tail.
+            double area = 0.0;
+            for (int64_t k = i - 2; k <= i + 3; ++k) area += (envAt(k) - lo) / span;
+            pos = std::clamp(static_cast<double>(i - 2) + area, i - 1.5, i + 1.5);
+        }
+        return static_cast<double>(envBaseSample) + pos * decim - lpfDelay;
+    }
+
+    // Second edges are exactly one broadcast second apart, so a single
+    // second's measurement is not the best estimate of its own edge: under
+    // noise the drop's area moves +/-3 ms second to second at 10 dB. An
+    // alpha-beta tracker (phase + period, so a receiver sample rate a few ppm
+    // off nominal is followed without lag) reports the smoothed edge instead.
+    // It starts as a running mean so the first seconds are not dragged from
+    // zero, coasts on its own prediction through seconds with no drop found,
+    // and re-seeds only after several consecutive measurements disagree by a
+    // whole envelope block (a real step, not noise).
+    void trackEdge(bool measured, double raw) {
+        if (!trkValid) {
+            trkEdge = raw;
+            trkPeriod = sr;
+            trkValid = measured;
+            trkCount = measured ? 1 : 0;
+            trkOutliers = 0;
+            return;
+        }
+        const double pred = trkEdge + trkPeriod;
+        if (!measured) { trkEdge = pred; return; }
+        const double r = raw - pred;
+        if (std::fabs(r) > decim) {
+            if (++trkOutliers >= 3) {
+                trkEdge = raw;
+                trkPeriod = sr;
+                trkCount = 1;
+                trkOutliers = 0;
+            } else {
+                trkEdge = pred;
+            }
+            return;
+        }
+        trkOutliers = 0;
+        ++trkCount;
+        const double alpha = std::max(1.0 / trkCount, kTrkAlpha);
+        trkEdge = pred + alpha * r;
+        if (trkCount > kTrkWarm) {
+            // +/-200 ppm is far outside any real receiver; the clamp only stops
+            // a pathological residual run from winding the period away.
+            trkPeriod = std::clamp(trkPeriod + kTrkBeta * r, sr * (1.0 - 2e-4), sr * (1.0 + 2e-4));
+        }
+    }
+
+    void edgeThresholds(float& thrHi, float& thrMid, float& thrLo) const {
+        thrHi  = pP10 + 0.6f * (pP90 - pP10);
+        thrMid = pP10 + 0.5f * (pP90 - pP10);
+        thrLo  = pP10 + 0.4f * (pP90 - pP10);
     }
 
     void trySeed() {
         if (envCount < kWarmEnv || !haveContrast()) return;
-        const float thrHi = pP10 + 0.6f * (pP90 - pP10);
-        const float thrLo = pP10 + 0.4f * (pP90 - pP10);
-        int64_t lo = std::max<int64_t>(std::max<int64_t>(scanPos, 1), envCount - kEnvCap + 2);
-        for (int64_t i = lo; i + 7 < envCount; ++i) {
+        float thrHi, thrMid, thrLo;
+        edgeThresholds(thrHi, thrMid, thrLo);
+        int64_t lo = std::max<int64_t>(std::max<int64_t>(scanPos, 9), envCount - kEnvCap + 9);
+        for (int64_t i = lo; i + kEdgeLook < envCount; ++i) {
             scanPos = i;
-            if (envAt(i - 1) >= thrHi && envAt(i) < thrLo && sustainedLow(i, thrLo)) {
+            if (isFallingEdge(i, thrHi, thrMid, thrLo)) {
                 curStart = i;
+                curEdge = edgeSampleAt(i);
+                curEdgeMeasured = true;
                 phaseKnown = true;
                 return;
             }
         }
     }
 
-    int64_t findFallingEdgeNear(int64_t pred, int tol) {
-        if (!haveContrast()) return pred;   // coast on predicted cadence
-        const float thrHi = pP10 + 0.6f * (pP90 - pP10);
-        const float thrLo = pP10 + 0.4f * (pP90 - pP10);
-        int64_t lo = std::max<int64_t>(pred - tol, envCount - kEnvCap + 2);
-        int64_t hi = std::min<int64_t>(pred + tol, envCount - 1);
+    // Look for the next second's drop near its predicted env index. On success
+    // sets startOut to the crossing sample (the classifier's window start) and
+    // edgeOut to the sub-block edge; otherwise startOut is the prediction and
+    // the caller coasts.
+    bool findFallingEdgeNear(int64_t pred, int tol, int64_t& startOut, double& edgeOut) {
+        startOut = pred;
+        if (!haveContrast()) return false;   // coast on predicted cadence
+        float thrHi, thrMid, thrLo;
+        edgeThresholds(thrHi, thrMid, thrLo);
+        int64_t lo = std::max<int64_t>(pred - tol, envCount - kEnvCap + 9);
+        int64_t hi = std::min<int64_t>(pred + tol, envCount - 1 - kEdgeLook);
         int64_t bestEdge = pred, bestDist = tol + 1;
         for (int64_t i = lo; i <= hi; ++i) {
-            if (i < 1) continue;
-            if (envAt(i - 1) >= thrHi && envAt(i) < thrLo && sustainedLow(i, thrLo)) {
+            if (i < 9) continue;
+            if (isFallingEdge(i, thrHi, thrMid, thrLo)) {
                 int64_t d = std::llabs(i - pred);
                 if (d < bestDist) { bestDist = d; bestEdge = i; }
             }
         }
-        return bestEdge;
+        if (bestDist > tol) return false;
+        startOut = bestEdge;
+        edgeOut = edgeSampleAt(bestEdge);
+        return true;
     }
 
     void classifyAndAdvance() {
@@ -378,11 +520,15 @@ struct WwvbDecoder::Impl {
         ClockSymbol sym = (best == 0) ? ClockSymbol::Zero
                         : (best == 1) ? ClockSymbol::One
                                       : ClockSymbol::Marker;
-        int64_t edgeSample = envBaseSample + curStart * decim;
+        // Reported at input-sample resolution from the edge tracker, fed the
+        // sub-block estimate made when this second was located; curStart only
+        // chooses which envelope samples the classifier sees.
+        trackEdge(curEdgeMeasured, curEdge);
+        int64_t edgeSample = static_cast<int64_t>(std::llround(trkEdge));
 
         int sof = -1;
-        updateSync(sym, edgeSample, sof);
-        emitSecond(edgeSample, sym, conf, sof, w, best);
+        updateSync(sym, conf, edgeSample, sof);
+        emitSecond(edgeSample, curEdgeMeasured, sym, conf, sof, w, best);
 
         if (anchored && sof >= 0)
             recordFrameSecond(sof, sym, conf);
@@ -399,15 +545,34 @@ struct WwvbDecoder::Impl {
         }
 
         int64_t pred = curStart + kEnvRateHz;
-        curStart = findFallingEdgeNear(pred, kEdgeTol);
+        double edge = 0.0;
+        curEdgeMeasured = findFallingEdgeNear(pred, kEdgeTol, curStart, edge);
+        // Coasting keeps the last edge's sub-block phase instead of snapping to
+        // the envelope grid, so a missed drop does not add a quantisation step.
+        curEdge = curEdgeMeasured ? edge : curEdge + sr;
     }
 
     // ---- frame sync (double marker) --------------------------------------
 
-    void updateSync(ClockSymbol sym, int64_t edgeSample, int& sofOut) {
+    // Leap seconds are only ever inserted as 23:59:60 UTC on the last day of a
+    // month, so a third consecutive marker is a leap second only straight after
+    // such a minute. With no decoded minute to judge by (still acquiring) it
+    // cannot be ruled out, and treating it as one costs nothing: the frame it
+    // starts is validated at s59 like any other.
+    bool leapSecondPossible() const {
+        if (!haveLastFields) return true;
+        const TimeFields& f = lastFields;
+        if (f.minute != 59 || f.hour != 23) return false;
+        if (f.doy < 1 || f.doy > 366 || f.year2 < 0 || f.year2 > 99) return false;
+        return ubersdr_ntp::isLastDayOfMonth(
+            ubersdr_ntp::utcMsFromFields(f.year2, f.doy, f.hour, f.minute));
+    }
+
+    void updateSync(ClockSymbol sym, float conf, int64_t edgeSample, int& sofOut) {
+        const bool marker = (sym == ClockSymbol::Marker);
         if (!anchored) {
             // Two consecutive markers = s59 -> s0; this second is s0.
-            if (havePrev && prevSym == ClockSymbol::Marker && sym == ClockSymbol::Marker) {
+            if (havePrev && prevSym == ClockSymbol::Marker && marker) {
                 anchored = true;
                 sofOut = 0;
                 sofNext = 1;
@@ -415,11 +580,43 @@ struct WwvbDecoder::Impl {
             } else {
                 sofOut = -1;
             }
+        } else if (sofNext == 1 && marker && prevSym == ClockSymbol::Marker &&
+                   prevPrevSym == ClockSymbol::Marker && leapSecondPossible()) {
+            // Three markers in a row -- s59, s60, s0 -- is how NIST SP 250-67
+            // sends a leap second. The second just labelled s0 was 23:59:60 and
+            // this one is the real s0, so the minute restarts here and the frame
+            // that just finished spans 61 s. Labelling on without this puts
+            // every second of the next minute one second late. If the lock was
+            // still up (the warning bit was missed), drop it now, BEFORE this
+            // second is emitted: the leap second itself has already gone out
+            // labelled as the next minute's s0 and nothing can recall that, but
+            // no later one is extended from it.
+            if (lockState == ClockLockState::Locked) {
+                haveVoted = false;
+                setLockState(ClockLockState::Acquiring);
+            }
+            leapInserted = true;
+            sofOut = 0;
+            sofNext = 1;
+            beginFrame(edgeSample);
         } else {
             sofOut = sofNext;
             if (sofOut == 0) beginFrame(edgeSample);
             sofNext = (sofNext + 1) % 60;
+            // A confident symbol that contradicts the marker skeleton means the
+            // second count has slipped (a leap second nobody announced, a lost
+            // or duplicated second in the stream). The frame check at s59 would
+            // catch it, but up to a minute later, and every second until then
+            // would be labelled from a wrong count. Stop certifying time NOW;
+            // s59 decides whether the frame was sound after all (and re-locks)
+            // or drops the anchor.
+            if (lockState == ClockLockState::Locked && conf >= kStructConf &&
+                marker != isWwvbMarkerSecond(sofOut)) {
+                haveVoted = false;
+                setLockState(ClockLockState::Acquiring);
+            }
         }
+        prevPrevSym = havePrev ? prevSym : ClockSymbol::Unknown;
         prevSym = sym;
         havePrev = true;
     }
@@ -449,6 +646,9 @@ struct WwvbDecoder::Impl {
             anchored = false;
             havePrev = false;
             haveLastFrame = false;
+            haveLastFields = false;
+            lastLeapWarn = false;
+            leapInserted = false;
             haveVoted = false;
             voter.reset();
             setLockState(ClockLockState::Acquiring);
@@ -458,10 +658,15 @@ struct WwvbDecoder::Impl {
         ClockFrameInfo fi = decodeFrame();
         if (owner->onFrame) owner->onFrame(fi);
 
+        // A frame that followed a leap second starts 61 s after the previous
+        // one; it is still the next broadcast minute and must not reset the
+        // voter's window.
         int64_t s0env = (frStartSample - envBaseSample) / decim;
+        const long long gapSecs = leapInserted ? 61LL : 60LL;
+        leapInserted = false;
         bool consecutive =
             haveLastFrame &&
-            std::llabs((s0env - lastFrameS0Env) - 60LL * kEnvRateHz) <= 2LL * kEdgeTol;
+            std::llabs((s0env - lastFrameS0Env) - gapSecs * kEnvRateHz) <= 2LL * kEdgeTol;
         if (!consecutive) voter.reset();
         haveLastFrame = true;
         lastFrameS0Env = s0env;
@@ -470,14 +675,36 @@ struct WwvbDecoder::Impl {
         std::array<float, 60> confs = frConf;
         voter.addFrame(syms, confs);
 
-        if (voter.locked()) {
+        const bool certified = voter.locked();
+        if (certified) {
             votedMinute = voter.votedField(TimeFrameVoter::FieldMinutes);
             votedHour = voter.votedField(TimeFrameVoter::FieldHours);
             votedDoy = voter.votedField(TimeFrameVoter::FieldDoy);
             votedYear = voter.votedField(TimeFrameVoter::FieldYear);
             votedQuality = voter.lockConfidence();
+        }
+        lastFields = certified ? TimeFields{votedMinute, votedHour, votedDoy, votedYear}
+                               : TimeFields{fi.minute, fi.hour, fi.doy, fi.year2};
+        haveLastFields = true;
+
+        // The minute that just ended is 23:59 on the last day of a month with
+        // the leap warning up (this frame's bit, or the previous frame's in case
+        // this one faded): the next second is probably 23:59:60. Every second
+        // re-emits time extended from this frame by whole seconds of samples, so
+        // the leap second would go out as 00:00:00 and each one after it a
+        // second early. Stop certifying before that second is emitted; the
+        // triple-marker check re-aligns the minute and the next frame re-locks.
+        // If no leap second comes after all, that frame re-locks just the same.
+        const bool leapNext = (fi.leapPending || lastLeapWarn) && leapSecondPossible();
+        lastLeapWarn = fi.leapPending;
+
+        if (certified && !leapNext) {
             haveVoted = true;
             setLockState(ClockLockState::Locked);
+        } else if (certified) {
+            haveVoted = false;
+            if (lockState == ClockLockState::Locked)
+                setLockState(ClockLockState::Acquiring);
         } else {
             // WS-4.5: the voter no longer certifies a timestamp — stop the
             // per-second cached re-emission and demote a stale Locked instead
@@ -519,8 +746,13 @@ struct WwvbDecoder::Impl {
 
         fi.leapYear    = bit(55) != 0;   // LYI
         fi.leapPending = bit(56) != 0;   // LSW
-        fi.dst1        = bit(57) != 0;   // DST code bit "2"
-        fi.dst2        = bit(58) != 0;   // DST code bit "1"
+        // DST pair, mapped to the SAME meaning as WWV's s2/s55 so a consumer
+        // never has to know which station it is reading: NIST puts "DST in
+        // effect at 00:00Z today" on s58 and "DST in effect at 24:00Z today" on
+        // s57. (Read the other way round, "DST begins today" and "DST ends
+        // today" swap, which is exactly the day the bits matter.)
+        fi.dst1        = bit(58) != 0;   // DST at 00:00Z today
+        fi.dst2        = bit(57) != 0;   // DST at 24:00Z today
 
         double sum = 0.0;
         int cnt = 0;
@@ -538,11 +770,12 @@ struct WwvbDecoder::Impl {
 
     // ---- callbacks & state -----------------------------------------------
 
-    void emitSecond(int64_t edgeSample, ClockSymbol sym, float conf, int sof,
+    void emitSecond(int64_t edgeSample, bool measured, ClockSymbol sym, float conf, int sof,
                     const std::array<float, kEnvRateHz>& w, int best) {
         if (!owner->onSecond) return;
         ClockSecondInfo si;
         si.edgeSample = edgeSample;
+        si.edgeMeasured = measured;
         si.symbol = sym;
         si.confidence = conf;
         si.secondOfFrame = sof;
@@ -583,6 +816,7 @@ struct WwvbDecoder::Impl {
     double oscRe = 1.0, oscIm = 0.0, stepRe = 1.0, stepIm = 0.0;
     int oscRenorm = 0;
     Biquad lpI, lpQ;
+    double lpfDelay = 0.0;        // DC group delay of lpI/lpQ, input samples
     double magAccum = 0.0;
     int magCount = 0;
     int64_t envBaseSample = 0;
@@ -596,6 +830,13 @@ struct WwvbDecoder::Impl {
     // second segmentation
     bool phaseKnown = false;
     int64_t curStart = 0, scanPos = 0;
+    double curEdge = 0.0;          // current second's edge, fractional input sample
+    bool curEdgeMeasured = false;  // false when coasted (no drop found)
+
+    // edge tracker (trackEdge)
+    bool trkValid = false;
+    double trkEdge = 0.0, trkPeriod = 0.0;
+    int trkCount = 0, trkOutliers = 0;
 
     // matched-filter templates
     std::array<std::array<float, kEnvRateHz>, 3> tpl{};
@@ -605,7 +846,14 @@ struct WwvbDecoder::Impl {
     bool anchored = false;
     int sofNext = 0;
     ClockSymbol prevSym = ClockSymbol::Unknown;
+    ClockSymbol prevPrevSym = ClockSymbol::Unknown;
     bool havePrev = false;
+
+    // leap-second handling
+    bool leapInserted = false;     // current frame began after a 23:59:60 marker
+    bool haveLastFields = false;   // lastFields holds the last finalized minute
+    TimeFields lastFields;
+    bool lastLeapWarn = false;     // previous frame's leap-warning bit
 
     // frame assembly
     std::array<ClockSymbol, 60> frSym{};
@@ -650,6 +898,7 @@ ClockDecoderDiagnostics WwvbDecoder::diagnostics() const {
     ClockDecoderDiagnostics g;
     g.toneSnrDb = d.lastToneSnrDb;
     g.pwmContrast = (d.pP10 > 1e-6f) ? d.pP90 / d.pP10 : 0.0f;
+    g.tickBandRatioDb = std::numeric_limits<float>::quiet_NaN();  // WWV-only metric
     g.toneDetected = (d.phase == Impl::Phase::Running);
     g.phaseLocked = d.phaseKnown;
     g.delayEstMs = std::numeric_limits<float>::quiet_NaN();  // WWV-only metric

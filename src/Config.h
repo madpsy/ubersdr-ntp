@@ -26,9 +26,11 @@
 // Auto-estimation covers what is measurable: propagation from the receiver's
 // own coordinates (the server publishes them at /api/description) against the
 // transmitter the decoder reports, the codec's known constant, and half the
-// HTTP round-trip to the server. Everything left — the receiver's internal
-// buffering above all — is `extra_delay_ms`, which is what you turn against a
-// reference clock if you have one.
+// HTTP round-trip to the server. The receiver's internal delay is the same on
+// every UberSDR instance, so it is a built-in constant (measured live), as is
+// the WWV decoder's own edge bias; see Source.cpp. What is left, if anything,
+// is `extra_delay_ms` — for a source with a reason of its own to disagree with
+// a reference clock. It defaults to 0.
 //
 // Getting this wrong does not break anything; it biases the served time by
 // exactly the amount you got it wrong by. Leaving it at zero biases the served
@@ -139,10 +141,6 @@ struct Config {
 
     // Defaults applied to any source that does not set them itself.
     SourceConfig defaults;
-
-    // Overridable, but the default identifies the program, its version and
-    // where to look it up -- see Version.h.
-    std::string userAgent = kUserAgent;
 
     // Loads and validates. Returns false with `err` set; never half-applies.
     static bool load(const std::string& path, Config& out, std::string& err);

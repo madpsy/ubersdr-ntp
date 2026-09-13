@@ -1,5 +1,6 @@
 # Install to /etc/systemd/system/ubersdr-ntp.service, put the configuration at
-# /etc/ubersdr-ntp.json, then:
+# /etc/ubersdr-ntp.json (root-owned, mode 0600 -- it holds receiver passwords),
+# then:
 #
 #   sudo systemctl daemon-reload
 #   sudo systemctl enable --now ubersdr-ntp
@@ -7,7 +8,15 @@
 #
 # If the configuration sets log.file, the detailed per-source status blocks go
 # there and the journal keeps the one-line records. Without it, everything goes
-# to the journal.
+# to the journal. The only writable place is the logs directory below, so the
+# file must be under it:
+#
+#   "log": { "file": "/var/log/ubersdr-ntp/ubersdr-ntp.log" }
+#
+# Needs systemd 247 or later, for LoadCredential= (Ubuntu 22.04, Debian 11 and
+# newer). On an older systemd, create a system user, drop DynamicUser= and
+# LoadCredential=, add User=ubersdr-ntp and Group=ubersdr-ntp, make the config
+# root:ubersdr-ntp 0640, and point ExecStart at /etc/ubersdr-ntp.json.
 
 [Unit]
 Description=NTP server disciplined by WWV/WWVH/WWVB over UberSDR
@@ -17,7 +26,13 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/ubersdr-ntp --config /etc/ubersdr-ntp.json
+# The configuration is handed over as a credential rather than read in place.
+# A dynamic user has no fixed UID to own or be granted the file, so reading it
+# directly would need it world-readable, passwords and all. systemd reads it
+# as root at start and exposes a private copy only this service's UID can
+# read. The file can therefore stay 0600 root.
+LoadCredential=config:/etc/ubersdr-ntp.json
+ExecStart=/usr/local/bin/ubersdr-ntp --config ${CREDENTIALS_DIRECTORY}/config
 # SIGHUP reopens the log file, which is what logrotate wants.
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=always
@@ -29,8 +44,15 @@ RestartSec=10
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
-# It reads one config file, opens outbound TLS connections and binds two
-# sockets. Nothing else, so nothing else is permitted.
+# /var/log/ubersdr-ntp, created and chowned to the dynamic UID on every start.
+# ReadWritePaths= is no substitute: it lifts ProtectSystem= for the path but
+# does not change its owner, and a dynamic UID cannot be given ownership of a
+# directory in advance -- so log.file could not be opened and the daemon would
+# exit, restart and fail again every RestartSec.
+LogsDirectory=ubersdr-ntp
+
+# It reads one config file, opens outbound TLS connections, binds two sockets
+# and writes one log. Nothing else, so nothing else is permitted.
 DynamicUser=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
@@ -48,8 +70,6 @@ MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallErrorNumber=EPERM
-# Uncomment, with a matching log.file, to let it write its log:
-# ReadWritePaths=/var/log/ubersdr-ntp
 
 [Install]
 WantedBy=multi-user.target

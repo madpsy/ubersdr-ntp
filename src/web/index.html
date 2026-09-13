@@ -253,6 +253,7 @@ function onStatus(d) {
         : "none yet"],
       ["Delay model", ms(dl.total_ms) + " total = " + ms(dl.propagation_ms) + " propagation + " +
         ms(dl.network_ms) + " network + " + ms(dl.codec_ms) + " codec + " +
+        ms(dl.chain_ms) + " UberSDR chain " + signed(dl.decoder_bias_ms) + " decoder bias + " +
         ms(dl.configured_ms) + " configured<br>" +
         '<span class="note">' + esc(dl.path) + "</span>"],
       ["Sample clock", sc.fitted

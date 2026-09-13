@@ -3,10 +3,10 @@
 
 What this can and cannot check
 ------------------------------
-It cannot check the DSP: that needs a real receiver, or a fake UberSDR server
-speaking Opus, and the decoders here are byte-identical copies of
-ubersdr-clock's, which its own build already feeds a synthetic WWV minute and
-watches lock. Duplicating that would test the copy, not this program.
+It does not check the DSP: that is tools/decodertest.cpp (built as
+ubersdr-ntp-decodertest), which generates WWV, WWVH and WWVB itself and checks
+every timestamp and edge the decoders produce against the truth. End-to-end
+over a real receiver needs a real receiver.
 
 What it does check is everything this program adds, and every part of it is a
 real failure mode that a clean compile does not rule out:
@@ -23,6 +23,10 @@ real failure mode that a clean compile does not rule out:
   * the HTTP service serves the page, /api/time, /api/status and /api/health,
     with /api/health reporting 503 while unsynchronised;
   * the SSE stream connects and emits a tick within a couple of seconds;
+  * more event streams than it has slots for are refused, and /api/health
+    still answers while they are open;
+  * a source string holding invalid UTF-8 does not kill the HTTP service
+    (nlohmann's strict serialiser throws on it, in a detached thread);
   * it refuses to be written to -- a POST is answered 405, not 404;
   * it shuts down on SIGTERM without having to be killed.
 
@@ -119,8 +123,8 @@ def ntp_query(port, mode=3, version=4, timeout=2.0):
     }
 
 
-def http_get(path, timeout=3.0):
-    url = 'http://127.0.0.1:%d%s' % (HTTP_PORT, path)
+def http_get(path, timeout=3.0, port=None):
+    url = 'http://127.0.0.1:%d%s' % (port or HTTP_PORT, path)
     try:
         with urllib.request.urlopen(url, timeout=timeout) as r:
             return r.status, r.read().decode('utf-8', 'replace'), dict(r.headers)
@@ -140,9 +144,9 @@ def http_post(path, timeout=3.0):
         return -1
 
 
-def sse_first_event(timeout=6.0):
+def sse_first_event(timeout=6.0, port=None):
     """Connect to /api/events and return the first named event and its data."""
-    s = socket.create_connection(('127.0.0.1', HTTP_PORT), timeout=timeout)
+    s = socket.create_connection(('127.0.0.1', port or HTTP_PORT), timeout=timeout)
     try:
         s.sendall(b'GET /api/events HTTP/1.1\r\nHost: localhost\r\n'
                   b'Accept: text/event-stream\r\n\r\n')
@@ -374,6 +378,37 @@ def main():
             except ValueError:
                 check('SSE event data is JSON', False, data[:160])
 
+        # More streams than the connection cap. Streams have a smaller cap of
+        # their own, so the extra ones are refused and a health check still
+        # gets through; before that, 64 idle pages locked out /api/health,
+        # which a monitor reads as the daemon being down.
+        streams = []
+        try:
+            for _ in range(70):
+                st = socket.create_connection(('127.0.0.1', HTTP_PORT), timeout=3.0)
+                st.sendall(b'GET /api/events HTTP/1.1\r\nHost: localhost\r\n\r\n')
+                streams.append(st)
+            accepted = refused = 0
+            for st in streams:
+                try:
+                    first = st.recv(64)
+                except socket.timeout:
+                    first = b''
+                if first.startswith(b'HTTP/1.1 200'):
+                    accepted += 1
+                elif first.startswith(b'HTTP/1.1 503'):
+                    refused += 1
+            check('event streams beyond the stream cap are refused 503',
+                  accepted > 0 and refused > 0 and accepted + refused == len(streams),
+                  'accepted=%d refused=%d of %d' % (accepted, refused, len(streams)))
+            code, body, _ = http_get('/api/health')
+            check('/api/health still answers with many streams open',
+                  code in (200, 503) and '"synchronised"' in body,
+                  'HTTP %s: %s' % (code, body[:80]))
+        finally:
+            for st in streams:
+                st.close()
+
         # --- shutdown --------------------------------------------------------
         proc.send_signal(signal.SIGTERM)
         try:
@@ -424,6 +459,77 @@ def main():
             proc2.wait()
         try:
             os.unlink(path2)
+        except OSError:
+            pass
+
+    # --- invalid UTF-8 in a served string -----------------------------------
+    #
+    # A --source URL is taken from argv bytes unvalidated and appears in
+    # /api/status, which makes it the one input a test can reach that has the
+    # same shape as the real hazard: a link detail carrying whatever bytes a
+    # remote server put in its HTTP status reason. With nlohmann's strict
+    # serialiser that threw in a detached connection thread and terminated the
+    # whole daemon.
+    cfg['ntp']['answer_when_unsynchronised'] = True
+    cfg['ntp']['listen'] = ['127.0.0.1']
+    cfg['ntp']['port'] = free_port(socket.SOCK_DGRAM)
+    cfg['http']['enabled'] = True
+    cfg['http']['port'] = free_port(socket.SOCK_STREAM)
+    port3 = cfg['http']['port']
+    fd3, path3 = tempfile.mkstemp(suffix='.json', prefix='ubersdr-ntp-selftest-')
+    with os.fdopen(fd3, 'w') as f:
+        json.dump(cfg, f)
+    proc3 = subprocess.Popen([binary.encode(), b'--config', path3.encode(),
+                              b'--source', b'http://127.0.0.1:1/\xff\xfe\xc3@10'],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        deadline = time.time() + 10
+        up = False
+        while time.time() < deadline and proc3.poll() is None:
+            try:
+                socket.create_connection(('127.0.0.1', port3), timeout=0.5).close()
+                up = True
+                break
+            except OSError:
+                time.sleep(0.2)
+        check('invalid UTF-8 source: starts', up and proc3.poll() is None)
+        if up:
+            ok = False
+            try:
+                code, body, _ = http_get('/api/status', port=port3)
+                j = json.loads(body)
+                ok = code == 200 and any('\ufffd' in src.get('url', '') for src in j['sources'])
+            except Exception as e:
+                body = repr(e)
+            check('invalid UTF-8 source: /api/status is valid JSON with U+FFFD', ok, body[:160])
+            try:
+                code, body, _ = http_get('/api/sources', port=port3)
+                ok = code == 200 and isinstance(json.loads(body), list)
+            except Exception as e:
+                ok, body = False, repr(e)
+            check('invalid UTF-8 source: /api/sources is valid JSON', ok, body[:160])
+            # Guarded: against the bug this checks for, the daemon is already
+            # dead here and the connection is refused.
+            try:
+                name, data, raw = sse_first_event(timeout=4.0, port=port3)
+            except OSError as e:
+                name, raw = None, repr(e)
+            check('invalid UTF-8 source: SSE emits an event', name is not None, raw[:160])
+            time.sleep(0.3)
+            check('invalid UTF-8 source: daemon still running', proc3.poll() is None,
+                  'exited %s' % proc3.returncode)
+        if proc3.poll() is None:
+            proc3.send_signal(signal.SIGTERM)
+            proc3.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc3.kill()
+        proc3.wait()
+    finally:
+        if proc3.poll() is None:
+            proc3.kill()
+            proc3.wait()
+        try:
+            os.unlink(path3)
         except OSError:
             pass
 

@@ -15,6 +15,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <vector>
 
 namespace AetherSDR {
@@ -66,6 +67,13 @@ using ClockFieldMap = std::vector<ClockBitWeight>;
 // Emitted once per classified second (drives the alignment display).
 struct ClockSecondInfo {
     int64_t edgeSample = 0;      // sample index (total consumed) of the second edge
+    // True when this second carried its own timing evidence. False for WWV/WWVH's
+    // minute hole (second 0 has no subcarrier pulse) and sub-threshold seconds,
+    // and for WWVB seconds whose carrier drop was not found (coasted). edgeSample
+    // is still the decoder's tracked cadence then -- correct to its usual
+    // accuracy -- but nothing in THIS second measured it, so a consumer that
+    // wants only measured edges should skip it.
+    bool edgeMeasured = true;
     ClockSymbol symbol = ClockSymbol::Unknown;
     float confidence = 0.0f;     // matched-filter margin (best - runner-up), >= 0
     int secondOfFrame = -1;      // 0..59 once frame-synced, else -1
@@ -85,8 +93,8 @@ struct ClockSecondInfo {
 struct ClockFrameInfo {
     int minute = -1, hour = -1, doy = -1, year2 = -1; // per-frame BCD decode
     int dut1Tenths = 0;          // signed tenths of a second (e.g. -3 = -0.3 s)
-    bool dst1 = false;           // WWV s2  (WWVB: DST-code bit s57)
-    bool dst2 = false;           // WWV s55 (WWVB: DST-code bit s58)
+    bool dst1 = false;           // DST in effect at 00:00Z today (WWV s2,  WWVB s58)
+    bool dst2 = false;           // DST in effect at 24:00Z today (WWV s55, WWVB s57)
     bool leapPending = false;    // leap-second warning bit
     bool leapYear = false;       // WWVB LYI s55 (always false for WWV)
     float frameConfidence = 0.0f;    // 0..1
@@ -115,6 +123,10 @@ struct ClockDecoderDiagnostics {
     float toneSnrDb = 0.0f;    // WWVB: last tone-search peak/median in dB;
                                // WWV/WWVH: folded tick-band peak-to-mean in dB
     float pwmContrast = 0.0f;  // WWVB: p90/p10 envelope contrast (0 when n/a)
+    // WWV/WWVH: folded tick excess, 2000 Hz band over 2200 Hz band, in dB --
+    // what the station tag is decided from (> +1.8 dB leans WWV, < -1.8 dB
+    // WWVH; a lone WWV reads about +5 dB). NaN when n/a.
+    float tickBandRatioDb = std::numeric_limits<float>::quiet_NaN();
     bool toneDetected = false; // WWVB tone-gate passed / WWV tick fold locked
     // stage 2 — timing
     bool phaseLocked = false;  // WWV tickLocked / WWVB phaseKnown

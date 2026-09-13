@@ -16,6 +16,16 @@ namespace ubersdr_ntp {
 
 namespace {
 
+// Every string in these documents that did not come from a literal here --
+// a source's link detail above all, which is IXWebSocket's raw HTTP status
+// reason and therefore whatever bytes the far server sent -- can hold invalid
+// UTF-8. nlohmann's default strict handler throws type_error.316 on that, and
+// the callers are detached HTTP threads where an escaped exception is
+// std::terminate. U+FFFD in one field is the right outcome; a dead daemon is not.
+std::string dumpJson(const nlohmann::json& j, bool pretty) {
+    return j.dump(pretty ? 2 : -1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
 std::string f2(double v, int prec = 2) {
     if (!std::isfinite(v)) return "-";
     char b[48];
@@ -105,7 +115,7 @@ std::string renderTimeJson(const Combined& c, double receiveUnixSec,
     rt["server_raw_receive"] = receiveUnixSec;
     j["roundtrip"] = std::move(rt);
 
-    return pretty ? j.dump(2) : j.dump();
+    return dumpJson(j, pretty);
 }
 
 std::string renderStatusLine(const StatusInput& in) {
@@ -224,7 +234,11 @@ std::string renderStatusBlock(const StatusInput& in) {
 
         o << "    decoder: " << s.clockState << ", stage " << funnelStage(s)
           << ", tick " << f2(s.toneSnrDb, 1) << " dB"
-          << (s.toneDetected ? " (detected)" : " (NOT detected)")
+          << (s.toneDetected ? " (detected)" : " (NOT detected)");
+        if (std::isfinite(s.tickBandRatioDb)) {
+            o << ", 2000/2200 Hz " << f2(s.tickBandRatioDb, 1) << " dB";
+        }
+        o
           << ", edge " << (s.phaseLocked ? "locked" : "unlocked");
         if (std::isfinite(s.delayEstMs) && s.delayEstMs != 0.0) o << " at " << f2(s.delayEstMs, 1) << " ms";
         o << ", frame " << (s.anchored ? "anchored" : "not anchored");
@@ -257,6 +271,8 @@ std::string renderStatusBlock(const StatusInput& in) {
           << f2(s.propagationSec * 1000.0, 1) << " propagation + "
           << f2(s.networkSec * 1000.0, 1) << " network + "
           << f2(s.codecSec * 1000.0, 1) << " codec + "
+          << f2(s.chainSec * 1000.0, 1) << " UberSDR chain + "
+          << f2(s.decoderSec * 1000.0, 1) << " decoder bias + "
           << f2(s.extraSec * 1000.0, 1) << " configured\n";
         o << "            " << s.pathDescription << '\n';
 
@@ -344,6 +360,9 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         dec["stage"] = funnelStage(s);
         dec["tone_snr_db"] = s.toneSnrDb;
         dec["tone_detected"] = s.toneDetected;
+        // Which station the tick is really from: + leans WWV, - leans WWVH.
+        dec["tick_band_ratio_db"] = std::isfinite(s.tickBandRatioDb)
+                                        ? json(s.tickBandRatioDb) : json(nullptr);
         dec["phase_locked"] = s.phaseLocked;
         // NaN has no JSON spelling and the decoder really does report it for a
         // delay estimate that has not settled, so it becomes null rather than
@@ -379,6 +398,8 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         d["propagation_ms"] = s.propagationSec * 1000.0;
         d["network_ms"] = s.networkSec * 1000.0;
         d["codec_ms"] = s.codecSec * 1000.0;
+        d["chain_ms"] = s.chainSec * 1000.0;
+        d["decoder_bias_ms"] = s.decoderSec * 1000.0;
         d["configured_ms"] = s.extraSec * 1000.0;
         d["path"] = s.pathDescription;
         if (s.receiverLocation.valid) {
@@ -399,7 +420,7 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
     }
     j["sources"] = std::move(arr);
 
-    return pretty ? j.dump(2) : j.dump();
+    return dumpJson(j, pretty);
 }
 
 } // namespace ubersdr_ntp

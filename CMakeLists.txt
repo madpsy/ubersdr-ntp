@@ -42,11 +42,13 @@ target_compile_options(ixwebsocket_vendored PRIVATE -w)
 # ---------------------------------------------------------------------------
 # The time-code decoders.
 #
-# Copied verbatim from ubersdr-clock, which took them verbatim from AetherSDR.
-# Kept byte-identical on purpose: it makes an upstream fix a straight `cp`, and
-# the voter in particular carries calibration constants tuned against live WWV
-# corpora that should not drift without upstream's evidence behind the change.
-# Built as their own target with warnings off for the same reason.
+# Taken from ubersdr-clock, which took them from AetherSDR, and since changed
+# here: sub-sample edge timing, the WWV/WWVH station tag, leap-second minutes
+# and the WWVB DST bits. An upstream fix is no longer a straight `cp` -- diff
+# first. The voter's calibration constants, and WwvDecoder's
+# kNominalDelaySamples, are still upstream's and should not drift without
+# evidence behind the change. tools/decodertest.cpp is that evidence offline.
+# Built as their own target with warnings off, as upstream's code was.
 # ---------------------------------------------------------------------------
 add_library(clockdecoders STATIC
     src/clock/WwvDecoder.cpp
@@ -54,6 +56,13 @@ add_library(clockdecoders STATIC
     src/clock/TimeFrameVoter.cpp)
 target_include_directories(clockdecoders PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(clockdecoders PRIVATE -w)
+
+# Offline decoder accuracy test: synthesises WWV/WWVH/WWVB at several rates,
+# sub-sample phases and noise levels (including a leap-second minute) and checks
+# decoded timestamps and edge error. Needs no receiver; not installed.
+add_executable(ubersdr-ntp-decodertest tools/decodertest.cpp)
+target_link_libraries(ubersdr-ntp-decodertest PRIVATE clockdecoders Threads::Threads)
+target_compile_options(ubersdr-ntp-decodertest PRIVATE -Wall -Wextra)
 
 # ---------------------------------------------------------------------------
 # The page is a real file in src/web/ and is served from the binary. This is

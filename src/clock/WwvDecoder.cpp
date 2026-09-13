@@ -1,5 +1,7 @@
 #include "WwvDecoder.h"
 
+#include "CivilTime.h"
+
 // WWV/WWVH 100 Hz-subcarrier BCD time-code decoder — streaming implementation.
 //
 // Ports the MATH of the gate-passed AetherClock reference chain
@@ -63,6 +65,47 @@ constexpr int kMaxShift = 40;
 // this is τ ≈ 100 s). The fold must FORGET a stale phase: after a sample
 // discontinuity the re-seed has to find the CURRENT tick phase, not history.
 constexpr double kFoldDecay = 0.99;
+
+// Station tag (see onSeriesSample): one band's folded tick excess must be this
+// many times the other's for a verdict. A single station's own tick leaks into
+// the other band at roughly a third of its excess (3.2x clean, never below
+// 1.77x through Opus with a programme tone in offline measurement), so 1.5x
+// separates the stations with margin while staying undecided when both are
+// heard at similar strength.
+constexpr double kStationExcessRatio = 1.5;
+// Station-tag timing, all in once-per-second verdicts (see onSeriesSample):
+// fold age past tick lock before any verdict counts; identical verdicts to
+// adopt a first tag; consecutive contrary verdicts to switch an established
+// one (longer than a fade, far shorter than a propagation change); seconds
+// without a supporting verdict before a tag is released to Unknown.
+constexpr int kStationWarmSecs    = 20;
+constexpr int kStationConfirmSecs = 10;
+constexpr int kStationSwitchSecs  = 30;
+constexpr int kStationReleaseSecs = 120;
+
+// Reported second edge. Each second's own best matched-filter shift is a
+// noisy, 5 ms-quantised measurement (it moves +/-3 series samples = +/-15 ms
+// under noise); reporting it directly put that jitter on every edge. The
+// reported edge instead follows a separate smoothed, sub-sample estimate of
+// the same shift: the first kEdgeDelayWarm timed seconds form a running mean
+// (a fast start), then an EMA with this weight (tau ~16 s, far faster than any
+// sample-clock drift the tracked delay has to follow). Past the warm-up a
+// shift more than kEdgeDelayGate series samples from the estimate is a misfit,
+// not drift, and is ignored.
+constexpr double kEdgeDelayAlpha = 1.0 / 16.0;
+constexpr int    kEdgeDelayWarm  = 8;
+constexpr double kEdgeDelayGate  = 3.0;
+
+// A second only contributes timing if it actually carried a pulse: its mean
+// amplitude must reach this fraction of the running peak. A 170 ms binary-0
+// pulse averages ~0.17 of the peak over the second; the minute hole, with no
+// subcarrier at all, averages near zero.
+constexpr double kPulseEnergyFrac = 0.05;
+
+// Minimum matched-filter margin for a single second to count as evidence that
+// the frame alignment has slipped. A clean marker clears it with ease; a
+// coin-flip read under noise does not throw away a good lock.
+constexpr float kStructConf = 0.10f;
 
 // Markers (P1..P5, P0) land at seconds 9/19/29/39/49/59 — i.e. (s % 10 == 9).
 inline bool isMarkerSec(int s) { return (s % 10) == 9; }
@@ -157,6 +200,12 @@ struct WwvDecoder::Impl {
     std::array<double, kSecLen> foldH{};
     bool tickLocked = false;
     int tickPhase = 0;               // series-sample index of the second edge
+    std::int64_t tickLockJ = 0;      // series index at which the tick locked
+    ClockStation pendingStation = ClockStation::Unknown;  // verdict awaiting confirmation
+    int pendingCount = 0;            // consecutive identical verdicts for pendingStation
+    int stationContrary = 0;         // consecutive decisive verdicts against the tag
+    int stationUnsupported = 0;      // consecutive verdicts not supporting the tag
+    double tickExcessRatio = 0.0;    // latest 2000 Hz / 2200 Hz tick excess
 
     // Slowly-adapted matched-filter delay estimate: nominal chain group delay
     // plus any accumulated stream drift. Tracked slowly instead of re-searched
@@ -167,8 +216,22 @@ struct WwvDecoder::Impl {
     bool delayLocked = false;
     int delayCount = 0;
 
+    // Smoothed sub-sample matched-filter shift the reported edge is built on
+    // (see kEdgeDelayAlpha). Separate from delayEst, which steers the search
+    // band and must keep its own dynamics.
+    double edgeDelayEst = kNominalDelaySamples;
+    int edgeDelayCount = 0;
+    int edgeDelayRejects = 0;        // consecutive timed seconds gated out
+
     // Consecutive structurally-invalid frames (marker skeleton broken).
     int badFrameStreak = 0;
+
+    // Slip / leap-second handling.
+    std::int64_t suspectSec = -1;     // latest secIndex whose symbol contradicted the frame
+    std::int64_t lastRealignK = -1;   // frame start produced by the last +/-1 s realignment
+    bool haveLastFields = false;      // lastFields holds the last completed minute
+    TimeFields lastFields;
+    bool lastLeapWarn = false;        // previous frame's leap-warning bit
 
     // Per-second windowing at 200 Hz.
     std::array<float, kSecLen> curSec{};
@@ -212,7 +275,8 @@ struct WwvDecoder::Impl {
     void onSeriesSample(double a, double tickV, double tickH);
     void processSecond(std::int64_t startJ, const std::array<float, kSecLen>& w);
     void classify(const std::array<float, kSecLen>& w, int8_t& sym, float& conf,
-                  int& winShift) const;
+                  int& winShift, double& fracShift) const;
+    bool leapSecondPossible() const;
     void tryAnchor();
     void feedPendingFrames();
     void softReacquire();
@@ -364,37 +428,106 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
         ratio = (mean > 0.0) ? peak / mean : 0.0;
     };
 
+    // Tick EXCESS of a band: what its folded peak (argmax bin and both
+    // neighbours, so a tick straddling two 5 ms bins counts whole) holds above
+    // the band's own background (median bin).
+    //
+    // Station is decided by comparing excesses, not the bands' peak-to-mean
+    // ratios. The 5 ms tick at 2000 Hz leaks into the 2200 Hz filter at about
+    // -10 dB, at the same phase, so a WWV-only signal shows a real impulse in
+    // BOTH bands; peak-to-mean is scale-free per band, so which band "wins"
+    // was decided by the two bands' backgrounds rather than by where the tick
+    // is. Measured offline on synthetic WWV only: clean, the old margin was
+    // 1.47x against a 1.3x gate; with WWV's own 600 Hz programme tone it was
+    // 1.36x; through Opus at 16 kbps plus that tone the 2200 Hz band came out
+    // MORE impulsive than 2000 Hz at some tick phases (30.4 vs 28.6), and at
+    // 17 of 48 phase/codec/tone combinations no tag ever formed. The excess
+    // ratio stayed >= 1.77x for WWV in every one of those cases.
+    auto tickExcess = [](const std::array<double, kSecLen>& fold, int arg) {
+        std::array<double, kSecLen> tmp = fold;
+        std::nth_element(tmp.begin(), tmp.begin() + kSecLen / 2, tmp.end());
+        const double median = tmp[kSecLen / 2];
+        double e = 0.0;
+        for (int d = -1; d <= 1; ++d) e += fold[(arg + d + kSecLen) % kSecLen] - median;
+        return std::max(0.0, e);
+    };
+    auto tickVerdict = [&](double eV, double eH) {
+        if (eV >= kStationExcessRatio * eH && eV > 0.0) return ClockStation::Wwv;
+        if (eH >= kStationExcessRatio * eV && eH > 0.0) return ClockStation::Wwvh;
+        return ClockStation::Unknown;
+    };
+
     if (!tickLocked && j >= 5 * kSecLen) {
         double rV, rH; int argV, argH;
         stats(foldV, rV, argV);
         stats(foldH, rH, argH);
-        // Lock onto whichever band folds to a genuine impulse (a flat fold from
-        // noise or voice never clears the ratio gate). Tag the station only when
-        // that band's peakiness clearly beats the other's; hold Unknown (per the
-        // header) until confident.
-        bool vWins = rV >= rH;
-        double win = vWins ? rV : rH;
-        double lose = vWins ? rH : rV;
-        if (win > 2.5) {
+        // Lock once either band folds to a genuine impulse (a flat fold from
+        // noise or voice never clears the ratio gate). The tick phase comes from
+        // the band that actually carries the tick -- the larger excess -- not
+        // from whichever band looks peakier, which can be the leakage band.
+        if (std::max(rV, rH) > 2.5) {
+            const double eV = tickExcess(foldV, argV);
+            const double eH = tickExcess(foldH, argH);
             tickLocked = true;
-            tickPhase = vWins ? argV : argH;
-            if (win > 1.3 * lose)
-                station = vWins ? ClockStation::Wwv : ClockStation::Wwvh;
+            tickLockJ = j;
+            tickPhase = (eV >= eH) ? argV : argH;
+            // No station tag yet: five hits is enough to find the tick's phase,
+            // not to judge which band holds it (see the per-second block).
             setState(ClockLockState::Acquiring);
         }
     }
 
-    // Keep refining the station tag once per second: the fixed-phase tick keeps
-    // sharpening its band's fold while phase-incoherent voice averages flat, so
-    // impulsiveness separates the bands more cleanly the longer we integrate.
-    if (tickLocked && station == ClockStation::Unknown && phase == 0) {
+    // Judge the station once per second for as long as the stream runs, once
+    // the fold has integrated kStationWarmSecs past tick lock. The fixed-phase
+    // tick keeps sharpening its band's fold while phase-incoherent voice
+    // averages flat, and propagation can hand a shared frequency from one
+    // station to the other. The tag used to be set once, from the five-second
+    // fold at tick lock, and never revisited: offline, one Opus-coded WWV run
+    // read WWVH (-1.8 dB) at five seconds, then settled at +0.3..+1.4 dB -- WWV,
+    // but never decisively -- and kept the wrong tag for the whole stream.
+    //   - Unknown -> a station: kStationConfirmSecs consecutive identical
+    //     decisive verdicts.
+    //   - a station -> the other: kStationSwitchSecs consecutive decisive
+    //     contrary verdicts, so a fade does not flap the propagation model.
+    //   - a station -> Unknown: kStationReleaseSecs with no verdict supporting
+    //     it. The engine models Unknown on a shared frequency as WWV, the
+    //     dial's default, which is better than holding a tag nothing backs.
+    if (tickLocked && phase == 0) {
         double rV, rH; int argV, argH;
         stats(foldV, rV, argV);
         stats(foldH, rH, argH);
-        bool vWins = rV >= rH;
-        double win = vWins ? rV : rH, lose = vWins ? rH : rV;
-        if (win > 2.5 && win > 1.3 * lose)
-            station = vWins ? ClockStation::Wwv : ClockStation::Wwvh;
+        const double eV = tickExcess(foldV, argV);
+        const double eH = tickExcess(foldH, argH);
+        tickExcessRatio = (eH > 0.0) ? eV / eH : std::numeric_limits<double>::infinity();
+        const ClockStation v = tickVerdict(eV, eH);
+        if (j - tickLockJ < kStationWarmSecs * kSecLen) {
+            // Fold still too young to judge.
+        } else if (station == ClockStation::Unknown) {
+            if (v != ClockStation::Unknown && v == pendingStation) {
+                if (++pendingCount >= kStationConfirmSecs) {
+                    station = v;
+                    stationContrary = stationUnsupported = 0;
+                    pendingCount = 0;
+                }
+            } else {
+                pendingStation = v;
+                pendingCount = (v != ClockStation::Unknown) ? 1 : 0;
+            }
+        } else if (v == station) {
+            stationContrary = stationUnsupported = 0;
+        } else {
+            ++stationUnsupported;
+            stationContrary = (v != ClockStation::Unknown) ? stationContrary + 1 : 0;
+            if (stationContrary >= kStationSwitchSecs) {
+                station = v;
+                stationContrary = stationUnsupported = 0;
+            } else if (stationUnsupported >= kStationReleaseSecs) {
+                station = ClockStation::Unknown;
+                stationContrary = stationUnsupported = 0;
+                pendingStation = ClockStation::Unknown;
+                pendingCount = 0;
+            }
+        }
     }
 
     if (a > aScale) aScale = a;
@@ -414,7 +547,8 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
 }
 
 void WwvDecoder::Impl::classify(const std::array<float, kSecLen>& w,
-                                int8_t& sym, float& conf, int& winShift) const {
+                                int8_t& sym, float& conf, int& winShift,
+                                double& fracShift) const {
     // Normalized correlation against each zero-mean template; symbol = best,
     // confidence = best minus runner-up (the prototype's classify() margin).
     double mean = 0.0;
@@ -442,15 +576,17 @@ void WwvDecoder::Impl::classify(const std::array<float, kSecLen>& w,
         hi = std::min(kMaxShift, c + 3);
     }
 
+    auto score = [&](int k, int d) {
+        double dot = 0.0;
+        for (int n = d; n < kSecLen; ++n) dot += v[n] * tpl[k][n - d];
+        return dot * invn / (tplNorm[k] + 1e-12);
+    };
+
     double bestScore = -1e30, scStar[3] = {0, 0, 0};
     winShift = lo;
     for (int d = lo; d <= hi; ++d) {
         double sc[3];
-        for (int k = 0; k < 3; ++k) {
-            double dot = 0.0;
-            for (int n = d; n < kSecLen; ++n) dot += v[n] * tpl[k][n - d];
-            sc[k] = dot * invn / (tplNorm[k] + 1e-12);
-        }
+        for (int k = 0; k < 3; ++k) sc[k] = score(k, d);
         double m = std::max({sc[0], sc[1], sc[2]});
         if (m > bestScore) {
             bestScore = m; winShift = d;
@@ -464,12 +600,37 @@ void WwvDecoder::Impl::classify(const std::array<float, kSecLen>& w,
     for (int k = 0; k < 3; ++k) if (k != best && scStar[k] > runner) runner = scStar[k];
     sym = static_cast<int8_t>(best);
     conf = static_cast<float>(std::max(0.0, scStar[best] - runner));
+
+    // Sub-sample position of the correlation peak: a parabola through the
+    // winning template's score at the best shift and its two neighbours. Used
+    // only for the reported edge -- the 5 ms series grid is coarser than the
+    // timing this decoder is asked for, and the peak's shape carries the rest.
+    // Neighbours are evaluated even outside the constrained search band, which
+    // bounds where the peak may be looked for, not where its slope is sampled.
+    fracShift = 0.0;
+    if (winShift > 0 && winShift < kSecLen - 1) {
+        const double sm = score(best, winShift - 1);
+        const double sp = score(best, winShift + 1);
+        const double den = sm - 2.0 * scStar[best] + sp;
+        if (den < 0.0) fracShift = std::clamp(0.5 * (sm - sp) / den, -0.5, 0.5);
+    }
+}
+
+bool WwvDecoder::Impl::leapSecondPossible() const {
+    // Leap seconds are only ever inserted as 23:59:60 UTC on the last day of a
+    // month, so the only minute a leap second can follow is 23:59 on such a day.
+    if (!haveLastFields) return false;
+    const TimeFields& f = lastFields;
+    if (f.minute != 59 || f.hour != 23) return false;
+    if (f.doy < 1 || f.doy > 366 || f.year2 < 0 || f.year2 > 99) return false;
+    return ubersdr_ntp::isLastDayOfMonth(
+        ubersdr_ntp::utcMsFromFields(f.year2, f.doy, f.hour, f.minute));
 }
 
 void WwvDecoder::Impl::processSecond(std::int64_t startJ,
                                      const std::array<float, kSecLen>& w) {
-    int8_t sym; float conf; int winShift = 0;
-    classify(w, sym, conf, winShift);
+    int8_t sym; float conf; int winShift = 0; double fracShift = 0.0;
+    classify(w, sym, conf, winShift, fracShift);
 
     // Slowly adapt the delay estimate toward the alignment that confident
     // seconds actually used; constrain the search band once it settles. The
@@ -492,16 +653,67 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
     for (float v : w) emean += v;
     emean /= kSecLen;
 
-    // The second-edge label subtracts the nominal chain delay back out of the
-    // matched shift, so it tracks REAL stream drift: on a clean drift-free
-    // stream winShift ~= kNominalDelaySamples and this reduces to the window
-    // start, unchanged from pre-WS-4.5 behavior.
-    const std::int64_t edgeSample =
-        (startJ + (winShift - kNominalDelaySamples)) * decim;
     const std::int64_t k = secIndex;
     int secOfFrame = anchored
         ? static_cast<int>(((k - anchorSec0) % kFrameSecs + kFrameSecs) % kFrameSecs)
         : -1;
+
+    // Only a second that carried a pulse, and read confidently, measures the
+    // edge. The minute hole has nothing to align to: its "best" shift is
+    // whatever the noise favoured.
+    const bool holeSecond = anchored && secOfFrame == 0;
+    const bool timed = conf > 0.12f && !holeSecond && emean > kPulseEnergyFrac * aScale;
+    if (timed) {
+        const double shift = winShift + fracShift;
+        if (edgeDelayCount < kEdgeDelayWarm ||
+            std::fabs(shift - edgeDelayEst) <= kEdgeDelayGate) {
+            edgeDelayRejects = 0;
+            ++edgeDelayCount;
+            const double alpha = std::max(1.0 / edgeDelayCount, kEdgeDelayAlpha);
+            edgeDelayEst += alpha * (shift - edgeDelayEst);
+        } else if (++edgeDelayRejects >= kEdgeDelayWarm) {
+            // Not a misfit but a real move the search band has already
+            // followed: gating it out forever would freeze the reported edge on
+            // a delay the stream no longer has. Start the estimate over.
+            edgeDelayRejects = 0;
+            edgeDelayCount = 1;
+            edgeDelayEst = shift;
+        }
+    }
+
+    // The second-edge label subtracts the nominal chain delay back out of the
+    // smoothed matched shift, so it tracks REAL stream drift: on a clean
+    // drift-free stream the shift settles at kNominalDelaySamples and this
+    // reduces to the window start, unchanged from pre-WS-4.5 behavior. Same
+    // calibration as the old per-second (startJ + winShift - nominal) form --
+    // the estimate converges on the mean of those shifts -- minus their jitter
+    // and 5 ms quantisation.
+    const double reportDelay = edgeDelayCount > 0 ? edgeDelayEst : delayEst;
+    const std::int64_t edgeSample = static_cast<std::int64_t>(std::llround(
+        (static_cast<double>(startJ) + reportDelay - kNominalDelaySamples) * decim));
+
+    // Slip detection, BEFORE this second is emitted. The per-frame skeleton
+    // check below only runs once a minute, and every second until then would
+    // be labelled from a second count that is no longer right. A confident
+    // marker one second after its slot (with the slot itself not a marker), or
+    // one second before it, is a slipped count -- an unannounced leap second,
+    // or a second lost or duplicated in the stream. Straight after a possible
+    // leap-second minute, the minute hole landing on s1 instead of s0 (s1 is
+    // always a pulsed binary 0) says the same thing within one second instead
+    // of ten. Either way stop certifying time now and let the frame decide.
+    if (anchored && secOfFrame > 0 && !recs.empty() && recs.back().secIndex == k - 1) {
+        const Rec& prev = recs.back();
+        const bool late = conf >= kStructConf && sym == 2 && secOfFrame % 10 == 0 &&
+                          prev.sym != 2;
+        const bool early = conf >= kStructConf && sym != 2 && isMarkerSec(secOfFrame) &&
+                           prev.sym == 2 && prev.conf >= kStructConf;
+        const bool leapHole = secOfFrame == 1 && leapSecondPossible() &&
+                              emean < 0.5 * prev.energy;
+        if (late || early || leapHole) {
+            suspectSec = k;
+            if (state == ClockLockState::Locked) setState(ClockLockState::Acquiring);
+        }
+    }
 
     lastEdgeSample = edgeSample;
     lastEdgeSecondOfFrame = secOfFrame;
@@ -510,6 +722,7 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
     if (owner && owner->onSecond) {
         ClockSecondInfo info;
         info.edgeSample = edgeSample;
+        info.edgeMeasured = timed;
         info.symbol = static_cast<ClockSymbol>(sym);
         info.confidence = conf;
         info.secondOfFrame = secOfFrame;
@@ -610,9 +823,46 @@ void WwvDecoder::Impl::feedPendingFrames() {
             vsym[s] = static_cast<ClockSymbol>(r.sym);
         }
 
+        int mkOk = 0, mkFalse = 0, mkLate = 0, mkEarly = 0;
+        for (int s = 0; s < kFrameSecs; ++s) {
+            if (sym[s] != 2) continue;
+            (isMarkerSec(s) ? mkOk : mkFalse) += 1;
+            if (s % 10 == 0) ++mkLate;     // content one second later than labelled
+            if (s % 10 == 8) ++mkEarly;    // content one second earlier
+        }
+
+        // A whole skeleton one second off is a slipped second count, not a
+        // noisy frame: a leap second (NIST SP 432 sends 23:59:60 as a binary 0,
+        // so s59 -> s60 -> hole pushes every later marker one slot late), or a
+        // second lost or duplicated upstream. Realign the anchor by that second
+        // and assemble the frame again from there, without emitting or voting
+        // the misaligned one -- its minute is the same minute, read correctly
+        // once aligned. A frame that still looks slipped right after a
+        // realignment means the evidence is not a clean slip: start over.
+        if ((mkLate >= 4 || mkEarly >= 4) && mkOk <= 1) {
+            if (nextFrameStartK == lastRealignK) {
+                softReacquire();
+                return;
+            }
+            const int shift = (mkLate >= mkEarly) ? 1 : -1;
+            anchorSec0 += shift;
+            nextFrameStartK += shift;
+            lastRealignK = nextFrameStartK;
+            suspectSec = -1;   // the slip it flagged is now accounted for
+            if (state == ClockLockState::Locked) setState(ClockLockState::Acquiring);
+            continue;
+        }
+
+        // A second inside this frame contradicted the alignment (see
+        // processSecond). The frame may be half one count and half the other,
+        // so neither its decode nor a timestamp composed from its second 0 can
+        // be trusted.
+        const bool suspect = suspectSec >= nextFrameStartK &&
+                             suspectSec < nextFrameStartK + kFrameSecs;
+
         std::int64_t frameStartSample = recs[static_cast<std::size_t>(base)].edgeSample;
         ClockFrameInfo frame = decodeFrame(sym, conf, frameStartSample);
-        if (owner && owner->onFrame) owner->onFrame(frame);
+        if (!suspect && owner && owner->onFrame) owner->onFrame(frame);
 
         // Structural re-validation (WS-4.5): the marker skeleton is the frame's
         // ground truth — a healthy frame has its 6 P markers on the 9s and
@@ -623,11 +873,8 @@ void WwvDecoder::Impl::feedPendingFrames() {
         // usable signal and pruning them thins the window the fade rescue
         // needs (measured on the 2026-07-19 live corpus — the voter's own
         // range/staleness/trust gates absorb per-frame noise).
-        int mkOk = 0, mkFalse = 0;
-        for (int s = 0; s < kFrameSecs; ++s) {
-            if (sym[s] == 2) (isMarkerSec(s) ? mkOk : mkFalse) += 1;
-        }
-        if (mkOk < 4 || mkFalse > 5) {
+        const bool skeletonOk = !(mkOk < 4 || mkFalse > 5);
+        if (!skeletonOk) {
             if (++badFrameStreak >= 3) {
                 softReacquire();
                 return;
@@ -636,9 +883,51 @@ void WwvDecoder::Impl::feedPendingFrames() {
             badFrameStreak = 0;
         }
 
-        // Feed the cross-frame voter (markers excluded internally).
-        voter.addFrame(vsym, conf);
-        if (voter.locked()) {
+        // Feed the cross-frame voter (markers excluded internally). A suspect
+        // frame still takes its window slot -- the voter extrapolates by slot
+        // age, so skipping one would shift every older frame's minute -- but
+        // as all-Unknown: it votes nothing and counts as range-invalid.
+        if (suspect) {
+            std::array<ClockSymbol, kFrameSecs> blank{};
+            blank.fill(ClockSymbol::Unknown);
+            std::array<float, kFrameSecs> zero{};
+            voter.addFrame(blank, zero);
+        } else {
+            voter.addFrame(vsym, conf);
+        }
+        const bool certified = voter.locked();
+
+        // The minute this frame names (voted when the window certifies one), for
+        // judging whether a leap second can follow it.
+        haveLastFields = !suspect;
+        if (!suspect) {
+            lastFields = certified
+                ? TimeFields{voter.votedField(TimeFrameVoter::FieldMinutes),
+                             voter.votedField(TimeFrameVoter::FieldHours),
+                             voter.votedField(TimeFrameVoter::FieldDoy),
+                             voter.votedField(TimeFrameVoter::FieldYear)}
+                : TimeFields{frame.minute, frame.hour, frame.doy, frame.year2};
+        }
+        // 23:59 on the last day of a month with the leap warning up (this
+        // frame's bit or the previous one's, in case this one faded): the next
+        // second is probably 23:59:60. The engine extends this frame's timestamp
+        // by whole seconds of samples, so that second would be labelled
+        // 00:00:00 and every one after it a second early. Do not issue a
+        // timestamp from this frame and stop certifying before the leap second
+        // is emitted; the slip checks realign the next minute, which then
+        // re-locks. If no leap second comes after all, it re-locks just the same.
+        const bool leapNext = !suspect && (frame.leapPending || lastLeapWarn) &&
+                              leapSecondPossible();
+        if (!suspect) lastLeapWarn = frame.leapPending;
+
+        if (certified && (suspect || leapNext)) {
+            if (state == ClockLockState::Locked) setState(ClockLockState::Acquiring);
+        } else if (certified && !skeletonOk) {
+            // Voter still certifies, but this frame's own alignment is not
+            // confirmed: hold the state and let the previous timestamp keep
+            // extending rather than compose a fresh one against a second 0 the
+            // skeleton does not vouch for.
+        } else if (certified) {
             setState(ClockLockState::Locked);
             if (owner && owner->onTime) {
                 ClockTimeInfo t;
@@ -675,12 +964,19 @@ void WwvDecoder::Impl::softReacquire() {
     delayEst = kNominalDelaySamples;
     delayLocked = false;
     delayCount = 0;
+    edgeDelayEst = kNominalDelaySamples;
+    edgeDelayCount = 0;
+    edgeDelayRejects = 0;
     recs.clear();
     recBase = secIndex;
     anchored = false;
     anchorSec0 = 0;
     nextFrameStartK = 0;
     badFrameStreak = 0;
+    suspectSec = -1;
+    lastRealignK = -1;
+    haveLastFields = false;
+    lastLeapWarn = false;
     voter.reset();
     if (state != ClockLockState::NoSignal) setState(ClockLockState::Acquiring);
 }
@@ -733,8 +1029,12 @@ void WwvDecoder::Impl::reset() {
     accA = accTickV = accTickH = 0.0; decCount = 0; n200 = 0;
     foldV.fill(0.0); foldH.fill(0.0);
     tickLocked = false; tickPhase = 0;
+    tickLockJ = 0; pendingStation = ClockStation::Unknown; pendingCount = 0;
+    stationContrary = 0; stationUnsupported = 0; tickExcessRatio = 0.0;
     delayEst = kNominalDelaySamples; delayLocked = false; delayCount = 0;
+    edgeDelayEst = kNominalDelaySamples; edgeDelayCount = 0; edgeDelayRejects = 0;
     badFrameStreak = 0;
+    suspectSec = -1; lastRealignK = -1; haveLastFields = false; lastLeapWarn = false;
     curFill = 0; secStarted = false; secStartJ = 0; aScale = 1e-6;
     recs.clear(); recBase = 0; secIndex = 0;
     anchored = false; anchorSec0 = 0; nextFrameStartK = 0;
@@ -791,6 +1091,9 @@ ClockDecoderDiagnostics WwvDecoder::diagnostics() const {
     g.toneSnrDb = (ratio > 0.0)
         ? static_cast<float>(10.0 * std::log10(ratio)) : 0.0f;
     g.pwmContrast = 0.0f;  // WWVB-only metric
+    g.tickBandRatioDb = (d.tickLocked && d.tickExcessRatio > 0.0 && std::isfinite(d.tickExcessRatio))
+        ? static_cast<float>(10.0 * std::log10(d.tickExcessRatio))
+        : std::numeric_limits<float>::quiet_NaN();
     g.toneDetected = d.tickLocked;
 
     g.phaseLocked = d.tickLocked;

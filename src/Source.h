@@ -86,6 +86,10 @@ struct SourceSnapshot {
     std::string station = "unknown";
     double toneSnrDb = 0.0;
     double delayEstMs = 0.0;
+    // WWV/WWVH: tick energy in the 2000 Hz band over the 2200 Hz band, in dB --
+    // what the station tag is decided from. Positive leans WWV, negative WWVH;
+    // NaN when there is none (WWVB, or no tick yet).
+    double tickBandRatioDb = std::numeric_limits<double>::quiet_NaN();
     bool toneDetected = false;
     bool phaseLocked = false;
     bool anchored = false;
@@ -115,6 +119,8 @@ struct SourceSnapshot {
     double propagationSec = 0.0;
     double networkSec = 0.0;
     double codecSec = 0.0;
+    double decoderSec = 0.0;   // the running decoder's edge bias (negative: early)
+    double chainSec = 0.0;     // UberSDR's fixed RF-to-WebSocket delay
     double extraSec = 0.0;
     std::string pathDescription;
 
@@ -130,7 +136,7 @@ struct SourceSnapshot {
 
 class Source {
 public:
-    Source(SourceConfig cfg, std::string userAgent);
+    explicit Source(SourceConfig cfg);
     ~Source();
 
     Source(const Source&) = delete;
@@ -145,7 +151,7 @@ public:
 private:
     void supervise();
     bool sessionHandshake(std::string& err);     // POST /connection
-    void fetchDescription();                     // GET /api/description
+    bool fetchDescription();                     // GET /api/description; true once parsed
     std::string buildWsUrl() const;
 
     void onOpen();
@@ -155,8 +161,15 @@ private:
 
     // Audio path, all on the WebSocket thread.
     void handleAudio(const std::uint8_t* pkt, std::size_t len, double arrivalSec);
-    void feedSamples(const std::int16_t* pcm, int count, int rate, double arrivalSec);
-    void ensureDecoder(int rate);
+    // arrivalSec is CLOCK_MONOTONIC. observeArrival=false for samples this
+    // program synthesised (concealment, gap fill), which advance the timeline
+    // but did not arrive at any particular instant.
+    void feedSamples(const std::int16_t* pcm, int count, int rate, double arrivalSec,
+                     bool observeArrival = true);
+    void feedSilence(int count, int rate);
+    bool ensureDecoder(int rate);   // false: no decoder can run at this rate
+    void trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamples);
+    void discardTiming(const char* why);   // caller does NOT hold m_mu
     void resetStream(const char* why);
 
     // Decoder callbacks.
@@ -172,7 +185,6 @@ private:
     void probeRtt();
 
     SourceConfig m_cfg;
-    std::string m_userAgent;
     std::string m_sessionId;
 
     std::thread m_thread;
@@ -180,10 +192,11 @@ private:
     std::mutex m_wake;
     std::condition_variable m_wakeCv;
 
-    // Guards the pointer, not the socket. ix::WebSocket::stop() is safe to
-    // call from another thread; resetting the unique_ptr that holds it while
-    // that other thread is dereferencing it is not, and stop() and the
-    // supervisor loop both do exactly that.
+    // Guards the pointer, not the socket. Only the supervisor ever calls
+    // ix::WebSocket::stop(): it joins the socket's thread with no guard of its
+    // own, so two threads stopping one socket is a double join — undefined
+    // behaviour, and in practice std::terminate on SIGTERM. The pointer is
+    // shared so onOpen can send on it without racing the supervisor's reset.
     mutable std::mutex m_wsMu;
     std::shared_ptr<ix::WebSocket> m_ws;
 
@@ -194,6 +207,16 @@ private:
     double m_lastAudioAt = 0.0;
     double m_lastTimeAt = 0.0;
     std::atomic<bool> m_socketOpen{false};
+    bool m_haveDescription = false;   // supervisor thread only
+
+    // Which codec the audio actually being decoded came through, for the delay
+    // model. -1 until the first frame: the configured format is then the best
+    // guess, but a session that negotiated Opus can be sent lossless frames.
+    int m_feedingOpus = -1;
+
+    // The leap warning bit is taken from single frames, so one misread frame
+    // would otherwise announce a leap second to every client.
+    int m_leapFrames = 0;
 
     // audio decode
     OpusV4HeaderDecoder m_opusHeader;
@@ -202,12 +225,33 @@ private:
     std::vector<std::int16_t> m_opusPcm;
     std::unique_ptr<class PcmV4Reader> m_pcmv4;   // pimpl: keeps pcm_v4.hpp out of this header
     std::vector<float> m_mono;
+    std::vector<std::int16_t> m_silence;
 
     // clock decoder
     std::unique_ptr<AetherSDR::WwvDecoder> m_wwv;
     std::unique_ptr<AetherSDR::WwvbDecoder> m_wwvb;
     int m_decoderRate = 0;
+    bool m_rateRefused = false;
     std::int64_t m_samplesWritten = 0;
+    int m_lastFrameSamples = 0;     // the length a lost packet is assumed to have
+
+    // Timeline integrity, all on the WebSocket thread. The server stamps each
+    // frame with the time its first sample reached it; the stamp minus this
+    // program's own sample count is constant while no audio goes missing, and
+    // steps by exactly the missing duration when some does. See trackTimeline.
+    bool m_tsHave = false;
+    bool m_tsWaitResync = false;
+    std::uint64_t m_tsOriginNanos = 0;
+    std::int64_t m_tsOriginSample = 0;
+    double m_tsBaseline = 0.0;
+    double m_tsBlockMin = 0.0;
+    std::uint64_t m_tsBlockStartNanos = 0;
+    bool m_tsBlockHave = false;
+    std::uint64_t m_gapFills = 0;
+
+    // CLOCK_REALTIME minus CLOCK_MONOTONIC at the last packet, to see a step.
+    bool m_haveRtMinusMono = false;
+    double m_lastRtMinusMono = 0.0;
 
     SampleClock m_clock;
 
