@@ -297,8 +297,18 @@ Combining them is the same problem NTP solves, so it is solved the same way:
    more than usual: a deep fade biases the same bits in every frame of the
    decoder's voter window, so the misread is unanimous with maximum margin and
    no metric inside one decoder can catch it. An independent receiver can.
-3. **Combine** — survivors weighted by 1/dist², plus their spread, so two
-   sources 40 ms apart cannot produce an answer claiming 10 ms.
+3. **Combine** — survivors weighted by 1/uncertainty², plus their spread, so
+   two sources 40 ms apart cannot produce an answer claiming 10 ms.
+
+The uncertainty that decides the weighting is each source's *own* — its jitter,
+its sample-clock residual, and how well that clock's slope is known — and not
+the interval it asserts in step 2. The asserted interval includes the delay
+model's uncertainty, which is ~16 ms for any source on a typical path because
+they all run the same model; weighting by a figure they share compresses the
+ratio between a clean source and a struggling one until it stops meaning
+anything. A receiver whose stream keeps forcing its sample clock to be rebuilt
+loses its share of the vote on its own, without anyone having to set a weight by
+hand, and regains it when the stream settles.
 
 With one source there is nothing to intersect and the answer is that source's
 offset and its dispersion — the correct and slightly humbling result.

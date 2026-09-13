@@ -111,6 +111,15 @@ struct SourceSnapshot {
     double rawOffsetSec = 0.0;      // before the delay model, for diagnosis
     double jitterSec = 0.0;         // spread of the measurements in the window
     double dispersionSec = 0.0;     // jitter + fit residual + delay uncertainty
+    // What this source is worth RELATIVE TO THE OTHERS, which is not the same
+    // number. dispersionSec is dominated by the delay model's uncertainty, and
+    // every source shares that model: two receivers on similar paths both carry
+    // about 16 ms of it, so a source with seventeen times another's jitter still
+    // ends up only a third wider overall and keeps a third of the vote. The
+    // common term belongs in what the server ADVERTISES -- it is real, and the
+    // answer really is that uncertain -- but not in deciding which source to
+    // believe. This is the part that actually distinguishes them.
+    double weightDispersionSec = 0.0;
     double offsetAgeSec = 1e9;
     int offsetSamples = 0;
 
@@ -129,6 +138,8 @@ struct SourceSnapshot {
     double clockResidualSec = 0.0;
     double clockSpanSec = 0.0;
     double clockPpm = 0.0;          // receiver sample clock against ours
+    double clockSlopeUncSec = 0.0;  // bias the slope could be putting on an edge
+    bool clockSlopeHeld = false;    // fitted slope refused as implausible
     double lastExcessDelaySec = 0.0;
 
     double weight = 1.0;

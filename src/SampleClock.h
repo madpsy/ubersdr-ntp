@@ -52,6 +52,18 @@ struct ClockFit {
     double residualRms = 0.0;  // spread of the low-envelope points about the fit (s)
     double spanSec = 0.0;      // how much stream the fit covers
     int points = 0;
+    // How wrong the SLOPE could make a timestamp at the working end of the
+    // window. The residual above says how well the points sit on the line; this
+    // says how well the line's direction is known, which is a different thing
+    // and the one that hurts: a rate error is a bias that grows with distance
+    // from the window's centre, so a poorly determined slope quietly biases
+    // every edge rather than scattering them. Standard error of the OLS slope
+    // times the distance worked to -- or, when the slope was refused as
+    // implausible, how far the refused slope wanted to pull that timestamp,
+    // because data that implies an impossible rate is data that disagrees with
+    // itself by that much.
+    double slopeUncertaintySec = 0.0;
+    bool slopeHeld = false;    // the fitted slope was refused; nominal is in use
 };
 
 class SampleClock {

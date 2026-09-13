@@ -182,6 +182,7 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowRealtim
         o["have_offset"] = s.haveOffset;
         o["offset_ms"] = s.offsetSec * 1000.0;
         o["dispersion_ms"] = s.dispersionSec * 1000.0;
+        o["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
         o["samples"] = s.offsetSamples;
         o["in_use"] = std::find(c.usedNames.begin(), c.usedNames.end(), s.name) != c.usedNames.end();
         arr.push_back(std::move(o));

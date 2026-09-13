@@ -23,10 +23,19 @@
 //      discarded rather than averaged in. This is the step that makes two
 //      sources worth more than twice one.
 //
-//   3. COMBINE. Weight the survivors by 1/dist^2 and by the configured weight.
-//      A source claiming 8 ms then counts for sixteen times one claiming 32 ms,
-//      which is the right ratio when the claim is honest and the reason the
-//      dispersion each source reports has to be honest.
+//   3. COMBINE. Weight the survivors by 1/uncertainty^2 and by the configured
+//      weight. A source claiming 8 ms then counts for sixteen times one claiming
+//      32 ms, which is the right ratio when the claim is honest and the reason
+//      the dispersion each source reports has to be honest.
+//
+//      The uncertainty used here is the source's OWN -- its jitter and how well
+//      its sample clock is known -- and not the interval it asserts in step 2.
+//      The interval includes the delay model's uncertainty, which is the same
+//      for every source because they all run the same model: weighting by a
+//      number they share compresses the ratio between a good source and a bad
+//      one until it stops meaning anything. Step 2 wants the honest interval,
+//      step 3 wants the difference between them, and they are not the same
+//      number.
 //
 // With one source there is nothing to intersect and step 2 does nothing; the
 // answer is that source's offset and its dispersion, which is the correct and

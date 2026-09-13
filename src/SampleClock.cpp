@@ -1,9 +1,20 @@
 #include "SampleClock.h"
 
+#include <algorithm>
 #include <cmath>
 #include <ctime>
 
 namespace ubersdr_ntp {
+
+namespace {
+
+// The most a receiver's sample clock can credibly differ from ours. A crystal
+// is tens of ppm at worst and radiod resamples to the requested rate, so this
+// is already generous; past it the slope is describing a damaged stream, not a
+// rate. See the use site for why the bound is not looser.
+constexpr double kMaxPlausiblePpm = 200.0;
+
+} // namespace
 
 double realtimeNow() {
     struct timespec ts;
@@ -123,13 +134,23 @@ void SampleClock::refit() {
         f.secPerSample = sxy / sxx;
     }
 
-    // A slope implying the receiver's sample clock is more than 1000 ppm off
-    // ours is not a rate error, it is a fit through too short a window or a
-    // stream with a discontinuity in it. Fall back to nominal rather than
-    // extrapolate a wild slope across a minute of samples.
+    // A slope implying the receiver's sample clock is far off ours is not a
+    // rate error, it is a fit through too short a window or a stream with a
+    // discontinuity in it. Fall back to nominal rather than extrapolate a wild
+    // slope across a minute of samples.
+    //
+    // The bound is 200 ppm because that is already generous for the thing being
+    // measured: a receiver's sample clock is a crystal, tens of ppm at worst,
+    // and radiod resamples to the rate that was asked for. Anything beyond that
+    // is the stream misbehaving, and the old 1000 ppm bound was loose enough to
+    // pass a fit that put 12 ms of bias on every edge at the window's edge --
+    // wide enough to matter, narrow enough to look like a plausible source.
     const double nominal = 1.0 / m_rate;
-    if (!(f.secPerSample > nominal * 0.999 && f.secPerSample < nominal * 1.001)) {
+    const double fitted = f.secPerSample;
+    if (!(fitted > nominal * (1.0 - kMaxPlausiblePpm * 1e-6) &&
+          fitted < nominal * (1.0 + kMaxPlausiblePpm * 1e-6))) {
         f.secPerSample = nominal;
+        f.slopeHeld = true;
     }
 
     f.anchorSec = my - f.secPerSample * mx;
@@ -142,6 +163,27 @@ void SampleClock::refit() {
     f.residualRms = std::sqrt(ss / static_cast<double>(n));
     f.spanSec = m_envelope.back().hostSec - m_envelope.front().hostSec;
     f.points = static_cast<int>(n);
+
+    // The distance the slope is actually worked over: from the window's centre,
+    // which is where a regression is most certain, out to the newest sample,
+    // which is where every timestamp that matters is taken.
+    const double dWork = std::abs(static_cast<double>(m_envelope.back().sample) - mx);
+    if (n > 2 && sxx > 0.0) {
+        // Textbook standard error of an OLS slope: residual variance over the
+        // spread in x. It falls as the window lengthens (both through n and,
+        // much faster, through sxx), which is why a fit that has just been
+        // rebuilt is correctly reported as the weak evidence it is.
+        const double slopeStdErr = std::sqrt((ss / static_cast<double>(n - 2)) / sxx);
+        f.slopeUncertaintySec = slopeStdErr * dWork;
+    } else {
+        // Two points determine a line exactly and say nothing about how well.
+        // The span is the only thing left to go on.
+        f.slopeUncertaintySec = f.residualRms;
+    }
+    if (f.slopeHeld) {
+        f.slopeUncertaintySec = std::max(f.slopeUncertaintySec,
+                                         std::abs(fitted - nominal) * dWork);
+    }
     f.valid = true;
 
     m_fit = f;

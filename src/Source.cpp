@@ -99,6 +99,10 @@ constexpr double kDelayUncertaintyFloorSec = 0.015;
 // hops, more spread between them, more of the virtual height assumption.
 constexpr double kDelayUncertaintyFraction = 0.25;
 
+// The smallest uncertainty a source may claim when it is being weighed against
+// the others. See the use site.
+constexpr double kWeightDispersionFloorSec = 0.001;
+
 std::string makeUuidV4() {
     // The server requires a canonical lowercase v4 UUID and binds it to this
     // host's IP, so it identifies the session rather than securing anything —
@@ -1235,6 +1239,8 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     m_snap.clockSpanSec = f.spanSec;
     m_snap.clockPpm = f.valid && m_decoderRate > 0
         ? (f.secPerSample * m_decoderRate - 1.0) * 1e6 : 0.0;
+    m_snap.clockSlopeUncSec = f.slopeUncertaintySec;
+    m_snap.clockSlopeHeld = f.slopeHeld;
     m_snap.lastExcessDelaySec = m_clock.lastExcessDelay();
 
     updateDelayModel();
@@ -1496,7 +1502,23 @@ void Source::recomputeOffset() {
     //                   dominates
     const double delayUncertainty =
         std::max(kDelayUncertaintyFloorSec, m_snap.delaySec * kDelayUncertaintyFraction);
-    m_snap.dispersionSec = jitter + m_snap.clockResidualSec + delayUncertainty;
+    m_snap.dispersionSec = jitter + m_snap.clockResidualSec +
+                           m_snap.clockSlopeUncSec + delayUncertainty;
+
+    // And what it is worth against the others. The delay term is deliberately
+    // absent: every source runs the same delay model, so including it tells the
+    // selector only that all of them share a doubt, while drowning out the
+    // three things that actually differ. Those three are all measured, and a
+    // source whose sample clock has just been rebuilt or whose slope was
+    // refused says so here rather than waiting to be noticed by hand.
+    //
+    // The floor keeps a source that reports a suspiciously perfect zero -- a
+    // synthetic stream, or a window too short to have scattered yet -- from
+    // taking an unbounded share of the weight. A millisecond is about the
+    // decoder's own edge resolution, so no honest source is below it.
+    m_snap.weightDispersionSec = std::max(
+        kWeightDispersionFloorSec,
+        jitter + m_snap.clockResidualSec + m_snap.clockSlopeUncSec);
 
     // Fewer than a handful of measurements is not a filtered value, whatever
     // its spread happens to be.

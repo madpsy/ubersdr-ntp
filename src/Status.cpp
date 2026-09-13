@@ -262,7 +262,8 @@ std::string renderStatusBlock(const StatusInput& in) {
               << " (raw " << formatOffsetMs(s.rawOffsetSec)
               << ", jitter " << f2(s.jitterSec * 1000.0, 1) << " ms"
               << ", " << s.offsetSamples << " samples, newest "
-              << formatDuration(s.offsetAgeSec) << " old)\n";
+              << formatDuration(s.offsetAgeSec) << " old)"
+              << ", worth " << f2(s.weightDispersionSec * 1000.0, 1) << " ms against the others\n";
         } else {
             o << "    timing: no usable offset yet\n";
         }
@@ -280,6 +281,8 @@ std::string renderStatusBlock(const StatusInput& in) {
             o << "    sample clock: fit over " << formatDuration(s.clockSpanSec)
               << ", residual " << f2(s.clockResidualSec * 1000.0, 2) << " ms"
               << ", receiver runs " << f2(s.clockPpm, 1) << " ppm against ours"
+              << (s.clockSlopeHeld ? " (slope refused, holding nominal)" : "")
+              << ", slope worth " << f2(s.clockSlopeUncSec * 1000.0, 1) << " ms"
               << ", last packet " << f2(s.lastExcessDelaySec * 1000.0, 1) << " ms late\n";
         } else {
             o << "    sample clock: not yet fitted\n";
@@ -389,6 +392,7 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         t["raw_offset_ms"] = s.rawOffsetSec * 1000.0;
         t["jitter_ms"] = s.jitterSec * 1000.0;
         t["dispersion_ms"] = s.dispersionSec * 1000.0;
+        t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
         t["age_seconds"] = s.offsetAgeSec;
         t["samples"] = s.offsetSamples;
         o["timing"] = std::move(t);
@@ -413,6 +417,8 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         sc["residual_ms"] = s.clockResidualSec * 1000.0;
         sc["span_seconds"] = s.clockSpanSec;
         sc["ppm"] = s.clockPpm;
+        sc["slope_uncertainty_ms"] = s.clockSlopeUncSec * 1000.0;
+        sc["slope_held"] = s.clockSlopeHeld;
         sc["last_excess_delay_ms"] = s.lastExcessDelaySec * 1000.0;
         o["sample_clock"] = std::move(sc);
 

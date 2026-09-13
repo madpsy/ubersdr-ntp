@@ -27,6 +27,7 @@ struct Candidate {
     const SourceSnapshot* s;
     double offset;
     double dist;     // half-width of the asserted interval
+    double quality;  // the uncertainty that distinguishes it from the others
     double weight;
 };
 
@@ -52,7 +53,9 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         // newest measurement times the coast rate: a source whose last reading
         // is a minute old is a minute less certain than it was.
         const double staleness = s.offsetAgeSec * (m_coastDriftPpm * 1e-6);
-        cand.push_back(Candidate{&s, s.offsetSec, s.dispersionSec + staleness,
+        const double quality = (s.weightDispersionSec > 0.0 ? s.weightDispersionSec
+                                                            : s.dispersionSec) + staleness;
+        cand.push_back(Candidate{&s, s.offsetSec, s.dispersionSec + staleness, quality,
                                  s.weight > 0.0 ? s.weight : 1.0});
     }
     c.candidates = static_cast<int>(cand.size());
@@ -97,9 +100,16 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
 
     if (static_cast<int>(survivors.size()) >= m_minSources && !survivors.empty()) {
         // --- weighted combine ----------------------------------------------
+        // Weighted by the part of each source's uncertainty that is its own,
+        // not by the interval it asserts: the asserted interval carries the
+        // delay model's doubt, which every source carries equally, and dividing
+        // by a number they share tells the average nothing while hiding what
+        // does not. A source that is measurably noisier, or whose sample clock
+        // has just been rebuilt, loses its share here automatically -- which is
+        // the whole point of the source reporting honestly.
         double sw = 0.0, swx = 0.0;
         for (const Candidate& k : survivors) {
-            const double w = k.weight / (k.dist * k.dist);
+            const double w = k.weight / (k.quality * k.quality);
             sw += w;
             swx += w * k.offset;
         }
@@ -112,7 +122,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         // combined value — the select dispersion, in NTP's terms.
         double swd = 0.0, spread = 0.0;
         for (const Candidate& k : survivors) {
-            const double w = k.weight / (k.dist * k.dist);
+            const double w = k.weight / (k.quality * k.quality);
             swd += w * k.dist;
             spread = std::max(spread, std::abs(k.offset - offset));
         }
@@ -131,12 +141,13 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         c.ageSec = newest;
         c.used = static_cast<int>(survivors.size());
 
-        // The station tag of the survivor with the smallest interval. On the
+        // The station tag of the best-measured survivor -- by the same figure
+        // that decides the weighting, since it is the same question. On the
         // frequencies WWV and WWVH share, which one is being heard genuinely
         // changes through the day, so this follows the decoder rather than the
         // configuration.
         const Candidate* tightest = &survivors.front();
-        for (const Candidate& k : survivors) if (k.dist < tightest->dist) tightest = &k;
+        for (const Candidate& k : survivors) if (k.quality < tightest->quality) tightest = &k;
         c.refid = refidFor(tightest->s->station);
 
         // A leap warning is honoured only if every survivor agrees. One
