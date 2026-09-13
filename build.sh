@@ -96,8 +96,10 @@ if [ -n "$release" ]; then
         || fail "HEAD ($head_sha) is not on GitHub; push it before releasing"
     # An existing tag must already point at HEAD, or the release would carry
     # binaries that do not match its source.
-    tag_sha=$(gh api "repos/$gh_repo/commits/$release" --jq .sha 2>/dev/null || true)
-    if [ -n "$tag_sha" ] && [ "$tag_sha" != "$head_sha" ]; then
+    # Judged on the exit status, not the output: when the tag does not exist gh
+    # still prints GitHub's error body to stdout.
+    if tag_sha=$(gh api "repos/$gh_repo/commits/$release" --jq .sha 2>/dev/null) \
+       && [ "$tag_sha" != "$head_sha" ]; then
         fail "tag $release already exists on GitHub at $tag_sha, not HEAD ($head_sha)"
     fi
 fi
