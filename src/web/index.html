@@ -25,11 +25,14 @@ h1 span { color:var(--muted); font-weight:400; }
   letter-spacing:.07em; font-weight:600; }
 
 /* the clock: the one thing worth being large, because it is the product */
-.clock { display:flex; flex-wrap:wrap; align-items:flex-end; gap:6px 26px; }
+.clocks { display:flex; flex-wrap:wrap; align-items:flex-end; gap:14px 48px; }
+.clock { display:flex; align-items:flex-end; gap:14px; margin-top:4px; }
 .now { font:600 clamp(34px,9vw,58px)/1 var(--mono); letter-spacing:-.02em;
   font-variant-numeric:tabular-nums; }
+.now.local { font-size:clamp(28px,7vw,44px); }
 .now .frac { color:var(--muted); font-size:.45em; }
-.date { color:var(--muted); font-size:13px; padding-bottom:6px; }
+.date { color:var(--muted); font-size:13px; margin-top:6px; }
+.linknote { margin-top:10px; }
 .tickdot { width:9px; height:9px; border-radius:50%; background:var(--ok);
   transition:opacity .12s; opacity:.25; margin-bottom:14px; }
 .tickdot.on { opacity:1; }
@@ -75,12 +78,22 @@ a { color:var(--accent); }
   <div class="sub" id="sub">waiting for the event stream&hellip;</div>
 
   <div class="card" id="clockcard">
-    <div class="label">Broadcast time (UTC)</div>
-    <div class="clock">
-      <div class="now" id="now">--:--:--</div>
-      <div class="tickdot" id="dot"></div>
-      <div class="date" id="date"></div>
+    <div class="clocks">
+      <div>
+        <div class="label">Broadcast time (UTC)</div>
+        <div class="clock">
+          <div class="now" id="now">--:--:--</div>
+          <div class="tickdot" id="dot"></div>
+        </div>
+        <div class="date" id="date">&nbsp;</div>
+      </div>
+      <div>
+        <div class="label" id="loclabel">Local time</div>
+        <div class="clock"><div class="now local" id="lnow">--:--:--</div></div>
+        <div class="date" id="ldate">&nbsp;</div>
+      </div>
     </div>
+    <div class="note linknote" id="linknote">&nbsp;</div>
     <div class="grid">
       <div><div class="label">Status</div><div id="syncpill" style="margin-top:6px"></div>
         <div class="note" id="syncnote"></div></div>
@@ -144,31 +157,222 @@ function stageTone(stage, state) {
 // Where a clock stops being interesting and starts being wrong.
 const dispTone = (d) => d == null ? "dim" : (d < 50 ? "ok" : (d < 250 ? "warn" : "bad"));
 
-// The local clock is used only to advance the display BETWEEN ticks — an
-// interval of at most one second, never an absolute reading. The instant always
-// comes from the stream, so a host clock that is hours wrong still shows the
-// right time here.
-let tickAt = 0, tickUnix = 0, haveTick = false;
+// ---------------------------------------------------------------------------
+// The displayed time. A tick is stamped when it leaves the server and read when
+// it arrives, so taken at face value the page runs late by the network path,
+// any proxy, and however long the browser took to get round to the event. So
+// the page does what an NTP client does instead: it times requests to
+// /api/time, whose answer carries the server's receive and transmit instants,
+// and works out the offset from this page's own monotonic clock
+// (performance.now()) to the server's corrected time, taking half the round
+// trip as the one-way delay.
+//
+// The browser's clock never supplies the instant, only an interval since a
+// measurement, so a device clock that is hours wrong still shows the right time
+// here. Its timezone is used for the local-time display, nothing else.
+//
+// Resource Timing gives the instant the request was actually handed to the
+// socket and the instant the first response byte came back. Timing fetch()
+// itself would include the TCP handshake -- every request is a new connection
+// -- which is delay on the way out only, and asymmetry is the one error this
+// arithmetic cannot see.
+// ---------------------------------------------------------------------------
 
-function paintClock() {
-  if (!haveTick) return;
-  const t = (tickUnix + (performance.now() - tickAt) / 1000) * 1000;
-  const d = new Date(t);
-  const p = (n, w = 2) => String(n).padStart(w, "0");
-  $("now").innerHTML = p(d.getUTCHours()) + ":" + p(d.getUTCMinutes()) + ":" +
-    p(d.getUTCSeconds()) + '<span class="frac">.' + p(d.getUTCMilliseconds(), 3) + "</span>";
-  $("date").textContent = d.toLocaleDateString("en-GB",
-    { timeZone: "UTC", weekday: "short", day: "numeric", month: "short", year: "numeric" });
+// NTP's assumed frequency tolerance: how fast a sample's claim to accuracy
+// decays as the page's clock wanders away from it.
+const kPhi = 15e-6;
+const kWindow = 8;            // samples kept; the least delayed one wins
+const kMaxSampleAgeMs = 120000;
+const kBurstGapMs = 250;      // spacing of the burst that starts a measurement
+const kPollMs = 4000;         // then one sample this often
+const kFetchTimeoutMs = 3000;
+// Slack beyond the samples' own error bounds before two measurements are taken
+// to disagree -- a clock step, or a page clock that stopped during a sleep.
+const kStepMs = 25;
+
+let samples = [], srvOffsetMs = null, pollTimer = 0, burstLeft = 0, seq = 0, polling = false;
+
+// The least-delayed sample, its offset carried forward across any change the
+// server has since made to its own correction, and how far out it could be.
+function bestEstimate(nowPerf) {
+  let b = null, bErr = Infinity;
+  for (const s of samples) {
+    const err = s.delay / 2 + Math.max(0, nowPerf - s.at) * kPhi;
+    if (err < bErr) { bErr = err; b = s; }
+  }
+  if (!b) return null;
+  const drift = srvOffsetMs == null ? 0 : srvOffsetMs - b.srvOffset;
+  return { theta: b.theta + drift, err: bErr, delay: b.delay };
+}
+
+async function timingFor(url) {
+  // The entry is recorded when the body completes, which some browsers do a
+  // task or two after the promise resolves.
+  for (let i = 0; i < 5; i++) {
+    const list = performance.getEntriesByName(url, "resource");
+    if (list.length) return list[list.length - 1];
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return null;
+}
+
+async function takeSample() {
+  const url = new URL("/api/time?seq=" + (++seq), location.href).href;
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), kFetchTimeoutMs);
+  let d, t0, t3;
+  try {
+    t0 = performance.now();
+    const r = await fetch(url, { cache: "no-store", signal: ctl.signal });
+    t3 = performance.now();
+    d = await r.json();
+  } finally {
+    clearTimeout(timer);
+  }
+  const e = await timingFor(url);
+  performance.clearResourceTimings();   // or the buffer fills and entries stop
+  const precise = e && e.requestStart > 0 && e.responseStart >= e.requestStart;
+  const sent = precise ? e.requestStart : t0;
+  const got = precise ? e.responseStart : t3;
+  const rx = d.roundtrip.receive * 1000, tx = d.roundtrip.transmit * 1000;
+  return {
+    theta: ((rx - sent) + (tx - got)) / 2,
+    delay: Math.max(0, (got - sent) - (tx - rx)),
+    at: got,
+    srvOffset: d.offset_ms,
+  };
+}
+
+function addSample(s) {
+  srvOffsetMs = s.srvOffset;
+  const cur = bestEstimate(s.at);
+  // Two honest samples cannot disagree by more than their error bounds. If
+  // these do, the older ones describe a clock that no longer exists.
+  if (cur && Math.abs(s.theta - cur.theta) > s.delay / 2 + cur.err + kStepMs) samples = [];
+  samples.push(s);
+  samples = samples.filter((x) => s.at - x.at <= kMaxSampleAgeMs).slice(-kWindow);
+}
+
+function schedulePoll(ms) {
+  clearTimeout(pollTimer);
+  pollTimer = setTimeout(poll, ms);
+}
+
+async function poll() {
+  pollTimer = 0;
+  // A hidden tab has nothing to show; showing it again starts a burst.
+  if (document.hidden || polling) return;
+  polling = true;
+  try { addSample(await takeSample()); } catch (x) {}
+  polling = false;
+  if (burstLeft > 0) { burstLeft--; schedulePoll(kBurstGapMs); }
+  else schedulePoll(kPollMs);
+}
+
+function burst() {
+  burstLeft = kWindow - 1;
+  if (!polling) schedulePoll(0);
+}
+
+function restartMeasurement() {
+  samples = [];
+  burst();
+}
+
+// Where the page's monotonic clock stands against the wall clock. A jump means
+// one of them stopped or stepped -- performance.now() pauses across a sleep in
+// some browsers -- and every sample is then suspect.
+let wallMinusPerf = Date.now() - performance.now();
+setInterval(() => {
+  const w = Date.now() - performance.now();
+  if (Math.abs(w - wallMinusPerf) > 1000) restartMeasurement();
+  wallMinusPerf = w;
+}, 2000);
+
+// Until the first sample lands, the ticks drive the display as they always
+// did: late by the path, but never blank.
+let tickAt = 0, tickUnix = 0, haveTick = false;
+let lastFrameTs = 0, frameMs = 1000 / 60, shownSec = null;
+
+const pad = (n, w = 2) => String(n).padStart(w, "0");
+const hms = (h, m, s, frac) =>
+  pad(h) + ":" + pad(m) + ":" + pad(s) + '<span class="frac">.' + pad(frac, 3) + "</span>";
+
+function utcOffsetText(d) {
+  const off = -d.getTimezoneOffset();
+  return "UTC" + (off >= 0 ? "+" : "−") + pad(Math.floor(Math.abs(off) / 60)) + ":" +
+    pad(Math.abs(off) % 60);
+}
+
+function paintClock(ts) {
   requestAnimationFrame(paintClock);
+  // A frame drawn now is on the glass at the next vsync, roughly one frame
+  // interval after this callback's timestamp, so that is the instant to draw.
+  if (lastFrameTs) {
+    const dt = ts - lastFrameTs;
+    if (dt > 4 && dt < 50) frameMs += (dt - frameMs) * 0.05;
+  }
+  lastFrameTs = ts;
+  const shownAt = ts + frameMs;
+
+  const est = bestEstimate(shownAt);
+  let t;
+  if (est) t = shownAt + est.theta;
+  else if (haveTick) t = tickUnix * 1000 + (shownAt - tickAt);
+  else return;
+
+  const d = new Date(t);
+  $("now").innerHTML = hms(d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(),
+                           d.getUTCMilliseconds());
+  $("lnow").innerHTML = hms(d.getHours(), d.getMinutes(), d.getSeconds(), d.getMilliseconds());
+
+  const sec = Math.floor(t / 1000);
+  if (sec === shownSec) return;
+  shownSec = sec;
+
+  // The dot marks the second as displayed, not the tick's arrival, which is
+  // the late one.
+  const dot = $("dot");
+  dot.classList.add("on");
+  setTimeout(() => dot.classList.remove("on"), 140);
+
+  const dateOpts = { weekday: "short", day: "numeric", month: "short", year: "numeric" };
+  $("date").textContent = d.toLocaleDateString("en-GB", { ...dateOpts, timeZone: "UTC" });
+  $("ldate").textContent = d.toLocaleDateString(undefined, dateOpts);
+  let tz = "";
+  try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (x) {}
+  $("loclabel").textContent = "Local time · " + (tz ? tz + " " : "") + "(" + utcOffsetText(d) + ")";
+
+  if (est) {
+    const device = Date.now() - (performance.now() + est.theta);
+    const devText = Math.abs(device) < 1
+      ? "device clock within 1 ms"
+      : "device clock " + (Math.abs(device) < 10000
+          ? Math.abs(device).toFixed(0) + " ms"
+          : dur(Math.abs(device) / 1000)) + (device > 0 ? " fast" : " slow");
+    $("linknote").textContent = "browser latency " + ms(est.delay) + " round trip, corrected (±" +
+      ms(est.err) + ") · " + devText;
+    $("linknote").title = "The displayed time is advanced by half the measured round trip " +
+      "between this browser and the server. ± is the most an asymmetric path could leave, " +
+      "on top of the root dispersion.";
+  } else {
+    $("linknote").textContent = "measuring browser latency…";
+  }
 }
 
 function onTick(d) {
   tickUnix = d.unix; tickAt = performance.now();
+  srvOffsetMs = d.offset_ms;
   if (!haveTick) { haveTick = true; requestAnimationFrame(paintClock); }
 
-  const dot = $("dot");
-  dot.classList.add("on");
-  setTimeout(() => dot.classList.remove("on"), 140);
+  // The tick was stamped before it was sent, so the true time now cannot be
+  // earlier than its stamp. An estimate that says otherwise is stale -- most
+  // likely the page's clock stood still while the machine slept. Only while
+  // visible: a background tab can hold events back.
+  const est = bestEstimate(tickAt);
+  if (est && !document.hidden && tickAt + est.theta < d.unix * 1000 - est.err - kStepMs) {
+    restartMeasurement();
+  }
 
   $("ver").textContent = "v" + (d.version || "");
   $("sub").textContent = "up " + dur(d.uptime_seconds) + " · NTP on port " + d.ntp.port +
@@ -337,8 +541,10 @@ setInterval(() => {
 function wake() {
   if (Date.now() - lastEventAt > 3000) { retryDelay = 1000; connect(); }
 }
-document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(); });
-window.addEventListener("online", wake);
+// The path may be a different one now, and polling stopped while hidden.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) { wake(); burst(); } });
+window.addEventListener("online", () => { wake(); restartMeasurement(); });
 
 connect();
+burst();
 </script>

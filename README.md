@@ -560,7 +560,7 @@ daemon uses, so set `http.listen` to `127.0.0.1` to keep it on this machine.
 
 | Route | |
 |---|---|
-| `/` | The status page. Driven by the event stream, so it ticks with the broadcast |
+| `/` | The status page. It times its own requests to `/api/time` and corrects its clock for the browser-to-server delay, so it ticks with the broadcast; local time alongside |
 | `/api/events` | **SSE.** One `tick` event per *corrected* second — the instant the broadcast's own second rolls over, not this host's — plus a `status` event every 5 s with the full document |
 | `/api/time` | The time, for clients that do not speak NTP |
 | `/api/status` | Everything this daemon knows, pretty-printed |
