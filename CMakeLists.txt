@@ -82,6 +82,21 @@ add_custom_command(
     VERBATIM)
 add_custom_target(index_html DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc")
 
+# The version header, generated on every build from src/Version.h.in: the
+# release tag when build.sh passes one, `git describe` otherwise. See
+# tools/version.cmake. Rewritten only when the version changes.
+set(UBERSDR_NTP_VERSION "" CACHE STRING
+    "Version baked into the binary; empty takes it from git describe")
+add_custom_target(version_header
+    COMMAND ${CMAKE_COMMAND}
+            "-DSRC=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DOUT=${CMAKE_CURRENT_BINARY_DIR}/generated/Version.h"
+            "-DVERSION=${UBERSDR_NTP_VERSION}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tools/version.cmake"
+    BYPRODUCTS "${CMAKE_CURRENT_BINARY_DIR}/generated/Version.h"
+    COMMENT "Version header"
+    VERBATIM)
+
 add_executable(ubersdr-ntp
     src/main.cpp
     src/Config.cpp
@@ -94,7 +109,7 @@ add_executable(ubersdr-ntp
     src/Source.cpp
     src/Status.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc")
-add_dependencies(ubersdr-ntp index_html)
+add_dependencies(ubersdr-ntp index_html version_header)
 
 target_include_directories(ubersdr-ntp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"

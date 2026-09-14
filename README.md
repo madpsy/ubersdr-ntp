@@ -498,8 +498,13 @@ gives up on the TCP connection, which can take minutes.
 Every HTTP and WebSocket request carries:
 
 ```
-User-Agent: ubersdr-ntp/1.0.0 (+https://github.com/madpsy/ubersdr-ntp)
+User-Agent: ubersdr-ntp/0.1.9 (+https://github.com/madpsy/ubersdr-ntp)
 ```
+
+with the version of the release it was built from. That version is not written
+anywhere in the source: the build takes it from the release tag, or from
+`git describe` for any other build, so `--version`, the status page and this
+header always agree with the release that shipped them.
 
 That is the only thing telling a receiver operator what has taken one of their
 slots, so it names the program, the version and where to look it up — and it

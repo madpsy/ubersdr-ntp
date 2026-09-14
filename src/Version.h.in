@@ -2,6 +2,13 @@
 
 // The version, and the identity this daemon presents to a receiver.
 //
+// GENERATED at build time into the build directory from src/Version.h.in, by
+// tools/version.cmake. Edit the template, not the copy. The version is the
+// release tag (build.sh --release), or `git describe` for any other build, so
+// the binary, its status page and its User-Agent can never disagree with the
+// release they came from. It used to be a literal here, and read 1.0.0 through
+// every 0.1.x release.
+//
 // One place for both, because they appear in four: --version, the log banner,
 // the status JSON, and the User-Agent on every HTTP and WebSocket request. A
 // receiver operator looking at their session list sees the User-Agent, and it
@@ -13,9 +20,9 @@
 
 namespace ubersdr_ntp {
 
-inline constexpr const char* kVersion = "1.0.0";
+inline constexpr const char* kVersion = "@UBERSDR_NTP_VERSION@";
 
 inline constexpr const char* kUserAgent =
-    "ubersdr-ntp/1.0.0 (+https://github.com/madpsy/ubersdr-ntp)";
+    "ubersdr-ntp/@UBERSDR_NTP_VERSION@ (+https://github.com/madpsy/ubersdr-ntp)";
 
 } // namespace ubersdr_ntp

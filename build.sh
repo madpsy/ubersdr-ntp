@@ -110,6 +110,17 @@ if [ -n "$release" ]; then
     fi
 fi
 
+# The version baked into the binary: the release tag, or git describe for any
+# other build. Worked out HERE, on the host, and passed in: the build container
+# has no git, and the bind-mounted repo is owned by another uid, which git
+# refuses to read anyway. A leading "v" is dropped, so tag v0.1.9 is 0.1.9.
+if [ -n "$release" ]; then
+    version=${release#v}
+else
+    version=$(git -C "$repo" describe --tags --dirty --always 2>/dev/null || echo 0.0.0-unknown)
+    version=${version#v}
+fi
+
 # The packages this needs to BUILD, and the ones it needs to RUN. Kept together
 # because a container image that installs only the first set produces a binary
 # that will not start, and the error it gives does not say which package is
@@ -124,10 +135,10 @@ runtime_pkgs="libopus0 libcurl4 libssl3"
 # silently truncate the rest of the script, and the build would still exit 0.
 #
 # $1 = arch label, $2 = jobs, $3 = run the check, $4:$5 = host uid:gid,
-# $6 = build packages
+# $6 = build packages, $7 = version
 container_script=$(cat <<'CONTAINER_EOF'
 set -euo pipefail
-arch=$1; jobs=$2; check=$3; uid=$4; gid=$5; pkgs=$6
+arch=$1; jobs=$2; check=$3; uid=$4; gid=$5; pkgs=$6; version=$7
 
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
@@ -144,12 +155,22 @@ build=/src/build-$arch
 # root-owned tree behind that takes another privileged container to remove.
 trap "chown -R $uid:$gid \"$build\" 2>/dev/null || true" EXIT INT TERM
 
-cmake -S /src -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+cmake -S /src -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+      -DUBERSDR_NTP_VERSION="$version"
 cmake --build "$build" -j "$jobs"
 
 binary="$build/ubersdr-ntp"
 if [ ! -x "$binary" ]; then
     echo "no binary was produced" >&2
+    exit 1
+fi
+
+# The binary must say the version it is shipped as. It carried a literal 1.0.0
+# through every 0.1.x release, on --version, the status page and the
+# User-Agent receivers see, and nothing noticed.
+reported=$("$binary" --version)
+if [ "$reported" != "ubersdr-ntp $version" ]; then
+    echo "binary reports \"$reported\", expected \"ubersdr-ntp $version\"" >&2
     exit 1
 fi
 
@@ -187,7 +208,8 @@ built=""
 if [ "$native" = 1 ]; then
     host_arch=$(dpkg --print-architecture 2>/dev/null || echo amd64)
     say "Building natively for $host_arch (host toolchain)"
-    cmake -S "$repo" -B "$repo/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+    cmake -S "$repo" -B "$repo/build" -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+          -DUBERSDR_NTP_VERSION="$version"
     cmake --build "$repo/build" -j "$jobs"
     [ -x "$repo/build/ubersdr-ntp" ] || fail "the build produced no binary"
     built_name=$(basename "$(ls -t "$repo"/build/ubersdr-ntp_* 2>/dev/null | head -1)")
@@ -264,7 +286,7 @@ done
 
 failed=0
 for arch in $arches; do
-    say "Building $arch in $image"
+    say "Building $arch in $image (version $version)"
     # The pipeline must not swallow a container failure, and `set -o pipefail`
     # with a `while read` on the right would report the reader's status. So the
     # container's exit status is captured explicitly.
@@ -274,7 +296,7 @@ for arch in $arches; do
             --platform "linux/$arch" \
             -v "$repo:/src" \
             "$image" \
-            bash -s -- "$arch" "$jobs" "$check" "$(id -u)" "$(id -g)" "$build_pkgs" \
+            bash -s -- "$arch" "$jobs" "$check" "$(id -u)" "$(id -g)" "$build_pkgs" "$version" \
             2>&1 || echo "DOCKER_FAILED $?" >"$status_file"
     } | while IFS= read -r line; do
             case "$line" in
