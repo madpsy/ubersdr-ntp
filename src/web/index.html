@@ -275,21 +275,70 @@ function onStatus(d) {
   }).join("");
 }
 
-// EventSource reconnects on its own, with the server's `retry` interval, so
-// there is no reconnect logic here — only a visible state so a stall does not
-// look like a stopped clock.
+// EventSource reconnects on its own only after an established stream drops.
+// If a reconnection attempt itself fails -- the network is down because the
+// machine was asleep, or has not come back yet on wake -- the browser marks it
+// CLOSED and never tries again, and the page sat on "reconnecting" until it
+// was reloaded. A socket left half-open by a sleep can also stay OPEN and
+// deliver nothing. So the page owns reconnection: it retries a closed stream
+// with backoff, treats ten seconds without an event as dead (ticks arrive
+// every second), and tries at once when the tab is shown or the network
+// returns. Wall-clock time for the watchdog, not performance.now(), which can
+// pause across a sleep: the jump on wake is what should trip it.
+let es = null, lastEventAt = Date.now(), retryDelay = 1000, retryTimer = 0;
+const kStaleMs = 10000, kRetryMaxMs = 30000;
+
+function showLink(ok, text) {
+  $("linkpill").className = "pill " + (ok ? "ok" : "bad");
+  $("linkpill").textContent = text;
+}
+
+function drop() {
+  if (es) { es.close(); es = null; }
+}
+
+function scheduleReconnect() {
+  drop();
+  showLink(false, "reconnecting");
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => { retryTimer = 0; connect(); }, retryDelay);
+  retryDelay = Math.min(retryDelay * 2, kRetryMaxMs);
+}
+
 function connect() {
-  const es = new EventSource("/api/events");
-  es.addEventListener("open", () => {
-    $("linkpill").className = "pill ok";
-    $("linkpill").textContent = "live";
+  if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; }
+  drop();
+  lastEventAt = Date.now();
+  const s = es = new EventSource("/api/events");
+  const alive = () => { if (s === es) lastEventAt = Date.now(); };
+  s.addEventListener("open", () => {
+    if (s !== es) return;
+    alive();
+    retryDelay = 1000;
+    showLink(true, "live");
   });
-  es.addEventListener("tick", (e) => { try { onTick(JSON.parse(e.data)); } catch (x) {} });
-  es.addEventListener("status", (e) => { try { onStatus(JSON.parse(e.data)); } catch (x) {} });
-  es.addEventListener("error", () => {
-    $("linkpill").className = "pill bad";
-    $("linkpill").textContent = "reconnecting";
+  s.addEventListener("tick", (e) => { alive(); try { onTick(JSON.parse(e.data)); } catch (x) {} });
+  s.addEventListener("status", (e) => { alive(); try { onStatus(JSON.parse(e.data)); } catch (x) {} });
+  s.addEventListener("error", () => {
+    if (s !== es) return;
+    // Still CONNECTING: the browser is retrying by itself. CLOSED: it has
+    // given up, and nothing will happen unless this does.
+    if (s.readyState === EventSource.CLOSED) scheduleReconnect();
+    else showLink(false, "reconnecting");
   });
 }
+
+setInterval(() => {
+  if (Date.now() - lastEventAt > kStaleMs && !retryTimer) scheduleReconnect();
+}, 2000);
+
+// Back from sleep or a hidden tab, or the network is up again: do not wait out
+// the backoff or the watchdog.
+function wake() {
+  if (Date.now() - lastEventAt > 3000) { retryDelay = 1000; connect(); }
+}
+document.addEventListener("visibilitychange", () => { if (!document.hidden) wake(); });
+window.addEventListener("online", wake);
+
 connect();
 </script>
