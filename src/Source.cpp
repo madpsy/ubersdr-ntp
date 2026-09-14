@@ -230,7 +230,8 @@ Source::Source(SourceConfig cfg)
     m_snap.dialHz = m_cfg.dialHz;
     m_snap.format = m_cfg.format;
     m_snap.weight = m_cfg.weight;
-    m_snap.station = m_cfg.dialHz < kWwvbCeilingHz ? "wwvb" : "unknown";
+    m_snap.station = m_cfg.dialHz < kWwvbCeilingHz ? "wwvb"
+                   : wwvOnlyCarrier(m_cfg.carrierHz) ? "wwv" : "unknown";
     m_linkSince = monotonicNow();
 }
 
@@ -1245,7 +1246,28 @@ bool Source::ensureDecoder(int rate) {
         m_wwv->setPlausibility(reference, 24 * 60);
     }
 
-    LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz", wwvb ? "WWVB" : "WWV/WWVH", rate);
+    // The station tag, before any audio. A WWV-only carrier fixes it. Otherwise
+    // the tag the last decoder held carries over: a reconnect or a restart the
+    // consensus ordered throws the decoder away, and without this the tag went
+    // blank -- and the propagation model fell back to the dial's default, WWV,
+    // 14 ms from WWVH on a European path -- for the half-minute and more a new
+    // decoder needs to judge it again, when propagation had not changed in the
+    // seconds the restart took. A carried tag is still judged, and switched or
+    // released on the usual evidence, once the new decoder has heard enough.
+    static constexpr double kStationMemorySec = 900.0;
+    std::string stationNote;
+    if (m_wwv && wwvOnlyCarrier(m_cfg.carrierHz)) {
+        m_wwv->pinStation(clockdec::ClockStation::Wwv);
+        stationNote = ", station WWV (the only one on this carrier)";
+    } else if (m_wwv && m_stationMemory != clockdec::ClockStation::Unknown &&
+               monotonicNow() - m_stationMemoryAt < kStationMemorySec) {
+        m_wwv->presetStation(m_stationMemory);
+        stationNote = std::string(", station tag carried over: ") +
+                      (m_stationMemory == clockdec::ClockStation::Wwvh ? "WWVH" : "WWV");
+    }
+
+    LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz%s", wwvb ? "WWVB" : "WWV/WWVH", rate,
+             stationNote.c_str());
     return true;
 }
 
@@ -1276,6 +1298,15 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     const auto st = m_wwv ? m_wwv->station() : m_wwvb->station();
     const auto consumed = m_wwv ? m_wwv->samplesConsumed() : m_wwvb->samplesConsumed();
 
+    if (m_wwv) {
+        if (st == clockdec::ClockStation::Unknown) {
+            m_stationMemory = st;   // the decoder let it go on the evidence; so do we
+        } else if (d.phaseLocked) {
+            m_stationMemory = st;
+            m_stationMemoryAt = monotonicNow();
+        }
+    }
+
     std::lock_guard<std::mutex> lk(m_mu);
     m_snap.toneSnrDb = d.toneSnrDb;
     m_snap.tickBandRatioDb = d.tickBandRatioDb;
@@ -1295,11 +1326,23 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
         case clockdec::ClockLockRefusal::Contested:    m_snap.refusal = "contested"; break;
         default: m_snap.refusal = "none"; break;
     }
+    const char* station = "unknown";
     switch (st) {
-        case clockdec::ClockStation::Wwv:  m_snap.station = "wwv"; break;
-        case clockdec::ClockStation::Wwvh: m_snap.station = "wwvh"; break;
-        case clockdec::ClockStation::Wwvb: m_snap.station = "wwvb"; break;
-        default: m_snap.station = "unknown"; break;
+        case clockdec::ClockStation::Wwv:  station = "wwv"; break;
+        case clockdec::ClockStation::Wwvh: station = "wwvh"; break;
+        case clockdec::ClockStation::Wwvb: station = "wwvb"; break;
+        default: break;
+    }
+    if (m_snap.station != station) {
+        // Every change, with the evidence, because the tag moves the delay
+        // model by the difference between two transmitter paths.
+        if (std::isfinite(d.tickBandRatioDb)) {
+            LOG_INFO(m_cfg.name.c_str(), "station tag %s -> %s (tick 2000/2200 Hz %+.1f dB)",
+                     m_snap.station.c_str(), station, d.tickBandRatioDb);
+        } else {
+            LOG_INFO(m_cfg.name.c_str(), "station tag %s -> %s", m_snap.station.c_str(), station);
+        }
+        m_snap.station = station;
     }
 
     const ClockFit f = m_clock.fit();

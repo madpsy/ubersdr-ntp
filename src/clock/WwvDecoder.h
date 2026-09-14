@@ -50,6 +50,16 @@ public:
     void setPlausibility(std::function<TimeFields()> referenceNow,
                          int boundMinutes);
 
+    // Start from a station tag already established -- the one this source's
+    // previous decoder held -- rather than Unknown. The tag is still judged
+    // every second and switched or released on the usual evidence; this only
+    // spares a restarted decoder the half-minute it takes to re-derive what was
+    // already known. Ignored once pinned, and for anything but Wwv or Wwvh.
+    void presetStation(ClockStation s);
+    // Fix the tag for good, for a carrier only one station transmits on (WWV
+    // alone uses 20 and 25 MHz). Never judged afterwards; survives reset().
+    void pinStation(ClockStation s);
+
     ClockLockState state() const;
     ClockStation station() const;      // Wwv or Wwvh once tick-tagged
     std::int64_t samplesConsumed() const;

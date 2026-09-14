@@ -73,6 +73,13 @@ constexpr double kFoldDecay = 0.99;
 // separates the stations with margin while staying undecided when both are
 // heard at similar strength.
 constexpr double kStationExcessRatio = 1.5;
+// What still SUPPORTS a tag once it is established: the tagged band ahead by
+// this much, below the 1.5x needed to adopt one. A single ratio for both let a
+// signal hovering near 1.5x -- both stations heard, one a little stronger --
+// fail to support its own tag for two minutes, release it, then re-adopt it,
+// over and over. Still above 1.0, so a band that has genuinely fallen level
+// with the other stops supporting it.
+constexpr double kStationHoldRatio = 1.2;
 // Station-tag timing, all in once-per-second verdicts (see onSeriesSample):
 // fold age past tick lock before any verdict counts; identical verdicts to
 // adopt a first tag; consecutive contrary verdicts to switch an established
@@ -201,6 +208,7 @@ struct WwvDecoder::Impl {
     bool tickLocked = false;
     int tickPhase = 0;               // series-sample index of the second edge
     std::int64_t tickLockJ = 0;      // series index at which the tick locked
+    bool stationPinned = false;      // fixed by the carrier; never judged (pinStation)
     ClockStation pendingStation = ClockStation::Unknown;  // verdict awaiting confirmation
     int pendingCount = 0;            // consecutive identical verdicts for pendingStation
     int stationContrary = 0;         // consecutive decisive verdicts against the tag
@@ -489,9 +497,12 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
     //     decisive verdicts.
     //   - a station -> the other: kStationSwitchSecs consecutive decisive
     //     contrary verdicts, so a fade does not flap the propagation model.
-    //   - a station -> Unknown: kStationReleaseSecs with no verdict supporting
-    //     it. The engine models Unknown on a shared frequency as WWV, the
-    //     dial's default, which is better than holding a tag nothing backs.
+    //   - a station -> Unknown: kStationReleaseSecs with no second supporting
+    //     it, where support is the tagged band ahead by kStationHoldRatio. The
+    //     engine models Unknown on a shared frequency as WWV, the dial's
+    //     default, which is better than holding a tag nothing backs.
+    // A preset tag (presetStation) enters as established and is held to the
+    // same rules; a pinned one is not judged at all.
     if (tickLocked && phase == 0) {
         double rV, rH; int argV, argH;
         stats(foldV, rV, argV);
@@ -500,8 +511,11 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
         const double eH = tickExcess(foldH, argH);
         tickExcessRatio = (eH > 0.0) ? eV / eH : std::numeric_limits<double>::infinity();
         const ClockStation v = tickVerdict(eV, eH);
-        if (j - tickLockJ < kStationWarmSecs * kSecLen) {
-            // Fold still too young to judge.
+        const bool supported =
+            (station == ClockStation::Wwv && eV > 0.0 && eV >= kStationHoldRatio * eH) ||
+            (station == ClockStation::Wwvh && eH > 0.0 && eH >= kStationHoldRatio * eV);
+        if (stationPinned || j - tickLockJ < kStationWarmSecs * kSecLen) {
+            // Fixed by the carrier, or the fold is still too young to judge.
         } else if (station == ClockStation::Unknown) {
             if (v != ClockStation::Unknown && v == pendingStation) {
                 if (++pendingCount >= kStationConfirmSecs) {
@@ -513,7 +527,7 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
                 pendingStation = v;
                 pendingCount = (v != ClockStation::Unknown) ? 1 : 0;
             }
-        } else if (v == station) {
+        } else if (supported) {
             stationContrary = stationUnsupported = 0;
         } else {
             ++stationUnsupported;
@@ -1039,7 +1053,7 @@ void WwvDecoder::Impl::reset() {
     recs.clear(); recBase = 0; secIndex = 0;
     anchored = false; anchorSec0 = 0; nextFrameStartK = 0;
     lastEdgeSample = 0; lastEdgeSecondOfFrame = -1;
-    station = ClockStation::Unknown;
+    if (!stationPinned) station = ClockStation::Unknown;
     samplesConsumed = 0;
     voter.reset();
     setState(ClockLockState::NoSignal);
@@ -1066,6 +1080,22 @@ void WwvDecoder::reset() { m_impl->reset(); }
 void WwvDecoder::setPlausibility(std::function<TimeFields()> referenceNow,
                                  int boundMinutes) {
     m_impl->voter.setPlausibility(std::move(referenceNow), boundMinutes);
+}
+
+void WwvDecoder::presetStation(ClockStation s) {
+    Impl& d = *m_impl;
+    if (d.stationPinned || (s != ClockStation::Wwv && s != ClockStation::Wwvh)) return;
+    d.station = s;
+    d.pendingStation = ClockStation::Unknown;
+    d.pendingCount = d.stationContrary = d.stationUnsupported = 0;
+}
+
+void WwvDecoder::pinStation(ClockStation s) {
+    Impl& d = *m_impl;
+    d.station = s;
+    d.stationPinned = true;
+    d.pendingStation = ClockStation::Unknown;
+    d.pendingCount = d.stationContrary = d.stationUnsupported = 0;
 }
 
 ClockLockState WwvDecoder::state() const { return m_impl->state; }

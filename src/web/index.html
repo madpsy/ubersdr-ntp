@@ -154,6 +154,18 @@ function stageTone(stage, state) {
   if (stage === "no audio" || stage === "no tick") return "bad";
   return "warn";
 }
+// The station, or while the decoder has not decided one, which way the tick
+// leans -- a blank read as missing data when it meant "both heard about
+// equally" or "decoder just restarted".
+function stationText(station, ratioDb) {
+  if (station && station !== "unknown") return esc(station.toUpperCase());
+  if (ratioDb == null || !isFinite(ratioDb)) return "—";
+  return '<span class="note" title="Not decided yet. Tick 2000/2200 Hz ratio ' + signedDb(ratioDb) +
+    ': positive leans WWV, negative WWVH; a tag needs +1.8 dB either way.">' +
+    (ratioDb >= 0 ? "WWV?" : "WWVH?") + "</span>";
+}
+const signedDb = (v) => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1) + " dB";
+
 // Where a clock stops being interesting and starts being wrong.
 const dispTone = (d) => d == null ? "dim" : (d < 50 ? "ok" : (d < 250 ? "warn" : "bad"));
 
@@ -412,7 +424,7 @@ function onTick(d) {
           : "") + "</td>" +
       '<td><span class="pill ' + (s.link === "streaming" ? "ok" : "bad") + '">' +
         esc(s.link) + "</span></td>" +
-      "<td>" + esc(s.station === "unknown" ? "—" : s.station.toUpperCase()) + "</td>" +
+      "<td>" + stationText(s.station, s.tick_band_ratio_db) + "</td>" +
       '<td><span class="pill ' + stageTone(stage, s.state) + '">' + esc(stage) + "</span></td>" +
       '<td class="n">' + (s.tone_detected ? s.tone_snr_db.toFixed(1) + " dB" : "—") + "</td>" +
       '<td><div class="bar" title="' + s.frames_in_window + " of " + s.window_size +
@@ -451,7 +463,11 @@ function onStatus(d) {
         ", frame " + (dec.anchored ? "anchored" : "not anchored") +
         (dec.bad_frame_streak ? " (" + dec.bad_frame_streak + " bad in a row)" : "") +
         ", vote " + dec.frames_in_window + "/" + dec.window_size +
-        ", refusal " + esc(dec.refusal) + ", " + dur(dec.audio_seconds) + " of audio"],
+        ", refusal " + esc(dec.refusal) + ", " + dur(dec.audio_seconds) + " of audio" +
+        (dec.tick_band_ratio_db != null
+          ? ", station " + stationText(dec.station, dec.tick_band_ratio_db) +
+            " (tick " + signedDb(dec.tick_band_ratio_db) + ")"
+          : "")],
       ["Last decode", dec.last_decoded_utc
         ? esc(dec.last_decoded_utc) + " at quality " + dec.last_quality + "%, " +
           dur(dec.last_decode_age_seconds) + " ago"

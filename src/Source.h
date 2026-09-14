@@ -257,6 +257,12 @@ private:
     std::unique_ptr<clockdec::WwvbDecoder> m_wwvb;
     int m_decoderRate = 0;
     bool m_rateRefused = false;
+    // The last station tag a WWV/WWVH decoder held, so the next one can start
+    // from it (see ensureDecoder). Refreshed only while the tick is heard, so a
+    // tag nothing has backed for a while is not carried forward. WebSocket
+    // thread only.
+    clockdec::ClockStation m_stationMemory = clockdec::ClockStation::Unknown;
+    double m_stationMemoryAt = 0.0;
     std::int64_t m_samplesWritten = 0;
     int m_lastFrameSamples = 0;     // the length a lost packet is assumed to have
 

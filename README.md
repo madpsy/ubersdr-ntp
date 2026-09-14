@@ -230,6 +230,22 @@ the tick's audio image, and the station tag is decided by which of the 2000/2200
 Hz bands folds to an impulse. A 2.4 kHz SSB filter clips one or both and the
 decoder sits in `acquiring` for ever with `tone_detected: false`.
 
+The tag matters beyond the display: it chooses which transmitter the
+propagation delay is modelled from, and WWV and WWVH are 14 ms apart on a
+European path. So it is made to be steady:
+
+- On 20 and 25 MHz it is fixed to WWV. Nothing else transmits there.
+- On a shared carrier, one tick band has to lead the other by 1.5× (+1.8 dB)
+  for 10 s in a row before a tag is adopted. Once adopted, a lead of 1.2×
+  (+0.8 dB) is enough to keep it. It switches after 30 s of the other station
+  clearly leading, and is dropped only after 2 minutes with no support.
+- A reconnect, or a restart the consensus orders, starts the new decoder from
+  the tag the last one held, if that tag was backed by a heard tick within
+  15 minutes. It is judged again as soon as the new decoder has heard enough.
+- While there is no tag, the status page shows which way the tick leans
+  (`WWV?` / `WWVH?`, with the ratio on hover) rather than a blank. Every
+  change is logged with the ratio behind it.
+
 WWVB is chosen automatically for any dial below 1 MHz: it is a genuinely
 different decoder — pulse-width modulation on the carrier's own amplitude
 against a 100 Hz BCD subcarrier — not a setting.

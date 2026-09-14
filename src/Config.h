@@ -161,4 +161,10 @@ std::uint64_t dialForCarrier(std::uint64_t carrierHz);
 // WWVB_CEILING_HZ in the frontend panel.
 inline constexpr std::uint64_t kWwvbCeilingHz = 1000000;
 
+// Carriers only WWV transmits on. WWVH shares 2.5, 5, 10 and 15 MHz with it,
+// so only on these two does the dial alone say which station is heard.
+inline bool wwvOnlyCarrier(std::uint64_t carrierHz) {
+    return carrierHz == 20000000 || carrierHz == 25000000;
+}
+
 } // namespace ubersdr_ntp

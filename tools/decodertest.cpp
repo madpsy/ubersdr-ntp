@@ -102,6 +102,17 @@ struct Scenario {
     // next minute's s0 -- nothing can tell it apart until the second after it.
     // Every OTHER edge must still be right.
     bool allowLeapEdgeWrong = false;
+    // Station tag. `preset` goes in through presetStation before the first
+    // sample (or pinStation when `pin`), as Source does for a restarted
+    // decoder. `otherTickAmp` adds the other station's tick as well, 15 ms
+    // later, the way both are heard on a shared frequency. `wantStation`
+    // overrides the kind's own tag for the final check, and from `tagBySec`
+    // on the decoder must hold that tag continuously (-1: final check only).
+    ClockStation preset = ClockStation::Unknown;
+    bool pin = false;
+    double otherTickAmp = 0.0;
+    const char* wantStation = nullptr;
+    double tagBySec = -1.0;
     const char* note = "";
 };
 
@@ -180,6 +191,9 @@ std::vector<float> render(const Scenario& sc, const std::vector<Second>& secs) {
                 env += 0.5 * std::sin(2.0 * kPi * 100.0 * tau);
             x = env * std::sin(2.0 * kPi * 1000.0 * tau);
             if (tau < 0.005) x += 0.8 * std::sin(2.0 * kPi * tickHz * tau);
+            const double otherHz = tickHz == 2000.0 ? 2200.0 : 2000.0;
+            if (sc.otherTickAmp > 0.0 && tau >= 0.015 && tau < 0.020)
+                x += sc.otherTickAmp * std::sin(2.0 * kPi * otherHz * (tau - 0.015));
         }
         if (sigma > 0.0) x += sigma * gauss(rng);
         out[i] = static_cast<float>(x * scale);
@@ -201,7 +215,14 @@ struct Result {
     int unmeasured = 0;
     std::string firstWrong;
     const char* station = "?";
+    double tickRatioDb = std::numeric_limits<double>::quiet_NaN();   // at the end
+    double tagOffAtSec = -1.0;         // first second past tagBySec without the wanted tag
 };
+
+const char* stationName(ClockStation s) {
+    return s == ClockStation::Wwv ? "WWV" : s == ClockStation::Wwvh ? "WWVH"
+         : s == ClockStation::Wwvb ? "WWVB" : "unknown";
+}
 
 void fail(Result& r, const std::string& why) {
     r.pass = false;
@@ -302,13 +323,23 @@ Result run(const Scenario& sc) {
         for (std::size_t i = 0; i < pcm.size(); i += kChunk)
             d.process(pcm.data() + i, std::min(kChunk, pcm.size() - i));
         r.station = "WWVB";
-    } else {
+    }
+    const char* want = sc.wantStation ? sc.wantStation
+                     : sc.kind == Kind::Wwv ? "WWV" : sc.kind == Kind::Wwvh ? "WWVH" : "WWVB";
+    if (sc.kind != Kind::Wwvb) {
         WwvDecoder d(sc.rate);
         d.onSecond = onSecond; d.onFrame = onFrame; d.onTime = onTime; d.onStateChanged = onState;
-        for (std::size_t i = 0; i < pcm.size(); i += kChunk)
+        if (sc.pin) d.pinStation(sc.preset);
+        else d.presetStation(sc.preset);
+        for (std::size_t i = 0; i < pcm.size(); i += kChunk) {
             d.process(pcm.data() + i, std::min(kChunk, pcm.size() - i));
-        r.station = d.station() == ClockStation::Wwv ? "WWV"
-                  : d.station() == ClockStation::Wwvh ? "WWVH" : "unknown";
+            const double at = static_cast<double>(i) / rate;
+            if (sc.tagBySec >= 0.0 && at >= sc.tagBySec && r.tagOffAtSec < 0.0 &&
+                std::string(stationName(d.station())) != want)
+                r.tagOffAtSec = at;
+        }
+        r.station = stationName(d.station());
+        r.tickRatioDb = d.diagnostics().tickBandRatioDb;
     }
 
     // (a) + (c); (b) for WWVB here, WWV/WWVH once every run's mean is known.
@@ -318,8 +349,12 @@ Result run(const Scenario& sc) {
     if (r.wrongElsewhere > 0 || (r.wrongAtLeap > 0 && !sc.allowLeapEdgeWrong))
         fail(r, "WRONG timestamps: " + std::to_string(r.timeBad) + " time, " +
                     std::to_string(r.labelBad) + " label -- first: " + r.firstWrong);
-    const char* want = sc.kind == Kind::Wwv ? "WWV" : sc.kind == Kind::Wwvh ? "WWVH" : "WWVB";
     if (std::string(r.station) != want) fail(r, std::string("station tagged ") + r.station);
+    if (r.tagOffAtSec >= 0.0) {
+        char buf[96];
+        std::snprintf(buf, sizeof buf, "%s tag not held at %.0f s", want, r.tagOffAtSec);
+        fail(r, buf);
+    }
     if (sc.kind == Kind::Wwvb) {
         for (double e : r.edgeErrMs) {
             if (std::fabs(e) > 2.0) { fail(r, "WWVB edge error beyond 2 ms"); break; }
@@ -391,6 +426,49 @@ int main() {
                 }
     }
 
+    // Station tag: carried into a restarted decoder, fixed by a WWV-only
+    // carrier, and held with both stations heard. One rate and offset -- none
+    // of this is about timing, and every other check still applies.
+    auto tagScenario = [&](Kind k, const char* note) {
+        Scenario sc;
+        sc.kind = k; sc.rate = 12000; sc.offsetMs = 1.29; sc.seed = seed++;
+        sc.startUnix = kRollStart; sc.minutes = 10; sc.rolloverUnix = kRollover; sc.note = note;
+        return sc;
+    };
+    {
+        Scenario sc = tagScenario(Kind::Wwv, "tag: preset WWV held from the first second");
+        sc.preset = ClockStation::Wwv; sc.tagBySec = 0.0;
+        scs.push_back(sc);
+    }
+    {
+        Scenario sc = tagScenario(Kind::Wwvh, "tag: preset WWV on WWVH, corrected");
+        sc.preset = ClockStation::Wwv; sc.tagBySec = 120.0;
+        scs.push_back(sc);
+    }
+    {
+        Scenario sc = tagScenario(Kind::Wwvh, "tag: pinned WWV is never judged");
+        sc.preset = ClockStation::Wwv; sc.pin = true; sc.wantStation = "WWV"; sc.tagBySec = 0.0;
+        scs.push_back(sc);
+    }
+    // WWVH's tick at 0.6 of WWV's reads about +1.4 dB here: between the
+    // +0.8 dB that holds a tag and the +1.8 dB that adopts one. At 0.7 it reads
+    // about +0.7 dB, below both.
+    {
+        Scenario sc = tagScenario(Kind::Wwv, "tag: both heard at +1.4 dB, WWV held");
+        sc.otherTickAmp = 0.6; sc.preset = ClockStation::Wwv; sc.tagBySec = 0.0;
+        scs.push_back(sc);
+    }
+    {
+        Scenario sc = tagScenario(Kind::Wwv, "tag: both heard at +1.4 dB, none adopted");
+        sc.otherTickAmp = 0.6; sc.wantStation = "unknown";
+        scs.push_back(sc);
+    }
+    {
+        Scenario sc = tagScenario(Kind::Wwv, "tag: both heard at +0.7 dB, WWV released");
+        sc.otherTickAmp = 0.7; sc.preset = ClockStation::Wwv; sc.wantStation = "unknown";
+        scs.push_back(sc);
+    }
+
     std::vector<Result> results(scs.size());
     std::atomic<std::size_t> next{0};
     unsigned nThreads = std::max(1u, std::thread::hardware_concurrency());
@@ -428,9 +506,9 @@ int main() {
     }
 
     int failed = 0;
-    std::printf("%-4s %-4s %-6s %-6s %-5s | %-6s %-9s %-10s | %-44s | %s\n", "res", "stn", "rate",
-                "offset", "snr", "lock", "time ok/X", "label ok/X",
-                "measured edge error, ms (n mean min max)", "scenario");
+    std::printf("%-4s %-4s %-6s %-6s %-5s | %-6s %-9s %-10s | %-44s | %-14s | %s\n", "res", "stn",
+                "rate", "offset", "snr", "lock", "time ok/X", "label ok/X",
+                "measured edge error, ms (n mean min max)", "tag (tick dB)", "scenario");
     for (std::size_t i = 0; i < scs.size(); ++i) {
         const Scenario& sc = scs[i];
         const Result& r = results[i];
@@ -438,11 +516,14 @@ int main() {
         char snr[16];
         if (std::isnan(sc.snrDb)) std::snprintf(snr, sizeof snr, "clean");
         else std::snprintf(snr, sizeof snr, "%.0fdB", sc.snrDb);
+        char tag[32];
+        if (std::isnan(r.tickRatioDb)) std::snprintf(tag, sizeof tag, "%s", r.station);
+        else std::snprintf(tag, sizeof tag, "%s %+.1f", r.station, r.tickRatioDb);
         std::printf("%-4s %-4s %-6d %5.2fms %-5s | %5.0fs %4d/%-4d %5d/%-4d | n=%-4zu %+6.2f %+6.2f %+6.2f "
-                    "unmeas=%-3d | %s%s%s\n",
+                    "unmeas=%-3d | %-14s | %s%s%s\n",
                     r.pass ? "ok" : "FAIL", kindName(sc.kind), sc.rate, sc.offsetMs, snr,
                     r.lockAtSec, r.timeGood, r.timeBad, r.labelGood, r.labelBad, s.n, s.mean, s.min,
-                    s.max, r.unmeasured, sc.note, r.pass ? "" : " -- ", r.why.c_str());
+                    s.max, r.unmeasured, tag, sc.note, r.pass ? "" : " -- ", r.why.c_str());
         if (!r.pass) ++failed;
     }
 
