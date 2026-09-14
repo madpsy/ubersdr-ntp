@@ -140,6 +140,7 @@ struct SourceSnapshot {
     double clockPpm = 0.0;          // receiver sample clock against ours
     double wsRttMs = 0.0;           // round trip over the audio connection
     bool rttFromWs = false;         // ...and whether the delay model used it
+    bool rttProxied = false;        // the handshake ended short of the receiver
     double clockSlopeUncSec = 0.0;  // bias the slope could be putting on an edge
     bool clockSlopeHeld = false;    // fitted slope refused as implausible
     double lastExcessDelaySec = 0.0;

@@ -267,16 +267,30 @@ audio stream measures:
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
 
 The network term is measured over the **WebSocket**, not with an HTTP request,
-because a TCP handshake ends at whatever accepted the SYN. A receiver behind a
-CDN then has a proxy answering for it: measured here, one served through
-Cloudflare's London edge reported a 13 ms round trip for a path that is really
-91 ms, which cost 40 ms of delay budget and put its offset 39 ms away from a
-receiver on the same band that it should have agreed with to a millisecond. A
-ping down the audio connection has to reach the origin to come back, so it
-measures the path the audio actually takes. On a receiver served directly the
-two agree — 96.3 ms against a 96.6 ms handshake on one measured here — so this
-changes nothing except for the receivers that were being measured wrongly. The
-HTTP figure remains the fallback for a server too old to answer a ping.
+because a TCP handshake ends at whatever accepted the SYN — and most UberSDR
+instances are reached through a tunnel that terminates TCP near the client, not
+at the receiver. One measured here answered its handshake in 12 ms for an origin
+94 ms away, which cost 40 ms of delay budget and put its offset 39 ms from a
+receiver on the same band it should have agreed with to a millisecond.
+
+A ping down the audio connection cannot be answered by the tunnel. That is
+verified rather than assumed: an application-level ping through the same
+connection, which only the receiver can reply to, agreed with the protocol ping
+to 0.1 ms.
+
+Every source is measured this way, including the ones reached directly, and that
+is deliberate. The handshake is the cleaner ruler where it is valid — a SYN is
+answered by the kernel, a ping waits for the server's event loop, which costs
+between 0.6 and 6.5 ms on the instances measured here — so it is tempting to
+prefer it when the two agree. Doing that would measure different sources with
+different rulers, which turns a *shared* error into a *per-source* one. The
+shared kind is removable: it lands in the same pile as the chain constant and
+one calibration takes it out. The per-source kind is not, because the sources
+are the only check on each other. So the handshake is still measured and still
+shown — two figures disagreeing is how a tunnel announces itself — but it does
+not get a vote.
+
+The HTTP figure is used only when a server never answers a ping at all.
 
 ### The chain constant is about 3 ms too large
 

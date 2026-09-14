@@ -108,6 +108,11 @@ constexpr double kWeightDispersionFloorSec = 0.001;
 // trip whose start we never recorded.
 const char* const kPingPrefix = "ubersdr-ntp:";
 
+// How much longer the WebSocket round trip has to be than the TCP handshake
+// before a tunnel is named as the reason, in the status block. Reporting only;
+// nothing in the delay model branches on it.
+constexpr double kProxyRttRatio = 1.5;
+
 std::string makeUuidV4() {
     // The server requires a canonical lowercase v4 UUID and binds it to this
     // host's IP, so it identifies the session rather than securing anything —
@@ -1653,8 +1658,34 @@ void Source::updateDelayModel() {
     // connection has to reach the origin to be answered. The HTTP figure stays
     // as the fallback for a server too old to pong, where an under-estimate is
     // still better than dropping the largest correctable term entirely.
+    // One method for every source, and the WebSocket is the one that is always
+    // measuring the right thing. A TCP handshake times the path to whatever
+    // accepted the SYN, and most UberSDR instances are reached through a tunnel
+    // that terminates TCP near the client -- one measured here answered in 13 ms
+    // for an origin 91 ms away. A ping down the audio connection cannot be
+    // answered by the tunnel: timing an application-level ping through the same
+    // connection, which only the origin can reply to, agreed with the protocol
+    // ping to 0.1 ms.
+    //
+    // The handshake is the cleaner ruler where it is valid -- the kernel answers
+    // a SYN, while a ping waits for the server's event loop, which costs a few
+    // milliseconds -- and it is tempting to prefer it when the two agree and
+    // fall back to the ping when they do not. That would be a mistake. Using
+    // different rulers for different sources makes their errors DIFFER, and a
+    // difference between sources is the one thing this daemon cannot calibrate
+    // away: it has exactly one absolute reference and it spends it on the terms
+    // every source shares. Measuring every source the same way puts the ping's
+    // overhead into that shared pile, where the chain constant already lives and
+    // where a single calibration removes it. A topology heuristic would move a
+    // removable common error into an irremovable per-source one, and it would do
+    // it silently, on a threshold nobody can check from the outside.
+    //
+    // The handshake is still measured, and still worth seeing: the two
+    // disagreeing is how a tunnel announces itself. It just does not get a vote.
     const double rttMs = m_snap.wsRttMs > 0.0 ? m_snap.wsRttMs : m_snap.httpRttMs;
     m_snap.rttFromWs = m_snap.wsRttMs > 0.0;
+    m_snap.rttProxied = m_snap.wsRttMs > 0.0 && m_snap.httpRttMs > 0.0 &&
+                        m_snap.wsRttMs > m_snap.httpRttMs * kProxyRttRatio;
     const double net = rttMs > 0.0 ? (rttMs / 1000.0) * 0.5 : 0.0;
     // The codec the audio actually came through, not the one asked for: a
     // session that negotiated Opus is sent lossless frames in some modes, and

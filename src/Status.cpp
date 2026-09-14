@@ -283,11 +283,11 @@ std::string renderStatusBlock(const StatusInput& in) {
         if (s.wsRttMs > 0.0 || s.httpRttMs > 0.0) {
             o << "    path:   round trip " << f2((s.rttFromWs ? s.wsRttMs : s.httpRttMs), 1)
               << " ms over " << (s.rttFromWs ? "the audio connection" : "the TCP handshake");
-            // Both measured and disagreeing means something is answering for
-            // the receiver. Worth saying which figure is being believed.
-            if (s.rttFromWs && s.httpRttMs > 0.0 && s.wsRttMs > s.httpRttMs * 1.5) {
+            if (s.rttProxied) {
                 o << " (handshake said " << f2(s.httpRttMs, 1)
-                  << " ms — a proxy is terminating it short of the receiver)";
+                  << " ms — a tunnel is terminating it short of the receiver)";
+            } else if (s.httpRttMs > 0.0) {
+                o << " (handshake agrees at " << f2(s.httpRttMs, 1) << " ms)";
             }
             o << '\n';
         }
@@ -429,6 +429,8 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
         t["ws_rtt_ms"] = s.wsRttMs;
         t["rtt_from_websocket"] = s.rttFromWs;
+        t["rtt_proxied"] = s.rttProxied;
+        t["http_rtt_ms"] = s.httpRttMs;
         t["age_seconds"] = s.offsetAgeSec;
         t["samples"] = s.offsetSamples;
         o["timing"] = std::move(t);
