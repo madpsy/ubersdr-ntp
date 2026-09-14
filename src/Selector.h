@@ -84,6 +84,9 @@ struct Combined {
     bool leapPending = false;
     std::vector<std::string> usedNames;
     std::vector<std::string> rejectedNames;
+    // Why each source is not in use, by name, in words meant for the status
+    // page. A source in use has no entry.
+    std::map<std::string, std::string> notUsedReasons;
     std::string note;           // why it is not synchronised, when it is not
     std::vector<SourceResidual> residuals;
 };
@@ -113,6 +116,11 @@ private:
         double averagedSec = 0.0;
         double lastAtSec = 0.0;
         double firstAtSec = 0.0;
+        // Whether the refusal has been logged. combine() runs four times a
+        // second, and a refusal logged on every call buried everything else;
+        // it is said once when it starts and once when it ends, and the status
+        // block carries it in between.
+        bool refusalLogged = false;
     };
     std::map<std::string, ResidualState> m_residualAvg;
 

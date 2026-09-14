@@ -202,7 +202,10 @@ function onTick(d) {
     const votePct = s.window_size ? 100 * s.frames_in_window / s.window_size : 0;
     return "<tr>" +
       '<td class="name">' + esc(s.name) +
-        (s.in_use ? ' <span class="used">in use</span>' : "") + "</td>" +
+        (s.in_use ? ' <span class="used">in use</span>' : "") +
+        (!s.in_use && s.not_used_reason
+          ? '<div class="note" style="white-space:normal">not used: ' + esc(s.not_used_reason) + "</div>"
+          : "") + "</td>" +
       '<td><span class="pill ' + (s.link === "streaming" ? "ok" : "bad") + '">' +
         esc(s.link) + "</span></td>" +
       "<td>" + esc(s.station === "unknown" ? "—" : s.station.toUpperCase()) + "</td>" +
@@ -222,6 +225,8 @@ function onStatus(d) {
     const dec = x.decoder, t = x.timing, dl = x.delay, sc = x.sample_clock,
           l = x.link, a = x.audio;
     const rows = [
+      ["In use", x.in_use ? "yes"
+        : "no — " + esc(x.not_used_reason || "not yet considered")],
       ["Receiver", esc(x.receiver_name || "(unnamed)") + " — " + esc(x.url)],
       ["Tuning", (x.dial_hz / 1e6).toFixed(6) + " MHz dial for the " +
         (x.carrier_hz / 1e6).toFixed(3) + " MHz carrier, USB 0–3 kHz, " + esc(x.format) +

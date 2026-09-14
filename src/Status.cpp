@@ -158,6 +158,9 @@ std::string renderStatusBlock(const StatusInput& in) {
         o << "\n             using:";
         for (const std::string& n : in.combined.usedNames) o << ' ' << n;
     }
+    for (const auto& kv : in.combined.notUsedReasons) {
+        o << "\n             not using " << kv.first << ": " << kv.second;
+    }
     o << '\n';
 
     if (in.combined.residuals.size() >= 2) {
@@ -283,11 +286,8 @@ std::string renderStatusBlock(const StatusInput& in) {
         if (s.wsRttMs > 0.0 || s.httpRttMs > 0.0) {
             o << "    path:   round trip " << f2((s.rttFromWs ? s.wsRttMs : s.httpRttMs), 1)
               << " ms over " << (s.rttFromWs ? "the audio connection" : "the TCP handshake");
-            if (s.rttProxied) {
-                o << " (handshake said " << f2(s.httpRttMs, 1)
-                  << " ms — a tunnel is terminating it short of the receiver)";
-            } else if (s.httpRttMs > 0.0) {
-                o << " (handshake agrees at " << f2(s.httpRttMs, 1) << " ms)";
+            if (s.rttFromWs && s.httpRttMs > 0.0) {
+                o << " (TCP handshake " << f2(s.httpRttMs, 1) << " ms, not used)";
             }
             o << '\n';
         }
@@ -345,6 +345,12 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
     served["sources_candidate"] = in.combined.candidates;
     served["used_names"] = in.combined.usedNames;
     served["rejected_names"] = in.combined.rejectedNames;
+    {
+        json nu = json::array();
+        for (const auto& kv : in.combined.notUsedReasons)
+            nu.push_back({{"name", kv.first}, {"reason", kv.second}});
+        served["not_used"] = std::move(nu);
+    }
     served["leap_pending"] = in.combined.leapPending;
     served["note"] = in.combined.note;
     j["served"] = std::move(served);
@@ -370,6 +376,14 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         o["dial_hz"] = s.dialHz;
         o["format"] = formatName(s.format);
         o["weight"] = s.weight;
+        {
+            const auto used = std::find(in.combined.usedNames.begin(), in.combined.usedNames.end(),
+                                        s.name) != in.combined.usedNames.end();
+            const auto why = in.combined.notUsedReasons.find(s.name);
+            o["in_use"] = used;
+            o["not_used_reason"] = why != in.combined.notUsedReasons.end()
+                                       ? json(why->second) : json(nullptr);
+        }
 
         json link;
         link["state"] = linkStateName(s.link);
@@ -429,7 +443,6 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
         t["ws_rtt_ms"] = s.wsRttMs;
         t["rtt_from_websocket"] = s.rttFromWs;
-        t["rtt_proxied"] = s.rttProxied;
         t["http_rtt_ms"] = s.httpRttMs;
         t["age_seconds"] = s.offsetAgeSec;
         t["samples"] = s.offsetSamples;

@@ -185,6 +185,9 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowRealtim
         o["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
         o["samples"] = s.offsetSamples;
         o["in_use"] = std::find(c.usedNames.begin(), c.usedNames.end(), s.name) != c.usedNames.end();
+        const auto why = c.notUsedReasons.find(s.name);
+        o["not_used_reason"] = why != c.notUsedReasons.end()
+                                   ? nlohmann::json(why->second) : nlohmann::json(nullptr);
         arr.push_back(std::move(o));
     }
     j["sources_locked"] = locked;

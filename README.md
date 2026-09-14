@@ -286,9 +286,9 @@ prefer it when the two agree. Doing that would measure different sources with
 different rulers, which turns a *shared* error into a *per-source* one. The
 shared kind is removable: it lands in the same pile as the chain constant and
 one calibration takes it out. The per-source kind is not, because the sources
-are the only check on each other. So the handshake is still measured and still
-shown — two figures disagreeing is how a tunnel announces itself — but it does
-not get a vote.
+are the only check on each other. So the handshake is still measured and shown
+as a raw figure, but nothing classifies an instance by how the two compare, and
+the handshake does not get a vote.
 
 The HTTP figure is used only when a server never answers a ping at all.
 

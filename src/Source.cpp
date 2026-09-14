@@ -108,11 +108,6 @@ constexpr double kWeightDispersionFloorSec = 0.001;
 // trip whose start we never recorded.
 const char* const kPingPrefix = "ubersdr-ntp:";
 
-// How much longer the WebSocket round trip has to be than the TCP handshake
-// before a tunnel is named as the reason, in the status block. Reporting only;
-// nothing in the delay model branches on it.
-constexpr double kProxyRttRatio = 1.5;
-
 std::string makeUuidV4() {
     // The server requires a canonical lowercase v4 UUID and binds it to this
     // host's IP, so it identifies the session rather than securing anything —
@@ -1680,12 +1675,11 @@ void Source::updateDelayModel() {
     // removable common error into an irremovable per-source one, and it would do
     // it silently, on a threshold nobody can check from the outside.
     //
-    // The handshake is still measured, and still worth seeing: the two
-    // disagreeing is how a tunnel announces itself. It just does not get a vote.
+    // The handshake is still measured and shown as a raw figure, but nothing
+    // judges an instance by how it compares -- that would be a per-instance
+    // rule by the back door. It does not get a vote.
     const double rttMs = m_snap.wsRttMs > 0.0 ? m_snap.wsRttMs : m_snap.httpRttMs;
     m_snap.rttFromWs = m_snap.wsRttMs > 0.0;
-    m_snap.rttProxied = m_snap.wsRttMs > 0.0 && m_snap.httpRttMs > 0.0 &&
-                        m_snap.wsRttMs > m_snap.httpRttMs * kProxyRttRatio;
     const double net = rttMs > 0.0 ? (rttMs / 1000.0) * 0.5 : 0.0;
     // The codec the audio actually came through, not the one asked for: a
     // session that negotiated Opus is sent lossless frames in some modes, and

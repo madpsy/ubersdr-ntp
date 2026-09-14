@@ -4,6 +4,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdarg>
+#include <cstdio>
 #include <set>
 
 namespace ubersdr_ntp {
@@ -68,6 +70,15 @@ struct Candidate {
     double weight;
 };
 
+std::string format(const char* fmt, ...) {
+    char buf[256];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof buf, fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
 } // namespace
 
 Selector::Selector(double coastSeconds, double coastDriftPpm, int minSources)
@@ -80,11 +91,26 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
 
     std::vector<Candidate> cand;
     for (const SourceSnapshot& s : snaps) {
-        if (!s.enabled) continue;
-        if (!s.haveOffset) { c.rejectedNames.push_back(s.name); continue; }
-        if (s.clockState != "locked") { c.rejectedNames.push_back(s.name); continue; }
-        if (s.offsetAgeSec > kCandidateMaxAgeSec) { c.rejectedNames.push_back(s.name); continue; }
-        if (s.dispersionSec <= 0.0) { c.rejectedNames.push_back(s.name); continue; }
+        if (!s.enabled) { c.notUsedReasons[s.name] = "disabled in the configuration"; continue; }
+        // Most specific first, so the reason names the step that is actually
+        // missing rather than a symptom of it: an unlocked decoder also has no
+        // offset, and "no offset" would send someone to the wrong place.
+        std::string why;
+        if (s.clockState != "locked") {
+            why = "decoder not locked yet";
+        } else if (s.offsetAgeSec > kCandidateMaxAgeSec) {
+            why = format("newest measurement is %.0f s old (limit %.0f s)",
+                         s.offsetAgeSec, kCandidateMaxAgeSec);
+        } else if (!s.haveOffset) {
+            why = format("still filtering: %d offset sample(s) so far", s.offsetSamples);
+        } else if (s.dispersionSec <= 0.0) {
+            why = "no dispersion estimate yet";
+        }
+        if (!why.empty()) {
+            c.rejectedNames.push_back(s.name);
+            c.notUsedReasons[s.name] = why;
+            continue;
+        }
 
         // The interval a source asserts. Its dispersion plus the age of its
         // newest measurement times the coast rate: a source whose last reading
@@ -149,6 +175,15 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
                     r.settledForSec >= kResidualSettleSec &&
                     std::abs(r.averagedSec) > kMaxDisagreementSec;
         if (r.refused) refused.insert(r.name);
+        if (r.refused && !it->second.refusalLogged) {
+            LOG_WARN(kTag, "%s disagrees with the other sources by %+.0f ms; "
+                     "not a delay model this far out — refusing it",
+                     r.name.c_str(), r.averagedSec * 1000.0);
+        } else if (!r.refused && it->second.refusalLogged) {
+            LOG_INFO(kTag, "%s agrees with the other sources again (%+.0f ms); using it",
+                     r.name.c_str(), r.averagedSec * 1000.0);
+        }
+        it->second.refusalLogged = r.refused;
         c.residuals.push_back(std::move(r));
     }
 
@@ -160,10 +195,11 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         std::vector<Candidate> kept;
         for (const Candidate& k : cand) {
             if (refused.count(k.s->name)) {
-                LOG_WARN(kTag, "%s disagrees with the other sources by %+.0f ms; "
-                         "not a delay model this far out — refusing it",
-                         k.s->name.c_str(), m_residualAvg[k.s->name].averagedSec * 1000.0);
                 c.rejectedNames.push_back(k.s->name);
+                c.notUsedReasons[k.s->name] =
+                    format("refused: %+.0f ms from the other sources (limit ±%.0f ms)",
+                           m_residualAvg[k.s->name].averagedSec * 1000.0,
+                           kMaxDisagreementSec * 1000.0);
             } else {
                 kept.push_back(k);
             }
@@ -206,7 +242,13 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
 
         for (const Candidate& k : cand) {
             if (bestAt >= k.offset - k.dist && bestAt <= k.offset + k.dist) survivors.push_back(k);
-            else c.rejectedNames.push_back(k.s->name);
+            else {
+                c.rejectedNames.push_back(k.s->name);
+                c.notUsedReasons[k.s->name] =
+                    format("outside the majority: %+.1f ms ± %.1f ms does not overlap "
+                           "the interval %d source(s) agree on",
+                           k.offset * 1000.0, k.dist * 1000.0, best);
+            }
         }
     }
 
@@ -279,6 +321,13 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
     }
 
     // --- nothing usable: coast ---------------------------------------------
+    // Sources that agreed but were too few to serve are healthy, and should
+    // not look like it is their fault.
+    for (const Candidate& k : survivors) {
+        c.notUsedReasons[k.s->name] =
+            format("healthy, but only %d source(s) agree and min_sources is %d",
+                   static_cast<int>(survivors.size()), m_minSources);
+    }
     std::lock_guard<std::mutex> lk(m_mu);
     if (m_haveLast) {
         const double age = nowRealtime - m_lastGoodAt;
