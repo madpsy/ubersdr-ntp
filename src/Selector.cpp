@@ -32,6 +32,26 @@ constexpr double kResidualTauSec = 300.0;
 // joined, on a transient that was gone by the next minute.
 constexpr double kResidualSettleSec = 120.0;
 
+// How long a source may stay refused before it is made to start over, and the
+// most that wait may grow to.
+//
+// Refusal keeps a wrong source out of the served time, but it does not fix the
+// source, and nothing inside one decoder can: an edge tracker that has locked
+// onto the wrong part of the pulse still puts every minute marker in the right
+// second, so the frame decodes, the voter certifies, and the lock holds for as
+// long as the connection does. This daemon runs for months unattended, so
+// "until someone restarts it" is not an answer. A refused source is therefore
+// told to drop its connection and acquire from nothing -- which costs it one
+// lock, about five minutes, and costs the served time nothing, since it was not
+// contributing.
+//
+// The wait doubles each time the same source is sent back without having been
+// accepted in between, so a receiver that is genuinely broken, or genuinely
+// hearing something the others are not, reconnects once an hour rather than
+// once every few minutes for ever.
+constexpr double kReacquireAfterSec = 300.0;
+constexpr double kReacquireMaxSec = 3600.0;
+
 constexpr const char* kTag = "selector";
 
 // A source must be judged against at least this many others before its
@@ -139,6 +159,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
     // truth is. That is not a defect to be worked around, it is what two
     // measurements of one event can tell you. Hence kMinPeersToJudge.
     std::set<std::string> refused;
+    std::map<std::string, std::string> refusalWhy;
     std::vector<double> all;
     all.reserve(cand.size());
     for (const Candidate& k : cand) all.push_back(k.offset);
@@ -153,39 +174,103 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         r.instantSec = k.offset - consensus;
         r.peers = static_cast<int>(cand.size()) - 1;
 
+        // Only readings taken against enough peers go into the average. With
+        // one peer the median is the mean of the two and each residual is half
+        // their difference -- a source 40 ms out reads 20 -- so blending those
+        // in dragged a wrong source's average under the limit whenever a third
+        // receiver dropped out, and it was "accepted" on a reading that proves
+        // nothing. The time still passes (lastAtSec advances), so a gap is
+        // neither evidence nor a reason to weight the next reading heavily.
         auto it = m_residualAvg.find(r.name);
-        if (it == m_residualAvg.end()) {
-            ResidualState fresh;
-            fresh.averagedSec = r.instantSec;
-            fresh.lastAtSec = nowRealtime;
-            fresh.firstAtSec = nowRealtime;
-            it = m_residualAvg.emplace(r.name, fresh).first;
-        } else {
-            const double dt = nowRealtime - it->second.lastAtSec;
-            if (dt > 0.0) {
-                const double alpha = 1.0 - std::exp(-dt / kResidualTauSec);
-                it->second.averagedSec += alpha * (r.instantSec - it->second.averagedSec);
-                it->second.lastAtSec = nowRealtime;
+        if (it == m_residualAvg.end()) it = m_residualAvg.emplace(r.name, ResidualState{}).first;
+        ResidualState& ra = it->second;
+        if (r.peers >= kMinPeersToJudge) {
+            if (!ra.seeded) {
+                ra.seeded = true;
+                ra.averagedSec = r.instantSec;
+                ra.firstAtSec = nowRealtime;
+            } else {
+                const double dt = nowRealtime - ra.lastAtSec;
+                if (dt > 0.0) {
+                    const double alpha = 1.0 - std::exp(-dt / kResidualTauSec);
+                    ra.averagedSec += alpha * (r.instantSec - ra.averagedSec);
+                }
             }
         }
-        r.averagedSec = it->second.averagedSec;
-        r.settledForSec = nowRealtime - it->second.firstAtSec;
+        ra.lastAtSec = nowRealtime;
+        // Unseeded, the figure shown is the instant one: all there is, and
+        // what a two-source install has always displayed.
+        r.averagedSec = ra.seeded ? ra.averagedSec : r.instantSec;
+        r.settledForSec = ra.seeded ? nowRealtime - ra.firstAtSec : 0.0;
         r.haveAverage = true;
         r.refused = r.peers >= kMinPeersToJudge &&
                     r.settledForSec >= kResidualSettleSec &&
                     std::abs(r.averagedSec) > kMaxDisagreementSec;
-        if (r.refused) refused.insert(r.name);
+        // Whether the consensus was entitled to a verdict at all. Not refused
+        // is only "accepted" when it was; otherwise it is "could not say".
+        const bool judged = r.peers >= kMinPeersToJudge && r.settledForSec >= kResidualSettleSec;
+        ReacquireState& rq = m_reacquire[r.name];
+        if (r.refused) {
+            refused.insert(r.name);
+            if (rq.refusedSinceSec <= 0.0) rq.refusedSinceSec = nowRealtime;
+            const double wait = std::min(kReacquireAfterSec * std::pow(2.0, rq.count),
+                                         kReacquireMaxSec);
+            const double refusedFor = nowRealtime - rq.refusedSinceSec;
+            const std::string base =
+                format("refused: %+.0f ms from the other sources (limit ±%.0f ms)",
+                       r.averagedSec * 1000.0, kMaxDisagreementSec * 1000.0);
+            if (refusedFor >= wait) {
+                ++rq.count;
+                rq.refusedSinceSec = 0.0;
+                c.reacquireNames.push_back(r.name);
+                refusalWhy[r.name] = base + "; re-acquiring it from scratch now";
+                LOG_WARN(kTag, "%s has been refused for %.0f min; making it re-acquire from "
+                         "scratch (attempt %d, next wait %.0f min if it is still refused)",
+                         r.name.c_str(), refusedFor / 60.0, rq.count,
+                         std::min(kReacquireAfterSec * std::pow(2.0, rq.count),
+                                  kReacquireMaxSec) / 60.0);
+            } else {
+                refusalWhy[r.name] = base + format("; re-acquiring it from scratch in %.0f min "
+                                                   "if it does not come back",
+                                                   std::ceil((wait - refusedFor) / 60.0));
+            }
+        } else if (judged) {
+            // Accepted by a consensus that was entitled to judge it: the
+            // receiver is fine, the refusal is over, and the next one starts
+            // the backoff over.
+            rq.refusedSinceSec = 0.0;
+            rq.count = 0;
+        }
+        // Otherwise it could not be judged -- too few peers, or not settled --
+        // which is not the same as being accepted, so the timer holds. Live, a
+        // third receiver that lost lock every few minutes left a source 40 ms
+        // out with a single peer each time; a timer that reset on that never
+        // reached five minutes in half an hour, and nothing recovered.
         if (r.refused && !it->second.refusalLogged) {
             LOG_WARN(kTag, "%s disagrees with the other sources by %+.0f ms; "
                      "not a delay model this far out — refusing it",
                      r.name.c_str(), r.averagedSec * 1000.0);
-        } else if (!r.refused && it->second.refusalLogged) {
+        } else if (!r.refused && judged && it->second.refusalLogged) {
             LOG_INFO(kTag, "%s agrees with the other sources again (%+.0f ms); using it",
                      r.name.c_str(), r.averagedSec * 1000.0);
         }
-        it->second.refusalLogged = r.refused;
+        // "Agrees again" only on a real verdict: a source that merely lost its
+        // peers has not agreed with anyone, and saying so every time a third
+        // receiver dropped lock filled the log with recoveries that were not.
+        if (r.refused || judged) it->second.refusalLogged = r.refused;
         c.residuals.push_back(std::move(r));
     }
+
+    // A source sent back to start over is judged afresh when it returns: its
+    // old average describes the lock it is abandoning, and carried over it
+    // would convict the new one before the settling guard had a chance to
+    // apply.
+    for (const std::string& n : c.reacquireNames) m_residualAvg.erase(n);
+
+    // A refused source that drops out of the candidates (lost lock, went
+    // stale) keeps its timer too. It was not accepted while it was away, and a
+    // decoder that holds a wrong lock for a minute, loses it, and takes the
+    // same wrong lock again is exactly the fault this exists to clear.
 
     // Drop what the consensus refuses. This is deliberately NOT a correction:
     // a source that disagrees is telling you it decoded something else, and
@@ -196,10 +281,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         for (const Candidate& k : cand) {
             if (refused.count(k.s->name)) {
                 c.rejectedNames.push_back(k.s->name);
-                c.notUsedReasons[k.s->name] =
-                    format("refused: %+.0f ms from the other sources (limit ±%.0f ms)",
-                           m_residualAvg[k.s->name].averagedSec * 1000.0,
-                           kMaxDisagreementSec * 1000.0);
+                c.notUsedReasons[k.s->name] = refusalWhy[k.s->name];
             } else {
                 kept.push_back(k);
             }

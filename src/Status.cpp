@@ -236,6 +236,7 @@ std::string renderStatusBlock(const StatusInput& in) {
           << ", audio " << formatDuration(s.lastAudioAgeSec) << " ago"
           << ", " << s.packets << " packets / " << (s.audioBytes / 1024) << " kiB";
         if (s.decodeErrors) o << ", " << s.decodeErrors << " decode errors";
+        if (s.reacquisitions) o << ", sent back to re-acquire " << s.reacquisitions << " time(s)";
         o << '\n';
 
         if (s.basebandPowerDb > -998.0) {
@@ -394,6 +395,7 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         link["audio_bytes"] = s.audioBytes;
         link["decode_errors"] = s.decodeErrors;
         link["connect_attempts"] = s.connectAttempts;
+        link["reacquisitions"] = s.reacquisitions;
         link["http_rtt_ms"] = s.httpRttMs;
         o["link"] = std::move(link);
 

@@ -234,7 +234,8 @@ function onStatus(d) {
       ["Link", esc(l.state) + (l.detail ? " (" + esc(l.detail) + ")" : "") +
         " for " + dur(l.age_seconds) + ", audio " + dur(l.last_audio_age_seconds) + " ago, " +
         l.packets.toLocaleString() + " packets, " + (l.audio_bytes / 1048576).toFixed(1) +
-        " MiB, " + l.decode_errors + " decode errors, HTTP RTT " + ms(l.http_rtt_ms, 0)],
+        " MiB, " + l.decode_errors + " decode errors, HTTP RTT " + ms(l.http_rtt_ms, 0) +
+        (l.reacquisitions ? ", sent back to re-acquire " + l.reacquisitions + " time(s)" : "")],
       ["Signal", a.snr_db != null
         ? a.baseband_power_dbfs.toFixed(1) + " dBFS baseband, noise " +
           a.noise_dbfs.toFixed(1) + " dBFS, SNR " + a.snr_db.toFixed(1) + " dB"

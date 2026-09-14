@@ -341,6 +341,19 @@ int main(int argc, char** argv) {
         const auto snaps = snapshots();
         const Combined c = selector.combine(snaps, realtimeNow());
 
+        // A source the consensus has refused for long enough is sent back to
+        // start over (see kReacquireAfterSec). Without this a decoder holding a
+        // steady wrong lock would stay refused until someone restarted the
+        // daemon, and this is meant to run for months without anyone.
+        for (const std::string& n : c.reacquireNames) {
+            for (auto& s : sources) {
+                if (s->name() != n) continue;
+                const auto why = c.notUsedReasons.find(n);
+                s->requestReacquire(why != c.notUsedReasons.end() ? why->second
+                                                                   : "refused by the consensus");
+            }
+        }
+
         // A change in whether time is being served at all is worth a line of
         // its own, immediately, rather than waiting up to thirty seconds for
         // the next block.

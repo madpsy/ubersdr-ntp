@@ -87,6 +87,9 @@ struct Combined {
     // Why each source is not in use, by name, in words meant for the status
     // page. A source in use has no entry.
     std::map<std::string, std::string> notUsedReasons;
+    // Sources refused for long enough that they should start over from
+    // nothing. The Selector decides; the caller owns the sources and acts.
+    std::vector<std::string> reacquireNames;
     std::string note;           // why it is not synchronised, when it is not
     std::vector<SourceResidual> residuals;
 };
@@ -121,7 +124,22 @@ private:
         // it is said once when it starts and once when it ends, and the status
         // block carries it in between.
         bool refusalLogged = false;
+        // Whether the average holds any reading taken against enough peers
+        // to mean something. Until then averagedSec and firstAtSec are unset.
+        bool seeded = false;
     };
+
+    // Self-recovery, kept apart from ResidualState because that is discarded
+    // when a source starts over and this must survive it: the backoff is
+    // about the RECEIVER, not about one lock.
+    struct ReacquireState {
+        // When the current refusal began, 0 if none. Cleared only when the
+        // source is judged and accepted: time it spends unjudgeable (too few
+        // peers) or out of the candidates is not acceptance and does not reset it.
+        double refusedSinceSec = 0.0;
+        int count = 0;                  // consecutive re-acquisitions without being accepted
+    };
+    std::map<std::string, ReacquireState> m_reacquire;
     std::map<std::string, ResidualState> m_residualAvg;
 
     // The coasting state: the last good offset and when it was good.

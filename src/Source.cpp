@@ -354,6 +354,9 @@ void Source::supervise() {
             m_snap.link = LinkState::Connecting;
             m_snap.linkDetail.clear();
             m_snap.connectAttempts++;
+            // A request that arrived while no connection was up is already
+            // satisfied by the one about to be made.
+            m_reacquire.store(false);
             m_linkSince = monotonicNow();
         }
 
@@ -499,6 +502,16 @@ void Source::supervise() {
                 if (now - lastRttProbe >= 300.0) {
                     lastRttProbe = now;
                     probeRtt();
+                }
+
+                if (m_reacquire.exchange(false)) {
+                    std::string why;
+                    {
+                        std::lock_guard<std::mutex> lk(m_mu);
+                        why = m_reacquireWhy;
+                    }
+                    LOG_WARN(tag, "starting over at the consensus's request — %s", why.c_str());
+                    break;   // the reconnection below resets the stream and the decoder
                 }
 
                 double silentFor;
@@ -1702,6 +1715,15 @@ void Source::updateDelayModel() {
 }
 
 // ---------------------------------------------------------------------------
+
+void Source::requestReacquire(const std::string& why) {
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        m_reacquireWhy = why;
+        ++m_snap.reacquisitions;
+    }
+    m_reacquire.store(true);
+}
 
 SourceSnapshot Source::snapshot() const {
     std::lock_guard<std::mutex> lk(m_mu);

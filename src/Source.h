@@ -72,6 +72,7 @@ struct SourceSnapshot {
     std::uint64_t audioBytes = 0;
     std::uint64_t decodeErrors = 0;
     int connectAttempts = 0;
+    int reacquisitions = 0;         // times the consensus sent it back to start over
     double httpRttMs = 0.0;
     std::string receiverName;       // from /api/description
     GeoPoint receiverLocation;
@@ -161,6 +162,13 @@ public:
     const std::string& name() const { return m_cfg.name; }
     SourceSnapshot snapshot() const;
 
+    // Drop the connection and acquire from nothing, at the Selector's word
+    // that this source has disagreed with the others for too long. Safe from
+    // any thread; acted on by the supervisor within a second, and only while a
+    // connection is up -- a source that is already reconnecting is already
+    // starting over.
+    void requestReacquire(const std::string& why);
+
 private:
     void supervise();
     bool sessionHandshake(std::string& err);     // POST /connection
@@ -206,6 +214,8 @@ private:
     std::atomic<bool> m_running{false};
     std::mutex m_wake;
     std::condition_variable m_wakeCv;
+    std::atomic<bool> m_reacquire{false};
+    std::string m_reacquireWhy;     // under m_mu
 
     // Guards the pointer, not the socket. Only the supervisor ever calls
     // ix::WebSocket::stop(): it joins the socket's thread with no guard of its

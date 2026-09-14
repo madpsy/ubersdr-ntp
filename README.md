@@ -407,6 +407,22 @@ delay model and reported a healthy source, turning the one fault the
 arrangement can detect into one it cannot. The agreement figure says which
 source to distrust; it is not licence to bend the model until nobody disagrees.
 
+A refused source is not left refused. The veto protects the served time, but it
+does not fix the source, and nothing inside one decoder can: an edge tracker
+locked onto the wrong part of the pulse still puts every minute marker in the
+right second, so the frame decodes and the lock holds for as long as the
+connection does. So a source refused for five minutes without being accepted in
+between is made to start over. Time it cannot be judged at all does not count as
+acceptance: live, a third receiver that kept losing lock left the disagreeing
+source with a single peer every few minutes, and a clock that restarted on that
+never ran out. Made to start over, it — it drops its connection and acquires from nothing, and its
+agreement history is discarded so the new lock is judged on its own. Sent back
+again without having been accepted in between, it waits twice as long, up to an
+hour; accepted once, the wait returns to five minutes. A receiver that is
+genuinely broken costs one reconnection an hour, not one every few minutes, and
+nobody has to restart anything. The status page shows the pending wait in the
+source's reason, and `link.reacquisitions` counts how often it has happened.
+
 Two sources cannot use any of this: their residuals come out equal and opposite
 whichever of them is wrong, which is not a defect to be worked around but what
 two measurements of one event can tell you. Three is where it starts to work.
