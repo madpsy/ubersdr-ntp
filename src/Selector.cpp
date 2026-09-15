@@ -106,7 +106,7 @@ Selector::Selector(double coastSeconds, double coastDriftPpm, int minSources)
       m_coastDriftPpm(coastDriftPpm),
       m_minSources(minSources) {}
 
-Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowRealtime) {
+Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now) {
     Combined c;
 
     std::vector<Candidate> cand;
@@ -132,13 +132,20 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
             continue;
         }
 
+        // A source's offset is against the daemon clock as of its newest
+        // measurement, and moves at the daemon clock's rate error. Carried
+        // along its own rate to NOW, so that every candidate below is
+        // compared, intersected and averaged at one instant.
+        const double offsetNow = s.offsetSec + s.offsetRate * (now - s.offsetAtSec);
+
         // The interval a source asserts. Its dispersion plus the age of its
-        // newest measurement times the coast rate: a source whose last reading
-        // is a minute old is a minute less certain than it was.
-        const double staleness = s.offsetAgeSec * (m_coastDriftPpm * 1e-6);
+        // newest measurement times the coast rate and the doubt in the rate it
+        // was carried along: a source whose last reading is a minute old is a
+        // minute less certain than it was.
+        const double staleness = s.offsetAgeSec * (m_coastDriftPpm * 1e-6 + s.offsetRateUncertainty);
         const double quality = (s.weightDispersionSec > 0.0 ? s.weightDispersionSec
                                                             : s.dispersionSec) + staleness;
-        cand.push_back(Candidate{&s, s.offsetSec, s.dispersionSec + staleness, quality,
+        cand.push_back(Candidate{&s, offsetNow, s.dispersionSec + staleness, quality,
                                  s.weight > 0.0 ? s.weight : 1.0});
     }
     c.candidates = static_cast<int>(cand.size());
@@ -188,20 +195,20 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
             if (!ra.seeded) {
                 ra.seeded = true;
                 ra.averagedSec = r.instantSec;
-                ra.firstAtSec = nowRealtime;
+                ra.firstAtSec = now;
             } else {
-                const double dt = nowRealtime - ra.lastAtSec;
+                const double dt = now - ra.lastAtSec;
                 if (dt > 0.0) {
                     const double alpha = 1.0 - std::exp(-dt / kResidualTauSec);
                     ra.averagedSec += alpha * (r.instantSec - ra.averagedSec);
                 }
             }
         }
-        ra.lastAtSec = nowRealtime;
+        ra.lastAtSec = now;
         // Unseeded, the figure shown is the instant one: all there is, and
         // what a two-source install has always displayed.
         r.averagedSec = ra.seeded ? ra.averagedSec : r.instantSec;
-        r.settledForSec = ra.seeded ? nowRealtime - ra.firstAtSec : 0.0;
+        r.settledForSec = ra.seeded ? now - ra.firstAtSec : 0.0;
         r.haveAverage = true;
         r.refused = r.peers >= kMinPeersToJudge &&
                     r.settledForSec >= kResidualSettleSec &&
@@ -212,10 +219,10 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         ReacquireState& rq = m_reacquire[r.name];
         if (r.refused) {
             refused.insert(r.name);
-            if (rq.refusedSinceSec <= 0.0) rq.refusedSinceSec = nowRealtime;
+            if (rq.refusedSinceSec <= 0.0) rq.refusedSinceSec = now;
             const double wait = std::min(kReacquireAfterSec * std::pow(2.0, rq.count),
                                          kReacquireMaxSec);
-            const double refusedFor = nowRealtime - rq.refusedSinceSec;
+            const double refusedFor = now - rq.refusedSinceSec;
             const std::string base =
                 format("refused: %+.0f ms from the other sources (limit ±%.0f ms)",
                        r.averagedSec * 1000.0, kMaxDisagreementSec * 1000.0);
@@ -370,9 +377,35 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
             c.usedNames.push_back(k.s->name);
         }
 
+        // The rate the served offset moves at. Every source measures the same
+        // thing -- the daemon clock against UTC -- so their rates are averaged
+        // by how well each knows it. A source that has not measured one yet
+        // has nothing to add; if none has, the combination has not either.
+        double rw = 0.0, rwx = 0.0, rateBound = 0.0;
+        for (const Candidate& k : survivors) {
+            rateBound = std::max(rateBound, k.s->offsetRateUncertainty);
+            if (!k.s->offsetRateMeasured) continue;
+            const double u = std::max(k.s->offsetRateUncertainty, 1e-9);
+            rw += 1.0 / (u * u);
+            rwx += k.s->offsetRate / (u * u);
+        }
+
         c.valid = true;
         c.synchronised = true;
         c.offsetSec = offset;
+        c.atSec = now;
+        c.rateMeasured = rw > 0.0;
+        c.rate = rw > 0.0 ? rwx / rw : 0.0;
+        // Survivors whose rates disagree are measuring their own path's wander
+        // as well as the crystal, so the combination is no better known than
+        // that disagreement, however tight each claims to be -- the same rule
+        // as the spread term in the dispersion above.
+        double rateSpread = 0.0;
+        for (const Candidate& k : survivors) {
+            if (k.s->offsetRateMeasured) rateSpread = std::max(rateSpread, std::abs(k.s->offsetRate - c.rate));
+        }
+        c.rateUncertainty = rw > 0.0 ? std::max(1.0 / std::sqrt(rw), rateSpread) : rateBound;
+        c.hostOffsetSec = offset + daemonMinusRealtime();
         c.dispersionSec = dispersion;
         c.ageSec = newest;
         c.used = static_cast<int>(survivors.size());
@@ -395,9 +428,12 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
         std::lock_guard<std::mutex> lk(m_mu);
         m_haveLast = true;
         m_lastGoodOffset = offset;
+        m_lastGoodRate = c.rate;
+        m_lastGoodRateUncertainty = c.rateUncertainty;
+        m_lastGoodRateMeasured = c.rateMeasured;
         m_lastGoodDispersion = dispersion;
-        m_lastGoodAt = nowRealtime;
-        m_lastGoodMeasuredAt = nowRealtime - newest;
+        m_lastGoodAt = now;
+        m_lastGoodMeasuredAt = now - newest;
         m_last = c;
         return c;
     }
@@ -412,32 +448,40 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double nowR
     }
     std::lock_guard<std::mutex> lk(m_mu);
     if (m_haveLast) {
-        const double age = nowRealtime - m_lastGoodAt;
+        const double age = now - m_lastGoodAt;
+        // The offset carries on along the rate it was last measured moving at:
+        // the daemon clock is a crystal, and a crystal keeps its rate when the
+        // radio goes quiet. The claimed accuracy decays at the assumed wander
+        // of an undisciplined oscillator plus the doubt in that rate. This is
+        // the whole content of coasting: the clock keeps counting, and the
+        // honesty about it decays.
+        c.valid = true;
+        c.offsetSec = m_lastGoodOffset + m_lastGoodRate * age;
+        c.atSec = now;
+        c.rate = m_lastGoodRate;
+        c.rateUncertainty = m_lastGoodRateUncertainty;
+        c.rateMeasured = m_lastGoodRateMeasured;
+        c.hostOffsetSec = c.offsetSec + daemonMinusRealtime();
+        c.dispersionSec = m_lastGoodDispersion + age * (m_coastDriftPpm * 1e-6 + m_lastGoodRateUncertainty);
+        c.ageSec = now - m_lastGoodMeasuredAt;
+        c.refid = m_last.refid;
         if (age <= m_coastSeconds) {
-            c.valid = true;
             c.synchronised = true;
-            c.offsetSec = m_lastGoodOffset;
-            // The claimed accuracy decays at the assumed wander rate of an
-            // undisciplined clock. This is the whole content of coasting: the
-            // offset does not change, the honesty about it does.
-            c.dispersionSec = m_lastGoodDispersion + age * (m_coastDriftPpm * 1e-6);
-            c.ageSec = nowRealtime - m_lastGoodMeasuredAt;
             c.used = 0;
-            c.refid = m_last.refid;
             c.note = cand.empty() ? "coasting: no source has a lock"
                                   : "coasting: no set of sources agreed";
         } else {
-            c.valid = true;
             c.synchronised = false;
-            c.offsetSec = m_lastGoodOffset;
-            c.dispersionSec = m_lastGoodDispersion + age * (m_coastDriftPpm * 1e-6);
-            c.ageSec = nowRealtime - m_lastGoodMeasuredAt;
-            c.refid = m_last.refid;
             c.note = "unsynchronised: no lock for longer than the coast limit";
         }
     } else {
+        // Never had a time from the radio. The host's own clock is the only
+        // guess there is, and it is what an unsynchronised reply has always
+        // carried; LI=3 and stratum 0 say not to believe it.
         c.valid = false;
         c.synchronised = false;
+        c.offsetSec = -daemonMinusRealtime();
+        c.atSec = now;
         c.note = cand.empty() ? "no source has produced a timestamp yet"
                               : "no set of sources agreed";
     }

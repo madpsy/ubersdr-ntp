@@ -276,6 +276,9 @@ int main(int argc, char** argv) {
     ix::initNetSystem();
 
     const double startedAt = monotonicNow();
+    // Fixes the daemon clock's zero against the host clock now, before any
+    // thread takes a timestamp on it (SampleClock.h).
+    daemonNow();
 
     std::vector<std::unique_ptr<Source>> sources;
     for (const SourceConfig& s : cfg.sources) {
@@ -339,7 +342,7 @@ int main(int argc, char** argv) {
         if (g_reopen) { g_reopen = 0; Log::instance().reopen(); LOG_INFO(kTag, "log file reopened"); }
 
         const auto snaps = snapshots();
-        const Combined c = selector.combine(snaps, realtimeNow());
+        const Combined c = selector.combine(snaps, daemonNow());
 
         // A source the consensus has refused for long enough is sent back to
         // start over (see kReacquireAfterSec). Without this a decoder holding a

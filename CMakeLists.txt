@@ -64,6 +64,22 @@ add_executable(ubersdr-ntp-decodertest tools/decodertest.cpp)
 target_link_libraries(ubersdr-ntp-decodertest PRIVATE clockdecoders Threads::Threads)
 target_compile_options(ubersdr-ntp-decodertest PRIVATE -Wall -Wextra)
 
+# Offline test of the daemon's clock: the offset/rate estimator against a
+# drifting crystal, a step and outliers; the sample-clock fit on a steady clock
+# against one being slewed the way a host's NTP client slews it; and the
+# selector extrapolating and coasting along the measured rate. Not installed.
+add_executable(ubersdr-ntp-clocktest
+    tools/clocktest.cpp
+    src/OffsetEstimator.cpp
+    src/SampleClock.cpp
+    src/Selector.cpp
+    src/Log.cpp)
+target_include_directories(ubersdr-ntp-clocktest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(ubersdr-ntp-clocktest PRIVATE Threads::Threads)
+target_compile_options(ubersdr-ntp-clocktest PRIVATE -Wall -Wextra)
+
 # ---------------------------------------------------------------------------
 # The page is a real file in src/web/ and is served from the binary. This is
 # the one line of build glue that costs; a 400-line page living as a string
@@ -103,6 +119,7 @@ add_executable(ubersdr-ntp
     src/HttpApi.cpp
     src/Log.cpp
     src/NtpServer.cpp
+    src/OffsetEstimator.cpp
     src/Propagation.cpp
     src/SampleClock.cpp
     src/Selector.cpp
@@ -110,6 +127,7 @@ add_executable(ubersdr-ntp
     src/Status.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc")
 add_dependencies(ubersdr-ntp index_html version_header)
+add_dependencies(ubersdr-ntp-clocktest version_header)   # Selector.h reaches Config.h, which needs it
 
 target_include_directories(ubersdr-ntp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"

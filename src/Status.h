@@ -44,8 +44,9 @@ std::string renderStatusBlock(const StatusInput& in);
 // reach the same answer as an NTP one, minus whatever TCP and TLS add to the
 // asymmetry. A client that just wants the time reads `unix` and ignores the rest.
 //
-// `receiveUnixSec` is when the request arrived, taken before any of this ran.
-std::string renderTimeJson(const Combined& c, double receiveUnixSec,
+// `receiveDaemonSec` is when the request arrived, on the daemon clock
+// (daemonNow()), taken before any of this ran.
+std::string renderTimeJson(const Combined& c, double receiveDaemonSec,
                            double clientUnixSec, bool pretty);
 
 // A one-line summary, for the state-change log lines and for a quick glance.

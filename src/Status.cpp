@@ -77,15 +77,17 @@ std::string formatDuration(double seconds) {
     return b;
 }
 
-std::string renderTimeJson(const Combined& c, double receiveUnixSec,
+std::string renderTimeJson(const Combined& c, double receiveDaemonSec,
                            double clientUnixSec, bool pretty) {
     json j;
 
-    // The corrected clock: this host's reading plus what the radio says it is
-    // wrong by. Both timestamps are corrected, so a client that trusts this
-    // endpoint ends up on UTC rather than on our error.
-    const double recv = receiveUnixSec + c.offsetSec;
-    const double xmit = realtimeNow() + c.offsetSec;
+    // The served clock: the daemon's own clock plus what the radio says it is
+    // wrong by. Both timestamps are on it, so a client that trusts this
+    // endpoint ends up on UTC rather than on anyone's error.
+    const double now = daemonNow();
+    const double daemonMinusHost = daemonMinusRealtime();
+    const double recv = c.utcAt(receiveDaemonSec);
+    const double xmit = c.utcAt(now);
 
     j["synchronised"] = c.synchronised;
     j["stratum"] = c.synchronised ? 1 : 16;
@@ -99,7 +101,13 @@ std::string renderTimeJson(const Combined& c, double receiveUnixSec,
     j["unix_ms"] = static_cast<long long>(std::llround(xmit * 1000.0));
     j["utc"] = iso8601(static_cast<long long>(std::llround(xmit * 1000.0)));
     j["dispersion_ms"] = c.dispersionSec * 1000.0;
-    j["offset_ms"] = c.offsetSec * 1000.0;
+    // The correction this host would need to reach the served time.
+    j["offset_ms"] = (xmit - (now - daemonMinusHost)) * 1000.0;
+    // The served clock against the daemon's own and how fast that moves, so a
+    // client timing repeated requests can tell a change in this server's
+    // estimate from the rate it is expected to move at.
+    j["clock_offset_ms"] = (xmit - now) * 1000.0;
+    j["clock_rate_ppm"] = c.rate * 1e6;
     j["reference_age_seconds"] = c.ageSec;
     j["sources_used"] = c.used;
     if (!c.note.empty()) j["note"] = c.note;
@@ -110,9 +118,9 @@ std::string renderTimeJson(const Combined& c, double receiveUnixSec,
     if (clientUnixSec > 0.0) rt["originate"] = clientUnixSec;
     rt["receive"] = recv;
     rt["transmit"] = xmit;
-    // The server's own uncorrected clock, so a client can see what correction
+    // The host's own clock at the receive, so a client can see what correction
     // was applied rather than having to trust that one was.
-    rt["server_raw_receive"] = receiveUnixSec;
+    rt["server_raw_receive"] = receiveDaemonSec - daemonMinusHost;
     j["roundtrip"] = std::move(rt);
 
     return dumpJson(j, pretty);
@@ -124,7 +132,7 @@ std::string renderStatusLine(const StatusInput& in) {
 
     std::ostringstream o;
     if (in.combined.synchronised) {
-        o << "synchronised, offset " << formatOffsetMs(in.combined.offsetSec)
+        o << "synchronised, offset " << formatOffsetMs(in.combined.hostOffsetSec)
           << " +/- " << f2(in.combined.dispersionSec * 1000.0, 1) << " ms";
     } else {
         o << "UNSYNCHRONISED";
@@ -142,16 +150,25 @@ std::string renderStatusBlock(const StatusInput& in) {
     o << "served time: ";
     if (in.combined.synchronised) {
         o << "stratum 1 (" << in.combined.refid << "), offset "
-          << formatOffsetMs(in.combined.offsetSec)
+          << formatOffsetMs(in.combined.hostOffsetSec) << " to this host"
           << ", root dispersion " << f2(in.combined.dispersionSec * 1000.0, 1) << " ms"
           << ", from " << in.combined.used << " of " << in.combined.candidates << " candidate(s)"
           << ", " << formatDuration(in.combined.ageSec) << " old";
     } else {
         o << "UNSYNCHRONISED (stratum 16)";
         if (in.combined.valid) {
-            o << ", last known offset " << formatOffsetMs(in.combined.offsetSec)
+            o << ", last known offset " << formatOffsetMs(in.combined.hostOffsetSec)
               << " from " << formatDuration(in.combined.ageSec) << " ago";
         }
+    }
+    if (in.combined.valid) {
+        // The daemon clock's rate error, as the radio measures it. Positive
+        // offset rate means the served offset grows, i.e. the oscillator is slow.
+        o << "\n             daemon clock (raw oscillator) runs "
+          << f2(-in.combined.rate * 1e6, 1) << " ppm against UTC, "
+          << (in.combined.rateMeasured ? "+/- " + f2(in.combined.rateUncertainty * 1e6, 1) + " ppm measured"
+                                       : "not yet measured (up to " +
+                                             f2(in.combined.rateUncertainty * 1e6, 0) + " ppm assumed)");
     }
     if (!in.combined.note.empty()) o << "\n             " << in.combined.note;
     if (!in.combined.usedNames.empty()) {
@@ -209,7 +226,7 @@ std::string renderStatusBlock(const StatusInput& in) {
                       s.windowSize > 0 ? (std::to_string(s.framesInWindow) + "/" +
                                           std::to_string(s.windowSize)).c_str() : "-",
                       s.lastQuality > 0 ? (std::to_string(s.lastQuality) + "%").c_str() : "-",
-                      s.haveOffset ? formatOffsetMs(s.offsetSec).c_str() : "-",
+                      s.haveOffset ? formatOffsetMs(s.hostOffsetSec).c_str() : "-",
                       s.haveOffset ? (f2(s.dispersionSec * 1000.0, 1) + "ms").c_str() : "-",
                       s.offsetSamples);
         o << row << '\n';
@@ -273,13 +290,21 @@ std::string renderStatusBlock(const StatusInput& in) {
         o << '\n';
 
         if (s.haveOffset) {
-            o << "    timing: offset " << formatOffsetMs(s.offsetSec)
+            o << "    timing: offset " << formatOffsetMs(s.hostOffsetSec)
               << " +/- " << f2(s.dispersionSec * 1000.0, 1) << " ms"
               << " (raw " << formatOffsetMs(s.rawOffsetSec)
               << ", jitter " << f2(s.jitterSec * 1000.0, 1) << " ms"
               << ", " << s.offsetSamples << " samples, newest "
               << formatDuration(s.offsetAgeSec) << " old)"
               << ", worth " << f2(s.weightDispersionSec * 1000.0, 1) << " ms against the others\n";
+            o << "            rate " << f2(s.offsetRate * 1e6, 1) << " ppm";
+            if (s.offsetRateMeasured) {
+                o << " +/- " << f2(s.offsetRateUncertainty * 1e6, 1) << " over "
+                  << formatDuration(s.offsetRateSpanSec);
+            } else {
+                o << " assumed (not yet measured, up to " << f2(s.offsetRateUncertainty * 1e6, 0) << ")";
+            }
+            o << ", worth " << f2(s.rateTermSec * 1000.0, 2) << " ms\n";
         } else {
             o << "    timing: no usable offset yet\n";
         }
@@ -328,7 +353,13 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
     served["valid"] = in.combined.valid;
     served["stratum"] = in.combined.synchronised ? 1 : 16;
     served["refid"] = in.combined.refid;
-    served["offset_ms"] = in.combined.offsetSec * 1000.0;
+    // The correction this host would need; the served time itself is formed
+    // from the daemon clock, which clock_offset_ms and clock_rate_ppm describe.
+    served["offset_ms"] = in.combined.hostOffsetSec * 1000.0;
+    served["clock_offset_ms"] = in.combined.offsetSec * 1000.0;
+    served["clock_rate_ppm"] = in.combined.rate * 1e6;
+    served["clock_rate_uncertainty_ppm"] = in.combined.rateUncertainty * 1e6;
+    served["clock_rate_measured"] = in.combined.rateMeasured;
     served["root_dispersion_ms"] = in.combined.dispersionSec * 1000.0;
     {
         json ag = json::array();
@@ -438,8 +469,14 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
 
         json t;
         t["have_offset"] = s.haveOffset;
-        t["offset_ms"] = s.offsetSec * 1000.0;
+        t["offset_ms"] = s.hostOffsetSec * 1000.0;
         t["raw_offset_ms"] = s.rawOffsetSec * 1000.0;
+        t["clock_offset_ms"] = s.offsetSec * 1000.0;
+        t["rate_ppm"] = s.offsetRate * 1e6;
+        t["rate_uncertainty_ppm"] = s.offsetRateUncertainty * 1e6;
+        t["rate_measured"] = s.offsetRateMeasured;
+        t["rate_span_seconds"] = s.offsetRateSpanSec;
+        t["rate_term_ms"] = s.rateTermSec * 1000.0;
         t["jitter_ms"] = s.jitterSec * 1000.0;
         t["dispersion_ms"] = s.dispersionSec * 1000.0;
         t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;

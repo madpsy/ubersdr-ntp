@@ -129,9 +129,9 @@ bool truthy(const std::string& v) { return !v.empty() && v != "0" && v != "false
 // The compact per-second payload: the corrected time, what is being served,
 // and one line per source. Everything a live display or the summary half of the
 // page needs, at a size that is reasonable to send every second.
-std::string tickJson(const Combined& c, const StatusInput& in, double nowRealtime) {
+std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon) {
     nlohmann::json j;
-    const double utc = nowRealtime + c.offsetSec;
+    const double utc = c.utcAt(nowDaemon);
     const long long utcMs = static_cast<long long>(std::llround(utc * 1000.0));
 
     j["unix"] = utc;
@@ -140,7 +140,14 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowRealtim
     j["synchronised"] = c.synchronised;
     j["stratum"] = c.synchronised ? 1 : 16;
     j["refid"] = c.refid;
-    j["offset_ms"] = c.offsetSec * 1000.0;
+    // The correction this HOST would need, which is what a person reading
+    // "offset" wants to know.
+    j["offset_ms"] = (utc - (nowDaemon - daemonMinusRealtime())) * 1000.0;
+    // The served clock against the daemon's own, and how fast that moves: what
+    // a client timing repeated requests needs to tell a change in the server's
+    // estimate from the rate it is expected to move at (see the status page).
+    j["clock_offset_ms"] = (utc - nowDaemon) * 1000.0;
+    j["clock_rate_ppm"] = c.rate * 1e6;
     j["dispersion_ms"] = c.dispersionSec * 1000.0;
     j["reference_age_seconds"] = c.ageSec;
     j["sources_used"] = c.used;
@@ -180,7 +187,7 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowRealtim
         o["refusal"] = s.refusal;
         o["last_quality"] = s.lastQuality;
         o["have_offset"] = s.haveOffset;
-        o["offset_ms"] = s.offsetSec * 1000.0;
+        o["offset_ms"] = s.hostOffsetSec * 1000.0;
         o["dispersion_ms"] = s.dispersionSec * 1000.0;
         o["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
         o["samples"] = s.offsetSamples;
@@ -357,8 +364,8 @@ void HttpApi::accept() {
 }
 
 void HttpApi::serveConnection(int fd) {
-    // /api/time's receive timestamp: when the request's first bytes arrived,
-    // set at the first successful recv below. Not when this thread started --
+    // /api/time's receive timestamp, on the daemon clock: when the request's
+    // first bytes arrived, set at the first successful recv below. Not when this thread started --
     // that is when the TCP connection was accepted, and a client may take a
     // while to send its request after connecting, which would read as delay.
     double arrived = 0.0;
@@ -379,7 +386,7 @@ void HttpApi::serveConnection(int fd) {
         if (::poll(&pfd, 1, remaining) <= 0) return;
         const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
         if (n <= 0) return;
-        if (arrived == 0.0) arrived = realtimeNow();
+        if (arrived == 0.0) arrived = daemonNow();
         head.append(buf, static_cast<std::size_t>(n));
         if (head.size() > 16384) return;   // no legitimate GET is this large
     }
@@ -534,7 +541,7 @@ void HttpApi::serveEvents(int fd) {
         const std::string status = "event: status\ndata: " + renderStatusJson(in, false) + "\n\n";
         if (!writeAll(fd, status)) return;
         const std::string tick = "event: tick\ndata: " +
-                                 tickJson(m_selector.current(), in, realtimeNow()) + "\n\n";
+                                 tickJson(m_selector.current(), in, daemonNow()) + "\n\n";
         if (!writeAll(fd, tick)) return;
     }
 
@@ -547,8 +554,7 @@ void HttpApi::serveEvents(int fd) {
         // across a change in the offset — the boundary moves with the
         // correction rather than drifting away from it.
         const Combined c = m_selector.current();
-        const double now = realtimeNow();
-        const double corrected = now + c.offsetSec;
+        const double corrected = c.utcAt(daemonNow());
         double wait = std::ceil(corrected) - corrected;
         // Exactly on the boundary, go to the next one rather than firing twice.
         if (wait < 0.002) wait += 1.0;
@@ -573,7 +579,7 @@ void HttpApi::serveEvents(int fd) {
         const Combined c2 = m_selector.current();
         const StatusInput in = m_provider();
         const std::string tick = "event: tick\ndata: " +
-                                 tickJson(c2, in, realtimeNow()) + "\n\n";
+                                 tickJson(c2, in, daemonNow()) + "\n\n";
         if (!writeAll(fd, tick)) break;
 
         // The per-source detail does not change at 1 Hz and is twenty times the

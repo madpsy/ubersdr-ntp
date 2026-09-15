@@ -1,6 +1,6 @@
 #pragma once
 
-// Maps a decoder sample index onto this host's clock.
+// Maps a decoder sample index onto the daemon's clock (see daemonNow below).
 //
 // This is the whole problem. The decoder says "the broadcast second edge was
 // at input sample 5027880"; NTP needs to know what time it was HERE when that
@@ -47,7 +47,7 @@ namespace ubersdr_ntp {
 
 struct ClockFit {
     bool valid = false;
-    double anchorSec = 0.0;   // host CLOCK_MONOTONIC (seconds) at sample 0
+    double anchorSec = 0.0;   // daemon clock (seconds) at sample 0
     double secPerSample = 0.0; // 1 / effective rate, absorbing eps
     double residualRms = 0.0;  // spread of the low-envelope points about the fit (s)
     double spanSec = 0.0;      // how much stream the fit covers
@@ -79,16 +79,17 @@ public:
     int sampleRate() const { return m_rate; }
 
     // Records that the block ENDING at sample index `endSample` arrived at
-    // host time `hostSec` (CLOCK_MONOTONIC, seconds).
+    // daemon time `hostSec` (daemonNow(), seconds).
     //
-    // MONOTONIC, not REALTIME, although REALTIME is the clock being measured.
-    // The fit spans five minutes of arrivals; a step of the host clock in the
-    // middle of it — ntpd's own step, an operator's `date -s` — would put a
-    // one-sided discontinuity into a regression that assumes a straight line,
-    // and bias the anchor for the whole window. Fitted on MONOTONIC, a step
-    // cannot reach the fit at all, and the caller converts to REALTIME at the
-    // moment of use with a fresh realtimeMinusMonotonic(), where a step shows
-    // up immediately and exactly. Frequency slewing affects both clocks alike.
+    // The fit spans five minutes of arrivals and assumes a straight line, so it
+    // must be taken on a clock nothing steers. CLOCK_MONOTONIC is not one: it is
+    // immune to steps, but ntpd or chrony slewing the host changes its RATE, by
+    // hundreds of ppm for a minute at a time while they correct an offset --
+    // measured on a host whose chrony took this daemon as its source, the rate
+    // swung from +177 to -500 ppm within a minute. The fit read that as a
+    // receiver running impossibly fast, refused the slope, and put 40 ms of
+    // slope uncertainty on every edge. The daemon clock is the raw oscillator,
+    // so the line through these points is a line.
     //
     // The end of the block, not the start: its audio was captured before it was
     // sent, so the last sample is the edge closest to the moment it landed.
@@ -131,20 +132,37 @@ private:
     double m_lastExcess = 0.0;
 };
 
-// CLOCK_REALTIME and CLOCK_MONOTONIC as doubles.
+// The clocks this daemon reads, as doubles. They are not interchangeable.
 //
-// Both are needed and they are not interchangeable. REALTIME is what NTP
-// serves and what an offset is measured against, so every timing observation
-// is taken on it. MONOTONIC is what timeouts and intervals use, because a step
-// of the very clock this daemon exists to correct must not make a 30-second
-// status timer fire in 1970.
+// daemonNow() is the daemon's own clock, and the one every timing measurement
+// and every served timestamp is taken on: CLOCK_MONOTONIC_RAW -- the machine's
+// oscillator with no correction applied by anyone -- offset once, at the first
+// call, so that it reads close to Unix time. The radio decides what time it
+// is; this only has to count between broadcast seconds, and a clock that only
+// counts must not be a clock something else is steering. The host's clock is
+// exactly that: whatever disciplines the host slews it, and a host whose NTP
+// client uses this daemon as its source slews it by what this daemon serves,
+// which closes a loop through the measurement. Measured and served on the raw
+// oscillator, the answer is the radio's and the oscillator's alone. Its rate
+// error against UTC is a crystal's, steady and measured (see OffsetEstimator).
+// It stops while the machine is suspended, as MONOTONIC does.
+double daemonNow();
+
+// CLOCK_REALTIME: the host's own clock. Read only to REPORT how far it is from
+// the served time, and for the decoder's day-scale plausibility reference,
+// never to form a timestamp.
 double realtimeNow();
+
+// CLOCK_MONOTONIC: timeouts and intervals, which want neither a step of the
+// host clock nor anything else from this file.
 double monotonicNow();
 
-// CLOCK_REALTIME minus CLOCK_MONOTONIC, now. Adding it to a MONOTONIC instant
-// gives the REALTIME instant under the host clock as it currently stands.
-// Read as mono / real / mono and averaged, so a preemption between the two
-// reads is halved rather than counted whole.
-double realtimeMinusMonotonic();
+// daemonNow() minus realtimeNow(), now: add it to a host-clock instant to get
+// the daemon-clock instant. Read daemon / real / daemon and averaged, so a
+// preemption between the reads is halved rather than counted whole.
+double daemonMinusRealtime();
+
+// The resolution the daemon clock is read to, in seconds.
+double daemonClockResolution();
 
 } // namespace ubersdr_ntp

@@ -30,6 +30,7 @@
 // bypassed, it is being re-used.
 
 #include "Config.h"
+#include "OffsetEstimator.h"
 #include "OpusV4Header.h"
 #include "Propagation.h"
 #include "SampleClock.h"
@@ -108,8 +109,19 @@ struct SourceSnapshot {
 
     // timing
     bool haveOffset = false;
-    double offsetSec = 0.0;         // corrected: raw + total delay
-    double rawOffsetSec = 0.0;      // before the delay model, for diagnosis
+    // UTC minus the DAEMON clock (SampleClock.h) at offsetAtSec, delay model
+    // applied, moving at offsetRate. What the selector combines.
+    double offsetSec = 0.0;
+    double offsetAtSec = 0.0;
+    double offsetRate = 0.0;             // d(offsetSec)/d(daemon time); 1e-6 is 1 ppm
+    double offsetRateUncertainty = 0.0;
+    bool offsetRateMeasured = false;     // false: zero assumed, uncertainty is the bound
+    double offsetRateSpanSec = 0.0;
+    double rateTermSec = 0.0;            // what the rate's doubt could move the offset by
+    // The same offset against THIS HOST's clock, now, and before the delay model.
+    // For people and the status page; nothing is formed from them.
+    double hostOffsetSec = 0.0;
+    double rawOffsetSec = 0.0;
     double jitterSec = 0.0;         // spread of the measurements in the window
     double dispersionSec = 0.0;     // jitter + fit residual + delay uncertainty
     // What this source is worth RELATIVE TO THE OTHERS, which is not the same
@@ -182,7 +194,7 @@ private:
 
     // Audio path, all on the WebSocket thread.
     void handleAudio(const std::uint8_t* pkt, std::size_t len, double arrivalSec);
-    // arrivalSec is CLOCK_MONOTONIC. observeArrival=false for samples this
+    // arrivalSec is the daemon clock. observeArrival=false for samples this
     // program synthesised (concealment, gap fill), which advance the timeline
     // but did not arrive at any particular instant.
     void feedSamples(const std::int16_t* pcm, int count, int rate, double arrivalSec,
@@ -199,7 +211,7 @@ private:
     void onClockFrame(const clockdec::ClockFrameInfo& f);
     void onClockTime(const clockdec::ClockTimeInfo& t);
 
-    void addOffsetSample(double offsetSec, double atRealtime);
+    void addOffsetSample(double offsetSec, double atDaemon);   // caller holds m_mu
     void recomputeOffset();     // caller holds m_mu
     void updateDelayModel();    // caller holds m_mu
     void recordRtt(double rttSec);  // caller holds m_mu
@@ -280,10 +292,6 @@ private:
     bool m_tsBlockHave = false;
     std::uint64_t m_gapFills = 0;
 
-    // CLOCK_REALTIME minus CLOCK_MONOTONIC at the last packet, to see a step.
-    bool m_haveRtMinusMono = false;
-    double m_lastRtMinusMono = 0.0;
-
     SampleClock m_clock;
 
     // The UTC anchor a `time` event leaves behind, extended one second per
@@ -296,8 +304,7 @@ private:
     long long m_anchorUtcMs = 0;
     double m_anchorSetAt = 0.0;
 
-    struct OffsetSample { double at; double offset; };
-    std::deque<OffsetSample> m_offsets;
+    OffsetEstimator m_offsets;      // under m_mu
     std::deque<double> m_rttProbes;
     std::deque<double> m_wsRttProbes;
 };

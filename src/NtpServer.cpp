@@ -68,7 +68,7 @@ std::uint32_t toShortFormat(double seconds) {
 }
 
 // The precision field: the base-2 logarithm of the resolution this server
-// reads its clock to, as a signed 8-bit value.
+// reads its clock -- the daemon clock -- to, as a signed 8-bit value.
 //
 // NOT the accuracy. RFC 5905 defines it as the precision of the system clock,
 // and clients add 2^precision to the dispersion they compute for this server
@@ -80,11 +80,7 @@ std::uint32_t toShortFormat(double seconds) {
 // so the nanoseconds clock_getres reports would be a claim this cannot keep.
 std::int8_t clockPrecision() {
     static const std::int8_t precision = [] {
-        struct timespec res{};
-        double sec = 1e-9;
-        if (::clock_getres(CLOCK_REALTIME, &res) == 0) {
-            sec = static_cast<double>(res.tv_sec) + static_cast<double>(res.tv_nsec) * 1e-9;
-        }
+        const double sec = daemonClockResolution();
         const int p = sec > 0.0 ? static_cast<int>(std::ceil(std::log2(sec))) : -20;
         return static_cast<std::int8_t>(std::clamp(p, -20, 0));
     }();
@@ -309,8 +305,14 @@ void NtpServer::serve(int fd, const std::string& label) {
             continue;
         }
 
-        // The moment the packet actually arrived, from the kernel if it said.
-        double recvRealtime = realtimeNow();
+        // The moment the packet actually arrived, on the daemon clock, from the
+        // kernel if it said. The kernel's stamp is on the HOST clock --
+        // SO_TIMESTAMPNS offers no other -- so it is moved onto the daemon clock
+        // by the two clocks' difference as it stands now. That difference moves
+        // only as fast as the host is being slewed, microseconds over the time
+        // a packet waits; a stamp more than a second out means the host clock
+        // was stepped in between, and the read here stands instead.
+        double recvDaemon = daemonNow();
         // And the local address it arrived on, to answer from (see start()).
         bool haveDst4 = false, haveDst6 = false;
         struct in_pktinfo dst4{};
@@ -320,7 +322,9 @@ void NtpServer::serve(int fd, const std::string& label) {
             if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SO_TIMESTAMPNS) {
                 struct timespec ts;
                 std::memcpy(&ts, CMSG_DATA(cm), sizeof ts);
-                recvRealtime = static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+                const double viaStamp = static_cast<double>(ts.tv_sec) +
+                                        static_cast<double>(ts.tv_nsec) * 1e-9 + daemonMinusRealtime();
+                if (std::abs(viaStamp - recvDaemon) < 1.0) recvDaemon = viaStamp;
             }
 #endif
 #ifdef IP_PKTINFO
@@ -410,7 +414,7 @@ void NtpServer::serve(int fd, const std::string& label) {
             // the two from meaning different things. The broadcast carries no
             // sign, and every leap second since 1972 has been an insertion, so
             // an insertion is what is announced.
-            const double utc = recvRealtime + c.offsetSec;
+            const double utc = c.utcAt(recvDaemon);
             if (isLastDayOfMonth(static_cast<long long>(utc * 1000.0))) leap = 1;
         }
 
@@ -444,7 +448,7 @@ void NtpServer::serve(int fd, const std::string& label) {
         // Reference timestamp: when this server's clock was last set from the
         // radio, which is the age of the newest contributing measurement. Left
         // zero if it never has been, which is what RFC 5905 says zero means.
-        const double corrected = recvRealtime + c.offsetSec;
+        const double corrected = c.utcAt(recvDaemon);
         if (c.valid) {
             const NtpTime ref = toNtpTime(corrected - c.ageSec);
             put32(out + 16, ref.sec);
@@ -462,7 +466,7 @@ void NtpServer::serve(int fd, const std::string& label) {
         put32(out + 32, rec.sec);
         put32(out + 36, rec.frac);
 
-        const NtpTime xmt = toNtpTime(realtimeNow() + c.offsetSec);
+        const NtpTime xmt = toNtpTime(c.utcAt(daemonNow()));
         put32(out + 40, xmt.sec);
         put32(out + 44, xmt.frac);
 

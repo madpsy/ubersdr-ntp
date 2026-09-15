@@ -75,7 +75,17 @@ struct SourceResidual {
 struct Combined {
     bool valid = false;         // an offset is available at all
     bool synchronised = false;  // ...and it is fresh enough to serve as stratum 1
-    double offsetSec = 0.0;     // add to this host's clock to get UTC
+    // The served time is the daemon clock (SampleClock.h) plus this offset, as
+    // of atSec, moving at `rate`: use utcAt(), which is what every served
+    // timestamp is formed from.
+    double offsetSec = 0.0;
+    double atSec = 0.0;
+    double rate = 0.0;              // d(offsetSec)/d(daemon time); 1e-6 is 1 ppm
+    double rateUncertainty = 0.0;
+    bool rateMeasured = false;
+    // Served time minus THIS HOST's clock, at atSec: the correction the host
+    // would need. For display and the API's offset_ms; never used to serve.
+    double hostOffsetSec = 0.0;
     double dispersionSec = 0.0; // how far out that could be
     double ageSec = 0.0;        // since the last contributing measurement
     int used = 0;               // sources that survived the intersection
@@ -92,6 +102,9 @@ struct Combined {
     std::vector<std::string> reacquireNames;
     std::string note;           // why it is not synchronised, when it is not
     std::vector<SourceResidual> residuals;
+
+    // UTC at a daemon-clock instant.
+    double utcAt(double daemonSec) const { return daemonSec + offsetSec + rate * (daemonSec - atSec); }
 };
 
 class Selector {
@@ -101,7 +114,8 @@ public:
     // Recomputes from the current snapshots. Called on a timer and by the NTP
     // server; cheap enough to call per request but not called per request, so
     // a burst of clients cannot turn into a burst of work.
-    Combined combine(const std::vector<SourceSnapshot>& snaps, double nowRealtime);
+    // `now` is the daemon clock (daemonNow()).
+    Combined combine(const std::vector<SourceSnapshot>& snaps, double now);
 
     // The last result, for the NTP server to answer from without recomputing.
     Combined current() const;
@@ -144,7 +158,10 @@ private:
 
     // The coasting state: the last good offset and when it was good.
     bool m_haveLast = false;
-    double m_lastGoodOffset = 0.0;
+    double m_lastGoodOffset = 0.0;     // at m_lastGoodAt
+    double m_lastGoodRate = 0.0;       // ...and the rate it was moving at, to coast along
+    double m_lastGoodRateUncertainty = 0.0;
+    bool m_lastGoodRateMeasured = false;
     double m_lastGoodDispersion = 0.0;
     double m_lastGoodAt = 0.0;
     // When the newest measurement behind that offset was taken. Not the same

@@ -359,17 +359,61 @@ of the delay distribution and moves with network load.
 
 So `SampleClock` buckets the arrivals, keeps the *minimum* residual in each
 bucket, and fits a line through that lower envelope — the same estimator NTP's
-clock filter and PTP both use. The line's intercept is the sample-to-host anchor
-and its slope is the receiver's sample-clock error against this host's, which it
-reports in ppm. In practice the fit residual runs well under a millisecond.
+clock filter and PTP both use. The line's intercept is the sample-to-clock anchor
+and its slope is the receiver's sample-clock error against the daemon's clock
+(below), which it reports in ppm. In practice the fit residual runs well under a
+millisecond.
 
 A `time` event — a voted, plausibility-checked timestamp — arrives once a minute
 on WWV, which is a thin diet for a filter. But it anchors the UTC of one sample
 index, and every second edge after it is exactly one second later. So the anchor
 is extended forwards and each second edge yields an independent measurement of
 the same offset: sixty a minute instead of one, from the same voted timestamp.
-Those are reduced by median and MAD, which an occasional edge landing on a fade
-cannot drag.
+
+### Its own clock
+
+The radio decides what time it is, but only at each broadcast second, and late.
+Between those instants something has to count: to put an arrival time on each
+audio packet, and to read the moment an NTP request lands. That clock only has
+to count — over a second even a cheap crystal is off by microseconds — but it
+must not be a clock something else is steering.
+
+The host's clock is exactly that. Whatever disciplines the host slews it, by
+hundreds of ppm for a minute at a time while it corrects an offset, and a host
+whose NTP client takes this daemon as its source slews it by what this daemon
+serves, which closes a loop through the measurement. Measured on such a host,
+the arrival fit saw the rate swing from +177 to −500 ppm within a minute,
+refused its slope, and put about 40 ms of slope uncertainty on every edge: root
+dispersion near 100 ms, and a served offset wandering by 25 ms.
+
+So the daemon keeps its own clock: `CLOCK_MONOTONIC_RAW`, the machine's
+oscillator with nothing applied to it, offset once at startup so it reads close
+to Unix time. Packet arrivals, second edges, NTP receive and transmit stamps and
+the HTTP API are all read on it, and the served time is that clock plus what the
+radio measures it to be wrong by. The host clock is read only to report the
+correction the host would need — `offset_ms`, "correction to this host" on the
+page — and nothing is formed from it. It makes no difference to the served time
+what, if anything, disciplines the host, including this daemon.
+
+A raw crystal is steadily wrong by tens of ppm (the host this was written on
+measured −12 ppm against public NTP), so its offset from UTC is a line rather
+than a constant, and each source estimates both (`OffsetEstimator`):
+
+- **the rate** from half an hour of second edges by least squares with gross
+  outliers trimmed. What limits it is not the edges' scatter but the path
+  delay's wander — milliseconds over minutes, which over a short span passes for
+  rate (live, ten minutes of one receiver read anything from +23 to −21 ppm) —
+  so none is used before ten minutes, and its uncertainty is judged from
+  one-minute means, which carry that wander, as if the whole window might be one
+  excursion of it;
+- **the level** from the last two minutes, each edge carried forward along that
+  rate, then the median and MAD — which an occasional edge on a fade cannot
+  drag, and which lets a genuine step work its way out in two minutes.
+
+Until ten minutes of history pin the rate, none is assumed and up to 50 ppm of
+doubt is carried in the dispersion instead; several sources' rates are combined,
+and no more tightly than they agree. The status block, the page
+and `/api/status` show the rate each source measures and how well.
 
 ## Several sources
 
@@ -530,9 +574,11 @@ reason: an operator can only trust what it says if nobody can change it.
 
 ## When nothing is locked
 
-It keeps answering, coasting on the last good offset with root dispersion
-growing at `coast_drift_ppm` (15 ppm, NTP's own assumed wander for an
-undisciplined clock) until `coast_seconds`. Past that it answers stratum 0 with
+It keeps answering, coasting along the last good offset at the rate it was
+last measured moving — the daemon clock is a crystal, and a crystal keeps its
+rate when the radio goes quiet — with root dispersion growing at
+`coast_drift_ppm` (15 ppm, NTP's own assumed wander for an undisciplined clock)
+plus the doubt in that rate, until `coast_seconds`. Past that it answers stratum 0 with
 LI=3 — unsynchronised — which tells a client to look elsewhere immediately
 rather than making it wait for a timeout. That is what a real refclock does.
 
@@ -599,7 +645,8 @@ curl -s "http://127.0.0.1:1234/api/time?t=$(date +%s.%N)" | jq
   "synchronised": true, "stratum": 1, "refid": "WWV",
   "unix": 1789220625.417, "unix_ms": 1789220625417,
   "utc": "2026-09-12T14:23:45Z",
-  "offset_ms": -34.2, "dispersion_ms": 22.5,
+  "offset_ms": -34.2, "clock_offset_ms": 118.6, "clock_rate_ppm": 11.9,
+  "dispersion_ms": 22.5,
   "reference_age_seconds": 12.4, "sources_used": 2, "leap_pending": false,
   "roundtrip": {
     "originate": 1789220625.331, "receive": 1789220625.402,
@@ -611,6 +658,14 @@ curl -s "http://127.0.0.1:1234/api/time?t=$(date +%s.%N)" | jq
 `offset = ((receive − originate) + (transmit − destination)) / 2` and
 `delay = (destination − originate) − (transmit − receive)`, exactly as in
 RFC 5905. A client that just wants the time reads `unix` and ignores the rest.
+
+`offset_ms` is the correction *this host* would need to reach the served time;
+the served time itself does not depend on the host's clock (see
+[its own clock](#its-own-clock)). `clock_offset_ms` and `clock_rate_ppm` are the
+served time against the daemon's own clock and how fast that moves, which is
+what a client timing repeated requests needs to tell a change in the server's
+estimate from steady movement — the status page uses them that way.
+`server_raw_receive` is the host's clock at the receive.
 
 ### `/api/events`
 

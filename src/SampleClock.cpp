@@ -16,23 +16,47 @@ constexpr double kMaxPlausiblePpm = 200.0;
 
 } // namespace
 
-double realtimeNow() {
+namespace {
+
+double readClock(clockid_t id) {
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    clock_gettime(id, &ts);
     return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
 }
 
-double monotonicNow() {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return static_cast<double>(ts.tv_sec) + static_cast<double>(ts.tv_nsec) * 1e-9;
+// Where the daemon clock's zero is, fixed at the first read: the host clock at
+// that moment, so the two start out together and every offset stays a small
+// number while the host is roughly right. Nothing depends on the choice beyond
+// that, and nothing ever moves it.
+double daemonBase() {
+    static const double base = [] {
+        const double r0 = readClock(CLOCK_MONOTONIC_RAW);
+        const double rt = readClock(CLOCK_REALTIME);
+        const double r1 = readClock(CLOCK_MONOTONIC_RAW);
+        return rt - 0.5 * (r0 + r1);
+    }();
+    return base;
 }
 
-double realtimeMinusMonotonic() {
-    const double m0 = monotonicNow();
+} // namespace
+
+double daemonNow() { return readClock(CLOCK_MONOTONIC_RAW) + daemonBase(); }
+
+double realtimeNow() { return readClock(CLOCK_REALTIME); }
+
+double monotonicNow() { return readClock(CLOCK_MONOTONIC); }
+
+double daemonMinusRealtime() {
+    const double d0 = daemonNow();
     const double r = realtimeNow();
-    const double m1 = monotonicNow();
-    return r - 0.5 * (m0 + m1);
+    const double d1 = daemonNow();
+    return 0.5 * (d0 + d1) - r;
+}
+
+double daemonClockResolution() {
+    struct timespec res{};
+    if (clock_getres(CLOCK_MONOTONIC_RAW, &res) != 0) return 1e-9;
+    return static_cast<double>(res.tv_sec) + static_cast<double>(res.tv_nsec) * 1e-9;
 }
 
 SampleClock::SampleClock(int sampleRate, double bucketSec, double windowSec)

@@ -46,12 +46,6 @@ const char* linkStateName(LinkState s) {
 
 namespace {
 
-// How long the offset window reaches back. Two minutes is long enough to
-// average a couple of hundred second-edge measurements and short enough that a
-// genuine step — a source that resynchronised onto a different edge — works its
-// way out rather than being averaged with the old value for ever.
-constexpr double kOffsetWindowSec = 120.0;
-
 // Offsets older than this stop counting as current. A source that locked and
 // then faded should stop contributing long before its last reading is useless,
 // and the selector needs a definite answer rather than a decaying one.
@@ -818,25 +812,10 @@ void Source::onBinary(const std::string& msg) {
     // Everything below — header parsing, Opus, the whole DSP chain — happens
     // after this read, so none of it can add to the number.
     //
-    // On CLOCK_MONOTONIC, and converted to REALTIME only where an offset is
-    // formed; SampleClock.h has why.
-    const double arrival = monotonicNow();
-
-    // A step of the host clock. The fit is immune, but every offset already in
-    // the window was measured against the clock as it was, and is now wrong by
-    // exactly the step: the median of them would go on serving the old error
-    // for up to two minutes. ntpd's slew is at most 500 ppm, ten microseconds
-    // between packets, so 5 ms can only be a step.
-    const double rtMinusMono = realtimeMinusMonotonic();
-    if (m_haveRtMinusMono && std::abs(rtMinusMono - m_lastRtMinusMono) > 0.005) {
-        LOG_WARN(m_cfg.name.c_str(), "host clock stepped by %+.1f ms; discarding offsets "
-                 "measured against the old clock", (rtMinusMono - m_lastRtMinusMono) * 1000.0);
-        std::lock_guard<std::mutex> lk(m_mu);
-        m_offsets.clear();
-        recomputeOffset();
-    }
-    m_lastRtMinusMono = rtMinusMono;
-    m_haveRtMinusMono = true;
+    // On the daemon clock, which nothing steers and nothing steps (SampleClock.h
+    // has why). A step or a slew of the host clock reaches neither the fit nor
+    // any offset already measured, so neither needs handling here.
+    const double arrival = daemonNow();
 
     handleAudio(reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size(), arrival);
 }
@@ -1373,7 +1352,6 @@ void Source::resetStream(const char* why) {
     m_lastFrameSamples = 0;
     m_tsHave = false;
     m_tsWaitResync = false;
-    m_haveRtMinusMono = false;
     m_wwv.reset();
     m_wwvb.reset();
 
@@ -1493,11 +1471,10 @@ void Source::onClockSecond(const clockdec::ClockSecondInfo& i) {
     // towards the estimate instead of the signal.
     if (!i.edgeMeasured) return;
 
-    // The fit is on CLOCK_MONOTONIC; the offset is against CLOCK_REALTIME as it
-    // stands NOW, which is what the served time is formed from.
-    double hostMono = 0.0;
-    if (!m_clock.hostTimeAt(i.edgeSample, hostMono)) return;
-    const double hostSec = hostMono + realtimeMinusMonotonic();
+    // When the sample carrying this edge was observed here, on the daemon clock
+    // the fit is taken on and the offset is measured against.
+    double hostSec = 0.0;
+    if (!m_clock.hostTimeAt(i.edgeSample, hostSec)) return;
 
     std::lock_guard<std::mutex> lk(m_mu);
     if (!m_haveAnchor) return;
@@ -1546,15 +1523,15 @@ void Source::onClockSecond(const clockdec::ClockSecondInfo& i) {
     // TRANSMITTED. Adding the delay back is what makes the difference an offset
     // rather than a measurement of the path.
     const double raw = utcSec - hostSec;
-    addOffsetSample(raw + m_snap.delaySec, realtimeNow());
+    addOffsetSample(raw + m_snap.delaySec, hostSec);
     recomputeOffset();
 }
 
-void Source::addOffsetSample(double offsetSec, double atRealtime) {
-    m_offsets.push_back({atRealtime, offsetSec});
-    while (!m_offsets.empty() && atRealtime - m_offsets.front().at > kOffsetWindowSec) {
-        m_offsets.pop_front();
-    }
+void Source::addOffsetSample(double offsetSec, double atDaemon) {
+    // Dated by the edge, not by when this code ran: the rate is fitted against
+    // these instants, and the gap between an edge and its processing is audio
+    // buffering that has nothing to do with the crystal.
+    m_offsets.add(atDaemon, offsetSec);
 }
 
 void Source::recomputeOffset() {
@@ -1564,77 +1541,57 @@ void Source::recomputeOffset() {
         return;
     }
 
-    const double now = realtimeNow();
-    m_snap.offsetAgeSec = now - m_offsets.back().at;
-    m_snap.offsetSamples = static_cast<int>(m_offsets.size());
+    // Filtered once per new sample rather than once per packet: the estimator
+    // keeps its result until a sample arrives, and what below changes with
+    // every packet -- the age and the sample-clock terms -- is cheap.
+    // OffsetEstimator.h has the level/rate split and why.
+    const OffsetEstimate& e = m_offsets.estimate();
+    m_snap.offsetAgeSec = daemonNow() - e.atSec;
+    m_snap.offsetSamples = e.samples;
 
     if (m_snap.offsetAgeSec > kOffsetStaleSec) {
         m_snap.haveOffset = false;
         return;
     }
 
-    // The median, not the mean. A single second edge landing on a fade, or one
-    // packet arriving after a stall, produces an outlier of tens of
-    // milliseconds; the mean carries it and the median does not. With a hundred
-    // or so samples in the window the efficiency cost against a clean mean is
-    // irrelevant next to that.
-    std::vector<double> v;
-    v.reserve(m_offsets.size());
-    for (const OffsetSample& s : m_offsets) v.push_back(s.offset);
-    std::sort(v.begin(), v.end());
-    const std::size_t mid = v.size() / 2;
-    const double median = (v.size() % 2) ? v[mid] : 0.5 * (v[mid - 1] + v[mid]);
+    m_snap.offsetSec = e.offsetSec;
+    m_snap.offsetAtSec = e.atSec;
+    m_snap.offsetRate = e.rate;
+    m_snap.offsetRateUncertainty = e.rateUncertainty;
+    m_snap.offsetRateMeasured = e.rateMeasured;
+    m_snap.offsetRateSpanSec = e.rateSpanSec;
+    m_snap.rateTermSec = e.rateTermSec;
+    m_snap.jitterSec = e.jitterSec;
 
-    // Spread as the median absolute deviation, scaled to be comparable with a
-    // standard deviation on normal data. Robust for the same reason the median
-    // is: an RMS about the median would be dominated by the outliers it is
-    // meant to describe the absence of.
-    std::vector<double> dev;
-    dev.reserve(v.size());
-    for (double x : v) dev.push_back(std::abs(x - median));
-    std::sort(dev.begin(), dev.end());
-    const double mad = dev.empty() ? 0.0 : dev[dev.size() / 2];
-    const double jitter = 1.4826 * mad;
-
-    m_snap.offsetSec = median;
-    m_snap.jitterSec = jitter;
-    // The raw figure shown is the FILTERED one, recovered by undoing the delay
-    // model. Reporting the last unfiltered sample instead put a 15 ms outlier
-    // next to a filtered offset, which reads as the delay model being
-    // inconsistent rather than as the one noisy second edge it actually was.
-    // Individual edges do scatter by a few series samples; that is what the
-    // median is here to absorb, and what `jitter` is here to report.
-    m_snap.rawOffsetSec = median - m_snap.delaySec;
-
-    // What this source claims to be worth. Three independent terms:
+    // What this source claims to be worth. Independent terms:
     //   jitter          how much the measurements disagree with each other
-    //   clock residual  how well the sample-to-host mapping itself fits
+    //   clock residual  how well the sample-to-daemon-clock mapping fits
+    //   clock slope     how well that mapping's rate is known
+    //   rate term       how far the offset's own rate could have carried it
     //   delay           how wrong the delay model could be, which is the term
     //                   nothing can measure and therefore the one that usually
     //                   dominates
     const double delayUncertainty =
         std::max(kDelayUncertaintyFloorSec, m_snap.delaySec * kDelayUncertaintyFraction);
-    m_snap.dispersionSec = jitter + m_snap.clockResidualSec +
-                           m_snap.clockSlopeUncSec + delayUncertainty;
+    const double own = e.jitterSec + m_snap.clockResidualSec + m_snap.clockSlopeUncSec + e.rateTermSec;
+    m_snap.dispersionSec = own + delayUncertainty;
 
     // And what it is worth against the others. The delay term is deliberately
     // absent: every source runs the same delay model, so including it tells the
     // selector only that all of them share a doubt, while drowning out the
-    // three things that actually differ. Those three are all measured, and a
-    // source whose sample clock has just been rebuilt or whose slope was
-    // refused says so here rather than waiting to be noticed by hand.
+    // things that actually differ. Those are all measured, and a source whose
+    // sample clock has just been rebuilt or whose slope was refused says so
+    // here rather than waiting to be noticed by hand.
     //
     // The floor keeps a source that reports a suspiciously perfect zero -- a
     // synthetic stream, or a window too short to have scattered yet -- from
     // taking an unbounded share of the weight. A millisecond is about the
     // decoder's own edge resolution, so no honest source is below it.
-    m_snap.weightDispersionSec = std::max(
-        kWeightDispersionFloorSec,
-        jitter + m_snap.clockResidualSec + m_snap.clockSlopeUncSec);
+    m_snap.weightDispersionSec = std::max(kWeightDispersionFloorSec, own);
 
     // Fewer than a handful of measurements is not a filtered value, whatever
     // its spread happens to be.
-    m_snap.haveOffset = m_offsets.size() >= 5 && m_snap.clockState == "locked";
+    m_snap.haveOffset = e.valid && m_snap.clockState == "locked";
 }
 
 void Source::recordWsRtt(double rttSec) {
@@ -1775,7 +1732,14 @@ SourceSnapshot Source::snapshot() const {
     s.linkAgeSec = now - m_linkSince;
     s.lastAudioAgeSec = m_lastAudioAt > 0.0 ? now - m_lastAudioAt : 1e9;
     s.lastTimeAgeSec = m_lastTimeAt > 0.0 ? now - m_lastTimeAt : 1e9;
-    if (!m_offsets.empty()) s.offsetAgeSec = realtimeNow() - m_offsets.back().at;
+    const double nowDaemon = daemonNow();
+    if (!m_offsets.empty()) s.offsetAgeSec = nowDaemon - m_offsets.newestAt();
+
+    // The same offset against this host's clock, for people: carried to now
+    // along its rate, then moved from the daemon clock onto the host's as the
+    // host clock stands at this instant. Nothing is formed from it.
+    s.hostOffsetSec = s.offsetSec + s.offsetRate * (nowDaemon - s.offsetAtSec) + daemonMinusRealtime();
+    s.rawOffsetSec = s.hostOffsetSec - s.delaySec;
 
     // Staleness is decided HERE as well as in recomputeOffset, because
     // recomputeOffset only runs when a packet or a second edge arrives -- and

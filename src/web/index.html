@@ -208,10 +208,18 @@ const kFetchTimeoutMs = 3000;
 // to disagree -- a clock step, or a page clock that stopped during a sleep.
 const kStepMs = 25;
 
-let samples = [], srvOffsetMs = null, pollTimer = 0, burstLeft = 0, seq = 0, polling = false;
+let samples = [], pollTimer = 0, burstLeft = 0, seq = 0, polling = false;
+// The server's served-minus-daemon-clock offset as last heard, when (page
+// clock) it was heard, and the rate it moves at between estimates.
+let srvOffsetMs = null, srvAt = 0, srvRatePpm = 0;
 
 // The least-delayed sample, its offset carried forward across any change the
-// server has since made to its own correction, and how far out it could be.
+// server has since made to its own estimate, and how far out it could be.
+//
+// The served offset against the server's own clock moves steadily at that
+// clock's rate even when nothing changes, and the page's clock already runs at
+// the served rate, so only the part beyond that steady movement is a change to
+// carry forward.
 function bestEstimate(nowPerf) {
   let b = null, bErr = Infinity;
   for (const s of samples) {
@@ -219,7 +227,8 @@ function bestEstimate(nowPerf) {
     if (err < bErr) { bErr = err; b = s; }
   }
   if (!b) return null;
-  const drift = srvOffsetMs == null ? 0 : srvOffsetMs - b.srvOffset;
+  const drift = srvOffsetMs == null || b.srvOffset == null ? 0
+    : (srvOffsetMs - b.srvOffset) - srvRatePpm * 1e-6 * (srvAt - b.at);
   return { theta: b.theta + drift, err: bErr, delay: b.delay };
 }
 
@@ -257,12 +266,13 @@ async function takeSample() {
     theta: ((rx - sent) + (tx - got)) / 2,
     delay: Math.max(0, (got - sent) - (tx - rx)),
     at: got,
-    srvOffset: d.offset_ms,
+    srvOffset: d.clock_offset_ms,
+    srvRate: d.clock_rate_ppm,
   };
 }
 
 function addSample(s) {
-  srvOffsetMs = s.srvOffset;
+  srvOffsetMs = s.srvOffset; srvAt = s.at; srvRatePpm = s.srvRate || 0;
   const cur = bestEstimate(s.at);
   // Two honest samples cannot disagree by more than their error bounds. If
   // these do, the older ones describe a clock that no longer exists.
@@ -380,7 +390,7 @@ function paintClock(ts) {
 
 function onTick(d) {
   tickUnix = d.unix; tickAt = performance.now();
-  srvOffsetMs = d.offset_ms;
+  srvOffsetMs = d.clock_offset_ms; srvAt = tickAt; srvRatePpm = d.clock_rate_ppm || 0;
   if (!haveTick) { haveTick = true; requestAnimationFrame(paintClock); }
 
   // The tick was stamped before it was sent, so the true time now cannot be
