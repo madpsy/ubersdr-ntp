@@ -40,9 +40,53 @@
 // With one source there is nothing to intersect and step 2 does nothing; the
 // answer is that source's offset and its dispersion, which is the correct and
 // slightly humbling result.
+//
+// TWO CLASSES
+//
+// The sources are not all radio any more. Some are upstream NTP servers, and
+// one class is the primary while the other is the secondary; see ClockConfig
+// for what the three secondary modes mean. Three things change here, and only
+// three.
+//
+//   WHO IS ELIGIBLE. In `always` mode, everybody, and steps 1-3 run over both
+//   classes at once exactly as written. In `standby` and `cold` the secondary's
+//   candidates are held out of the intersection while the primary can serve,
+//   and swapped in when it cannot -- after a hold-down, and back again after a
+//   longer one, because a decoder coming out of a fade re-locks and loses it
+//   repeatedly for several minutes and every swap is a step in the served time.
+//
+//   WHO MAY CONVICT WHOM. Step 2's refusal test rests on an argument that only
+//   holds inside the radio class: every receiver is hearing ONE transmitter and
+//   ONE second edge, so anything past 30 ms is a misdecode rather than a delay
+//   model. A radio source and an NTP server have no such relationship -- they
+//   are two independent measurements of UTC, and a disagreement between them is
+//   the radio delay model's error, which is a real quantity with a real value
+//   that may well exceed 30 ms. So residuals are computed WITHIN a class, and a
+//   source is never refused for disagreeing with the other class.
+//
+//   WHAT STRATUM COMES OUT. A radio source is stratum 0 -- a reference, not a
+//   server -- so serving from one is stratum 1. An upstream at stratum 2 makes
+//   us stratum 3. The rule is NTP's own: one more than the lowest stratum among
+//   the survivors, which means a mixed set is still stratum 1, because a radio
+//   reference really is in it.
+//
+// THE DIFFERENCE BETWEEN THE CLASSES IS WORTH MORE THAN THE FAILOVER
+//
+// When both classes are measured at once -- `always`, or `standby`, which is
+// why standby exists -- the difference between their consensuses is the first
+// absolute reference this daemon has ever had. Every radio source shares the
+// chain-delay constant, the codec delay and the decoder's edge bias, and those
+// terms cancel exactly in any comparison between receivers: no number of
+// receivers can measure them. An NTP server does not share them. So
+// `classDelta` below is a direct measurement of the sum of the constants the
+// delay model cannot see, which the README has always had to state as an
+// unvalidated estimate of about 3 ms. It is reported and never applied: a
+// correction that made the radio agree with the network by construction would
+// turn the one independent check in the system into a tautology.
 
-#include "Source.h"
+#include "SourceSnapshot.h"
 
+#include <cstdint>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -67,9 +111,36 @@ struct SourceResidual {
     double instantSec = 0.0;  // against the median of the OTHERS, right now
     double averagedSec = 0.0; // ...smoothed, because one edge proves nothing
     bool haveAverage = false;
-    int peers = 0;            // how many others it was compared against
+    int peers = 0;            // how many others IN ITS OWN CLASS it was compared against
     bool refused = false;     // ...and it disagreed with them past explaining
     double settledForSec = 0.0; // how long it has been measured at all
+    SourceKind kind = SourceKind::Radio;
+};
+
+// Where the served time is coming from at this instant.
+enum class ServingClass {
+    None,        // nothing usable and nothing to coast from
+    Primary,
+    Secondary,
+    Both,        // `always` mode with candidates in each
+    Coasting,    // the crystal, on the last good offset
+};
+const char* servingClassName(ServingClass c);
+
+// What the two classes say about each other.
+//
+// Only meaningful while both are being measured at once, which is `always` and
+// `standby` but not `cold`. See the header: this is the one measurement in the
+// system that can see the constants every radio source shares, because the
+// class it is measured against does not share them.
+struct ClassDelta {
+    bool valid = false;
+    double instantSec = 0.0;    // primary consensus minus secondary consensus, now
+    double averagedSec = 0.0;   // ...smoothed over the same tau as a source residual
+    bool haveAverage = false;
+    double settledForSec = 0.0;
+    int primarySources = 0;     // how many went into each side
+    int secondarySources = 0;
 };
 
 struct Combined {
@@ -90,7 +161,38 @@ struct Combined {
     double ageSec = 0.0;        // since the last contributing measurement
     int used = 0;               // sources that survived the intersection
     int candidates = 0;         // sources that were eligible to be considered
-    std::string refid = "WWV";  // NTP reference identifier of the dominant station
+
+    // NTP's own stratum rule: one more than the lowest among the survivors,
+    // where a radio source counts as 0 because a reference is not a server. So
+    // radio-only is 1, an upstream at stratum 2 makes this 3, and a mixed set
+    // is 1 because a radio reference really is in it.
+    int stratum = 1;
+    // The NTP path above this server, which is zero while any radio source is
+    // in use -- there is no path above a radio clock -- and the selected
+    // upstream's root delay plus the round trip to it when there is not.
+    double rootDelaySec = 0.0;
+
+    // The reference identifier, as text for people. When the served time comes
+    // from an upstream rather than the radio it is that server's address, which
+    // is what RFC 5905 requires above stratum 1, and refidAddress carries the
+    // four bytes the packet needs.
+    std::string refid = "WWV";
+    bool refidIsAddress = false;
+    std::uint32_t refidAddress = 0;
+
+    // Which class is serving, how the failover stands, and what the two classes
+    // say about each other.
+    ServingClass serving = ServingClass::None;
+    ClassDelta classDelta;
+    int primaryCandidates = 0;
+    int secondaryCandidates = 0;
+    // Seconds until the pending swap, or 0 when none is pending. One of the two
+    // at most: the primary is either failing or recovering, never both.
+    double failoverInSec = 0.0;
+    double failbackInSec = 0.0;
+    // Why the serving class is what it is, in words for the status page.
+    std::string servingNote;
+
     bool leapPending = false;
     std::vector<std::string> usedNames;
     std::vector<std::string> rejectedNames;
@@ -109,7 +211,25 @@ struct Combined {
 
 class Selector {
 public:
-    Selector(double coastSeconds, double coastDriftPpm, int minSources);
+    // The clock configuration is taken by value and kept: the primary class and
+    // the secondary's mode do not change at runtime, and passing them per call
+    // would let two callers disagree about which class was which.
+    Selector(double coastSeconds, double coastDriftPpm, int minSources,
+             ClockConfig clock = ClockConfig{});
+
+    // Which sources the caller should be holding connections for, given where
+    // the failover currently stands. Empty in every mode but `cold`, where it
+    // is the whole of how a cold standby is brought up: the Selector decides
+    // that the primary has gone, the caller owns the sources and acts.
+    //
+    // Returned as a decision per class rather than per source, because
+    // activation is a property of the class -- a cold secondary comes up
+    // entirely or not at all.
+    struct Activation {
+        bool secondaryActive = false;
+        std::string reason;
+    };
+    Activation activation() const;
 
     // Recomputes from the current snapshots. Called on a timer and by the NTP
     // server; cheap enough to call per request but not called per request, so
@@ -170,9 +290,35 @@ private:
     // young, and the reference timestamp with it.
     double m_lastGoodMeasuredAt = 0.0;
 
+    // --- the failover state machine ---------------------------------------
+    //
+    // Two timers and a latch. The latch is which class is serving; the timers
+    // are how long the condition for changing it has held, because both
+    // directions need hysteresis and they need different amounts of it. See
+    // ClockConfig for why failing over is cheap and failing back is not.
+    bool m_onSecondary = false;
+    double m_primaryLostSince = 0.0;     // 0: the primary has candidates now
+    double m_primaryHealthySince = 0.0;  // 0: it does not
+    // Whether the secondary is being asked to hold connections. Only `cold`
+    // ever sets this false; read by activation() from another thread.
+    bool m_secondaryActive = true;
+    std::string m_activationReason;
+
+    // The smoothed difference between the two classes' consensuses. Kept here
+    // rather than recomputed because it is an average over five minutes and
+    // combine() runs four times a second.
+    struct ClassDeltaState {
+        bool seeded = false;
+        double averagedSec = 0.0;
+        double lastAtSec = 0.0;
+        double firstAtSec = 0.0;
+    };
+    ClassDeltaState m_classDelta;
+
     double m_coastSeconds;
     double m_coastDriftPpm;
     int m_minSources;
+    ClockConfig m_clock;
 };
 
 } // namespace ubersdr_ntp

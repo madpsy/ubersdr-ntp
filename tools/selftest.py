@@ -27,6 +27,10 @@ real failure mode that a clean compile does not rule out:
     still answers while they are open;
   * a source string holding invalid UTF-8 does not kill the HTTP service
     (nlohmann's strict serialiser throws on it, in a detached thread);
+  * with an upstream NTP server as its primary class and no radio at all, it
+    synchronises from that upstream and the reply says so honestly: one stratum
+    below it, the upstream's address as the reference id, and a root delay that
+    is no longer zero;
   * it refuses to be written to -- a POST is answered 405, not 404;
   * it shuts down on SIGTERM without having to be killed.
 
@@ -41,6 +45,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -121,6 +126,68 @@ def ntp_query(port, mode=3, version=4, timeout=2.0):
         'sent_xmt': bytes(pkt[40:48]),
         'raw': data,
     }
+
+
+class FakeUpstream(object):
+    """A minimal NTP server, so the daemon has something real to take time FROM.
+
+    The upstream path cannot be checked against a public server: a test that
+    needs the internet is a test that fails on a build machine without it, and
+    one that needs a public server to be up is a test that fails for reasons
+    that are nobody's fault. Thirty lines of socket here answers mode 3 with a
+    well-formed mode 4, from a clock deliberately offset by a known amount, and
+    the daemon cannot tell the difference.
+    """
+
+    def __init__(self, offset_sec=0.0, stratum=2):
+        self.offset = offset_sec
+        self.stratum = stratum
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self.sock.bind(('127.0.0.1', 0))
+        self.sock.settimeout(0.3)
+        self.port = self.sock.getsockname()[1]
+        self.served = 0
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _stamp(self, buf, at, t):
+        ntp = t + NTP_EPOCH_DELTA
+        struct.pack_into('!II', buf, at, int(ntp), int((ntp % 1) * 2**32))
+
+    def _run(self):
+        while not self._stop:
+            try:
+                data, peer = self.sock.recvfrom(1024)
+            except socket.timeout:
+                continue
+            except OSError:
+                return
+            if len(data) < 48:
+                continue
+            now = time.time() + self.offset
+            out = bytearray(48)
+            out[0] = (0 << 6) | (4 << 3) | 4      # LI 0, version 4, mode 4
+            out[1] = self.stratum
+            out[2] = data[2]
+            out[3] = 0xEC                          # precision, 2^-20
+            struct.pack_into('!I', out, 4, int(0.001 * 65536))   # root delay
+            struct.pack_into('!I', out, 8, int(0.002 * 65536))   # root dispersion
+            out[12:16] = bytes([198, 51, 100, 1])                # its own reference
+            self._stamp(out, 16, now - 1.0)                      # reference timestamp
+            out[24:32] = data[40:48]                             # originate, echoed
+            self._stamp(out, 32, now)                            # receive
+            self._stamp(out, 40, time.time() + self.offset)      # transmit
+            try:
+                self.sock.sendto(bytes(out), peer)
+                self.served += 1
+            except OSError:
+                pass
+
+    def close(self):
+        self._stop = True
+        self._thread.join(timeout=2.0)
+        self.sock.close()
 
 
 def http_get(path, timeout=3.0, port=None):
@@ -530,6 +597,105 @@ def main():
             proc3.wait()
         try:
             os.unlink(path3)
+        except OSError:
+            pass
+
+    # --- taking time FROM an upstream NTP server ----------------------------
+    #
+    # Everything above runs with the radio as the only class, which is the
+    # default and never reaches the second one. This starts the daemon with an
+    # upstream as its PRIMARY -- a fake one on the loopback whose clock is a
+    # known 400 ms fast -- and checks what comes out of the real NTP socket.
+    #
+    # The point is the honesty of the reply, which nothing else here can reach.
+    # A radio clock is stratum 1; a server relaying a stratum-2 upstream is
+    # stratum 3, its reference identifier is that upstream's ADDRESS rather
+    # than four characters naming a radio station, and its root delay stops
+    # being zero because there is now an NTP path above it. Serving stratum 1
+    # off a pool server would be a lie a client would act on.
+    upstream = FakeUpstream(offset_sec=0.400, stratum=2)
+    cfg4 = {
+        'ntp': {'port': free_port(socket.SOCK_DGRAM), 'listen': ['127.0.0.1'],
+                'min_sources': 1},
+        'http': {'enabled': True, 'port': free_port(socket.SOCK_STREAM),
+                 'listen': '127.0.0.1'},
+        'clock': {'primary': 'ntp', 'secondary': 'cold'},
+        'ntp_sources': [{'name': 'fake', 'server': '127.0.0.1', 'port': upstream.port,
+                         'poll_seconds': 8, 'iburst': True}],
+        'log': {'level': 'info'},
+    }
+    fd4, path4 = tempfile.mkstemp(suffix='.json', prefix='ubersdr-ntp-selftest-')
+    with os.fdopen(fd4, 'w') as f:
+        json.dump(cfg4, f)
+    proc4 = subprocess.Popen([binary, '--config', path4],
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        # iburst is six polls two seconds apart and the estimator wants four
+        # samples, so this is about eight seconds; allow plenty.
+        deadline = time.time() + 40
+        served = None
+        while time.time() < deadline and proc4.poll() is None:
+            r = ntp_query(cfg4['ntp']['port'], timeout=1.0)
+            if r and r.get('stratum', 0) not in (0, 16):
+                served = r
+                break
+            time.sleep(0.5)
+
+        check('with no radio at all, an upstream alone synchronises it',
+              served is not None,
+              'still unsynchronised after 40 s (%d polls served)' % upstream.served)
+        if served:
+            # One more than the upstream's own stratum. Not 1.
+            check('it serves one stratum below the upstream, not stratum 1',
+                  served['stratum'] == 3, 'stratum %d' % served['stratum'])
+            check('the leap indicator says synchronised', served['leap'] == 0,
+                  'LI=%d' % served['leap'])
+            # RFC 5905: above stratum 1 the refid is the reference's address.
+            check('the reference id is the upstream address, not a station name',
+                  bytes(served['refid']) == bytes([127, 0, 0, 1]),
+                  '%s' % list(served['refid']))
+            # There is an NTP path above us now, so this cannot be zero.
+            check('root delay is no longer zero: there is a path above it',
+                  served['rootdelay'] > 0.0, '%.4f s' % served['rootdelay'])
+            check('root dispersion is still reported', served['rootdisp'] > 0.0,
+                  '%.4f s' % served['rootdisp'])
+
+        code, body, _ = http_get('/api/status', port=cfg4['http']['port'])
+        try:
+            doc = json.loads(body) if code == 200 else {}
+        except ValueError:
+            doc = {}
+        clock = doc.get('clock', {})
+        check('/api/status reports the clock arrangement',
+              clock.get('primary') == 'ntp' and clock.get('secondary') == 'radio' and
+              clock.get('secondary_mode') == 'cold',
+              json.dumps(clock)[:120])
+        peers = [x for x in doc.get('sources', []) if x.get('kind') == 'ntp']
+        check('/api/status reports the upstream peer with its technical detail',
+              len(peers) == 1 and peers[0].get('ntp', {}).get('stratum') == 2 and
+              peers[0]['ntp'].get('reach', 0) != 0,
+              json.dumps(peers[0].get('ntp', {}) if peers else {})[:160])
+        # The offset it recovered should be the 400 ms that was planted. The
+        # served time is on the daemon clock, so this is checked through the
+        # peer's own reported offset rather than by comparing clocks.
+        if peers:
+            off = peers[0].get('timing', {}).get('clock_offset_ms')
+            check('the peer recovered the planted 400 ms offset',
+                  off is not None and abs(off - 400.0) < 20.0,
+                  '%s ms' % off)
+
+        proc4.send_signal(signal.SIGTERM)
+        proc4.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        proc4.kill()
+        proc4.wait()
+    finally:
+        if proc4.poll() is None:
+            proc4.kill()
+            proc4.wait()
+        upstream.close()
+        try:
+            os.unlink(path4)
         except OSError:
             pass
 

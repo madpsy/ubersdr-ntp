@@ -1,6 +1,7 @@
 #include "Selector.h"
 
 #include "Log.h"
+#include "SampleClock.h"
 
 #include <algorithm>
 #include <cmath>
@@ -54,6 +55,10 @@ constexpr double kReacquireMaxSec = 3600.0;
 
 constexpr const char* kTag = "selector";
 
+// NTP's stratum ceiling. 16 means unsynchronised; anything that would come out
+// at or past it is not a time this server may claim to be serving.
+constexpr int kMaxStratum = 15;
+
 // A source must be judged against at least this many others before its
 // disagreement means anything. Two sources produce equal and opposite
 // residuals whichever of them is wrong, so one peer is not enough to convict.
@@ -88,7 +93,20 @@ struct Candidate {
     double dist;     // half-width of the asserted interval
     double quality;  // the uncertainty that distinguishes it from the others
     double weight;
+    bool primary;    // in the class trusted first
 };
+
+// The median of a set of candidate offsets: the class consensus, and what each
+// member of the class is judged against.
+double medianOffset(const std::vector<Candidate>& v) {
+    if (v.empty()) return 0.0;
+    std::vector<double> all;
+    all.reserve(v.size());
+    for (const Candidate& k : v) all.push_back(k.offset);
+    std::sort(all.begin(), all.end());
+    const std::size_t mid = all.size() / 2;
+    return (all.size() % 2) ? all[mid] : 0.5 * (all[mid - 1] + all[mid]);
+}
 
 std::string format(const char* fmt, ...) {
     char buf[256];
@@ -101,23 +119,66 @@ std::string format(const char* fmt, ...) {
 
 } // namespace
 
-Selector::Selector(double coastSeconds, double coastDriftPpm, int minSources)
+const char* servingClassName(ServingClass c) {
+    switch (c) {
+        case ServingClass::None:      return "none";
+        case ServingClass::Primary:   return "primary";
+        case ServingClass::Secondary: return "secondary";
+        case ServingClass::Both:      return "both";
+        case ServingClass::Coasting:  return "coasting";
+    }
+    return "?";
+}
+
+Selector::Selector(double coastSeconds, double coastDriftPpm, int minSources, ClockConfig clock)
     : m_coastSeconds(coastSeconds),
       m_coastDriftPpm(coastDriftPpm),
-      m_minSources(minSources) {}
+      m_minSources(minSources),
+      m_clock(clock) {
+    // In every mode but cold the secondary is connected from the start, so the
+    // initial state has to say so -- main() asks before the first combine, and
+    // a default of "inactive" would park a standby that was never meant to be.
+    m_secondaryActive = m_clock.secondary != SecondaryMode::Cold;
+    m_activationReason = m_secondaryActive
+                             ? std::string("secondary mode is ") + secondaryModeName(m_clock.secondary)
+                             : "cold standby: the primary sources are healthy";
+}
+
+Selector::Activation Selector::activation() const {
+    std::lock_guard<std::mutex> lk(m_mu);
+    return Activation{m_secondaryActive, m_activationReason};
+}
 
 Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now) {
     Combined c;
 
-    std::vector<Candidate> cand;
+    // Candidates, split by class. Both lists are built the same way and judged
+    // the same way; what differs is who each is compared against, and which of
+    // them is allowed to serve. See the header.
+    std::vector<Candidate> primaryCand, secondaryCand;
+    // Whether a secondary class exists at all, candidate or not. Without this
+    // an install with no secondary configured would be told, while coasting,
+    // that the secondary sources take over in sixty seconds -- which is a
+    // promise nothing can keep and the sort of thing that sends someone
+    // looking for a fault in the wrong place.
+    bool secondaryConfigured = false;
     for (const SourceSnapshot& s : snaps) {
-        if (!s.enabled) { c.notUsedReasons[s.name] = "disabled in the configuration"; continue; }
+        if (!s.primaryClass) secondaryConfigured = true;
+    }
+    for (const SourceSnapshot& s : snaps) {
+        // Whether the source has anything worth considering is the source's own
+        // question, and it answers it in its own vocabulary: a receiver has a
+        // decoder lock and a peer has a reach register, and neither concept
+        // needs to be understood here. What IS decided here is freshness and
+        // whether there is a dispersion to intersect on, because those are
+        // this file's policy rather than the source's.
+        //
         // Most specific first, so the reason names the step that is actually
         // missing rather than a symptom of it: an unlocked decoder also has no
         // offset, and "no offset" would send someone to the wrong place.
         std::string why;
-        if (s.clockState != "locked") {
-            why = "decoder not locked yet";
+        if (!s.ready) {
+            why = s.notReadyReason.empty() ? "not ready" : s.notReadyReason;
         } else if (s.offsetAgeSec > kCandidateMaxAgeSec) {
             why = format("newest measurement is %.0f s old (limit %.0f s)",
                          s.offsetAgeSec, kCandidateMaxAgeSec);
@@ -145,12 +206,32 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         const double staleness = s.offsetAgeSec * (m_coastDriftPpm * 1e-6 + s.offsetRateUncertainty);
         const double quality = (s.weightDispersionSec > 0.0 ? s.weightDispersionSec
                                                             : s.dispersionSec) + staleness;
-        cand.push_back(Candidate{&s, offsetNow, s.dispersionSec + staleness, quality,
-                                 s.weight > 0.0 ? s.weight : 1.0});
+        (s.primaryClass ? primaryCand : secondaryCand)
+            .push_back(Candidate{&s, offsetNow, s.dispersionSec + staleness, quality,
+                                 s.weight > 0.0 ? s.weight : 1.0, s.primaryClass});
     }
-    c.candidates = static_cast<int>(cand.size());
+    c.primaryCandidates = static_cast<int>(primaryCand.size());
+    c.secondaryCandidates = static_cast<int>(secondaryCand.size());
 
     // --- agreement ----------------------------------------------------------
+    //
+    // WITHIN A CLASS, and never across the two. The test below refuses a source
+    // that sits more than 30 ms from its fellows, and the only reason that is a
+    // sound thing to do is that every radio source is hearing ONE transmitter
+    // and ONE second edge: there is no physical arrangement of receivers that
+    // explains more, so a source out there has decoded something else. Two NTP
+    // peers are likewise two views of one hierarchy. But a radio source and an
+    // NTP server share nothing at all -- they are independent measurements of
+    // UTC, and the gap between them is the radio delay model's error, a real
+    // quantity that can honestly exceed 30 ms on a path the model does not fit.
+    // Judged together, a good receiver on a poorly modelled path would be
+    // refused for disagreeing with the network, or worse, a network outage
+    // would look like every NTP peer suddenly agreeing with each other and not
+    // with the radio, and the radio would be the one convicted.
+    //
+    // So this runs twice, over one class each time, and the two never vote on
+    // each other. What the classes say about one another is measured separately
+    // and reported rather than acted on: see classDelta below.
     //
     // Against the median of ALL of them, self included, and not against each
     // source's peers alone. Leave-one-out is the obvious construction and it is
@@ -167,17 +248,14 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
     // measurements of one event can tell you. Hence kMinPeersToJudge.
     std::set<std::string> refused;
     std::map<std::string, std::string> refusalWhy;
-    std::vector<double> all;
-    all.reserve(cand.size());
-    for (const Candidate& k : cand) all.push_back(k.offset);
-    std::sort(all.begin(), all.end());
-    const std::size_t amid = all.size() / 2;
-    const double consensus = all.empty() ? 0.0
-                           : ((all.size() % 2) ? all[amid] : 0.5 * (all[amid - 1] + all[amid]));
+
+    auto judgeClass = [&](const std::vector<Candidate>& cand) {
+    const double consensus = medianOffset(cand);
 
     for (const Candidate& k : cand) {
         SourceResidual r;
         r.name = k.s->name;
+        r.kind = k.s->kind;
         r.instantSec = k.offset - consensus;
         r.peers = static_cast<int>(cand.size()) - 1;
 
@@ -224,8 +302,9 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
                                          kReacquireMaxSec);
             const double refusedFor = now - rq.refusedSinceSec;
             const std::string base =
-                format("refused: %+.0f ms from the other sources (limit ±%.0f ms)",
-                       r.averagedSec * 1000.0, kMaxDisagreementSec * 1000.0);
+                format("refused: %+.0f ms from the other %s sources (limit ±%.0f ms)",
+                       r.averagedSec * 1000.0, sourceKindName(r.kind),
+                       kMaxDisagreementSec * 1000.0);
             if (refusedFor >= wait) {
                 ++rq.count;
                 rq.refusedSinceSec = 0.0;
@@ -254,12 +333,12 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         // out with a single peer each time; a timer that reset on that never
         // reached five minutes in half an hour, and nothing recovered.
         if (r.refused && !it->second.refusalLogged) {
-            LOG_WARN(kTag, "%s disagrees with the other sources by %+.0f ms; "
+            LOG_WARN(kTag, "%s disagrees with the other %s sources by %+.0f ms; "
                      "not a delay model this far out — refusing it",
-                     r.name.c_str(), r.averagedSec * 1000.0);
+                     r.name.c_str(), sourceKindName(r.kind), r.averagedSec * 1000.0);
         } else if (!r.refused && judged && it->second.refusalLogged) {
-            LOG_INFO(kTag, "%s agrees with the other sources again (%+.0f ms); using it",
-                     r.name.c_str(), r.averagedSec * 1000.0);
+            LOG_INFO(kTag, "%s agrees with the other %s sources again (%+.0f ms); using it",
+                     r.name.c_str(), sourceKindName(r.kind), r.averagedSec * 1000.0);
         }
         // "Agrees again" only on a real verdict: a source that merely lost its
         // peers has not agreed with anyone, and saying so every time a third
@@ -267,6 +346,9 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         if (r.refused || judged) it->second.refusalLogged = r.refused;
         c.residuals.push_back(std::move(r));
     }
+    };
+    judgeClass(primaryCand);
+    judgeClass(secondaryCand);
 
     // A source sent back to start over is judged afresh when it returns: its
     // old average describes the lock it is abandoning, and carried over it
@@ -283,7 +365,8 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
     // a source that disagrees is telling you it decoded something else, and
     // learning an offset that makes it agree would turn a detected fault into
     // an undetectable one.
-    if (!refused.empty()) {
+    auto dropRefused = [&](std::vector<Candidate>& cand) {
+        if (refused.empty()) return;
         std::vector<Candidate> kept;
         for (const Candidate& k : cand) {
             if (refused.count(k.s->name)) {
@@ -294,8 +377,183 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
             }
         }
         cand.swap(kept);
-        c.candidates = static_cast<int>(cand.size());
+    };
+    dropRefused(primaryCand);
+    dropRefused(secondaryCand);
+    c.primaryCandidates = static_cast<int>(primaryCand.size());
+    c.secondaryCandidates = static_cast<int>(secondaryCand.size());
+
+    // --- what the two classes say about each other --------------------------
+    //
+    // The one measurement in this program that can see the constants every
+    // radio source shares. The chain delay, the codec delay and the decoder's
+    // edge bias are identical on every receiver, so they cancel exactly in the
+    // residuals above and no number of receivers can measure them; an upstream
+    // NTP server does not share them, so the gap between the two classes'
+    // consensuses contains them.
+    //
+    // Reported, never applied. Correcting the radio to agree with the network
+    // would make the two agree by construction and destroy the only independent
+    // check in the system -- and it would be correcting a stratum-1 radio clock
+    // to match a stratum-2 network one, which is the wrong way round on a
+    // machine whose whole purpose is not depending on that network.
+    if (!primaryCand.empty() && !secondaryCand.empty()) {
+        ClassDelta& d = c.classDelta;
+        d.valid = true;
+        d.primarySources = static_cast<int>(primaryCand.size());
+        d.secondarySources = static_cast<int>(secondaryCand.size());
+        d.instantSec = medianOffset(primaryCand) - medianOffset(secondaryCand);
+        // Smoothed over the same five minutes a source residual is, and for the
+        // same reason: one reading of this is one fade, and the figure is only
+        // interesting as a systematic.
+        if (!m_classDelta.seeded) {
+            m_classDelta.seeded = true;
+            m_classDelta.averagedSec = d.instantSec;
+            m_classDelta.firstAtSec = now;
+        } else {
+            const double dt = now - m_classDelta.lastAtSec;
+            if (dt > 0.0) {
+                const double alpha = 1.0 - std::exp(-dt / kResidualTauSec);
+                m_classDelta.averagedSec += alpha * (d.instantSec - m_classDelta.averagedSec);
+            }
+        }
+        m_classDelta.lastAtSec = now;
+        d.averagedSec = m_classDelta.averagedSec;
+        d.haveAverage = true;
+        d.settledForSec = now - m_classDelta.firstAtSec;
+    } else {
+        // One class is not being measured. The average is not carried across
+        // the gap: a figure resumed from before an outage would describe two
+        // sets of conditions averaged together with nothing to say where one
+        // ended.
+        m_classDelta = ClassDeltaState{};
     }
+
+    // --- which class serves -------------------------------------------------
+    //
+    // See ClockConfig for what the three modes mean and why failing over is
+    // cheap while failing back is not.
+    const bool primaryUsable = static_cast<int>(primaryCand.size()) >= m_minSources &&
+                               !primaryCand.empty();
+    const bool secondaryUsable =
+        static_cast<int>(secondaryCand.size()) >= m_clock.minSecondarySources &&
+        !secondaryCand.empty();
+
+    if (primaryUsable) {
+        if (m_primaryHealthySince <= 0.0) m_primaryHealthySince = now;
+        m_primaryLostSince = 0.0;
+    } else {
+        if (m_primaryLostSince <= 0.0) m_primaryLostSince = now;
+        m_primaryHealthySince = 0.0;
+    }
+
+    std::vector<Candidate> cand;
+    if (m_clock.secondary == SecondaryMode::Always) {
+        // One pool. The intersection then protects the answer against a bad
+        // source of either kind, which is the reason this mode is worth having:
+        // a radio source and an NTP server that agree to a few milliseconds are
+        // a far stronger statement than either alone.
+        cand = primaryCand;
+        cand.insert(cand.end(), secondaryCand.begin(), secondaryCand.end());
+        m_onSecondary = false;
+        m_secondaryActive = true;
+        m_activationReason = "secondary mode is always: both classes contribute";
+    } else {
+        const double lostFor = m_primaryLostSince > 0.0 ? now - m_primaryLostSince : 0.0;
+        const double healthyFor = m_primaryHealthySince > 0.0 ? now - m_primaryHealthySince : 0.0;
+
+        if (!m_onSecondary) {
+            if (!primaryUsable && secondaryUsable && lostFor >= m_clock.failoverAfterSec) {
+                m_onSecondary = true;
+                LOG_WARN(kTag, "failing over to the %s sources: the %s sources have had "
+                         "nothing usable for %.0f s",
+                         sourceKindName(m_clock.primary == SourceKind::Radio ? SourceKind::Ntp
+                                                                             : SourceKind::Radio),
+                         sourceKindName(m_clock.primary), lostFor);
+            } else if (!primaryUsable && secondaryConfigured &&
+                       lostFor >= m_clock.failoverAfterSec) {
+                c.servingNote = "the primary sources have nothing usable and the secondary "
+                                "is not ready either";
+            } else if (!primaryUsable && secondaryConfigured) {
+                c.failoverInSec = std::max(0.0, m_clock.failoverAfterSec - lostFor);
+            }
+        } else {
+            if (primaryUsable && healthyFor >= m_clock.failbackAfterSec) {
+                m_onSecondary = false;
+                LOG_INFO(kTag, "failing back to the %s sources: healthy again for %.0f s",
+                         sourceKindName(m_clock.primary), healthyFor);
+            } else if (primaryUsable) {
+                c.failbackInSec = std::max(0.0, m_clock.failbackAfterSec - healthyFor);
+            }
+        }
+
+        cand = m_onSecondary ? secondaryCand : primaryCand;
+
+        // Whether the secondary should be holding connections at all. Only cold
+        // mode ever says no, and it comes up the MOMENT the primary drops
+        // rather than after the failover hold-down: acquiring takes minutes, so
+        // waiting a minute before starting would spend the hold-down doing
+        // nothing. It stays up until the primary has proven itself for the full
+        // failback interval, so a receiver that re-locks and loses it again
+        // does not tear the standby down between attempts.
+        if (m_clock.secondary == SecondaryMode::Cold) {
+            // Three ways to be up, and the third is hysteretic ON m_secondaryActive
+            // rather than on the clock alone. Without that qualifier the
+            // settling clause is also true at startup -- the primary has been
+            // healthy for less than the failback interval because the daemon
+            // has only just begun -- and a cold standby would connect for five
+            // minutes on every start, which is the one thing the mode exists
+            // to avoid. It must mean "it is already up, hold it there", not
+            // "the primary has not been up long".
+            const bool want = m_onSecondary || !primaryUsable ||
+                              (m_secondaryActive && m_primaryHealthySince > 0.0 &&
+                               healthyFor < m_clock.failbackAfterSec);
+            if (want != m_secondaryActive) {
+                LOG_INFO(kTag, "%s the %s standby", want ? "bringing up" : "standing down",
+                         sourceKindName(m_clock.primary == SourceKind::Radio ? SourceKind::Ntp
+                                                                             : SourceKind::Radio));
+            }
+            m_secondaryActive = want;
+            m_activationReason =
+                want ? (m_onSecondary ? "serving: the primary sources have nothing usable"
+                                      : "warming up: the primary sources have nothing usable")
+                     : format("cold standby: the primary sources are healthy%s",
+                              healthyFor > 0.0 ? format(" (%.0f s)", healthyFor).c_str() : "");
+        } else {
+            m_secondaryActive = true;
+            m_activationReason = "secondary mode is standby: measured continuously, "
+                                 "held out of the served time while the primary is healthy";
+        }
+
+        // Held-out secondary candidates are healthy and should not look as
+        // though something is wrong with them.
+        if (!m_onSecondary) {
+            for (const Candidate& k : secondaryCand) {
+                c.notUsedReasons[k.s->name] =
+                    format("healthy, standing by: the %s sources are serving",
+                           sourceKindName(m_clock.primary));
+            }
+        } else {
+            for (const Candidate& k : primaryCand) {
+                c.notUsedReasons[k.s->name] =
+                    c.failbackInSec > 0.0
+                        ? format("healthy again, taking back in %.0f s — held off that long so "
+                                 "a source that keeps re-locking cannot step the clock each time",
+                                 c.failbackInSec)
+                        : std::string("recovering: it must stay healthy for a while before it "
+                                      "takes back");
+            }
+        }
+    }
+    c.candidates = static_cast<int>(cand.size());
+
+    // The minimum that must agree. min_sources governs the primary class; a set
+    // made entirely of secondary sources answers to the secondary's own figure,
+    // because "two receivers must agree" is a statement about receivers and
+    // cannot be satisfied, or meaningfully applied, by one NTP server.
+    bool anyPrimary = false;
+    for (const Candidate& k : cand) if (k.primary) anyPrimary = true;
+    const int minToServe = anyPrimary ? m_minSources : m_clock.minSecondarySources;
 
     // --- Marzullo / Mills intersection -------------------------------------
     //
@@ -341,7 +599,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         }
     }
 
-    if (static_cast<int>(survivors.size()) >= m_minSources && !survivors.empty()) {
+    if (static_cast<int>(survivors.size()) >= minToServe && !survivors.empty()) {
         // --- weighted combine ----------------------------------------------
         // Weighted by the part of each source's uncertainty that is its own,
         // not by the interval it asserts: the asserted interval carries the
@@ -410,14 +668,74 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         c.ageSec = newest;
         c.used = static_cast<int>(survivors.size());
 
-        // The station tag of the best-measured survivor -- by the same figure
-        // that decides the weighting, since it is the same question. On the
-        // frequencies WWV and WWVH share, which one is being heard genuinely
-        // changes through the day, so this follows the decoder rather than the
-        // configuration.
+        // --- stratum, root delay and the reference identifier ---------------
+        //
+        // NTP's own rule: one more than the lowest stratum among the survivors.
+        // A radio source is a REFERENCE rather than a server, so it counts as
+        // stratum 0 and serving from one is stratum 1; an upstream at stratum 2
+        // makes this stratum 3. A mixed set comes out at 1 because a radio
+        // reference really is in it, which is what NTP would say of any server
+        // with a refclock among its selected peers.
+        //
+        // This is the field a client uses to decide how much of the tree it is
+        // trusting, so getting it right is not cosmetic. Serving stratum 1 off
+        // a pool server would be a lie of exactly the kind the rest of this
+        // program takes trouble to avoid.
+        int lowest = 16;
+        bool anyRadioSurvivor = false;
+        for (const Candidate& k : survivors) {
+            if (k.s->kind == SourceKind::Radio) { lowest = 0; anyRadioSurvivor = true; }
+            else lowest = std::min(lowest, k.s->ntp.stratum);
+        }
+        c.stratum = std::clamp(lowest + 1, 1, kMaxStratum);
+
+        // The tightest survivor -- by the same figure that decides the
+        // weighting, since it is the same question -- names the reference.
         const Candidate* tightest = &survivors.front();
         for (const Candidate& k : survivors) if (k.quality < tightest->quality) tightest = &k;
-        c.refid = refidFor(tightest->s->station);
+
+        if (anyRadioSurvivor) {
+            // A radio survivor makes this a stratum-1 radio clock, so the refid
+            // is the station's registered identifier and the root delay is
+            // genuinely zero: there is no NTP path above us. On the frequencies
+            // WWV and WWVH share, which one is being heard genuinely changes
+            // through the day, so the tag follows the decoder rather than the
+            // configuration -- and the tightest survivor is picked from among
+            // the RADIO ones, since an upstream has no station to name.
+            const Candidate* tightestRadio = nullptr;
+            for (const Candidate& k : survivors) {
+                if (k.s->kind != SourceKind::Radio) continue;
+                if (!tightestRadio || k.quality < tightestRadio->quality) tightestRadio = &k;
+            }
+            c.refid = refidFor(tightestRadio->s->station);
+            c.refidIsAddress = false;
+            c.refidAddress = 0;
+            c.rootDelaySec = 0.0;
+        } else {
+            // Serving from upstreams alone. RFC 5905 wants the reference's
+            // address in the refid above stratum 1, and the root delay is the
+            // whole path back to the primary reference: what the upstream
+            // claimed, plus the round trip to it.
+            // The address, without the port: a reference identifier names a
+            // machine, and "192.0.2.1:123" is not one.
+            c.refid = tightest->s->ntp.addressHost.empty() ? tightest->s->ntp.server
+                                                           : tightest->s->ntp.addressHost;
+            c.refidIsAddress = true;
+            c.refidAddress = tightest->s->ntp.addressRefid;
+            c.rootDelaySec = tightest->s->ntp.rootDelaySec + tightest->s->ntp.delaySec;
+        }
+
+        // Which class the answer came from, for the status page and the log.
+        bool anyPrimarySurvivor = false, anySecondarySurvivor = false;
+        for (const Candidate& k : survivors) (k.primary ? anyPrimarySurvivor : anySecondarySurvivor) = true;
+        c.serving = anyPrimarySurvivor && anySecondarySurvivor ? ServingClass::Both
+                  : anyPrimarySurvivor                         ? ServingClass::Primary
+                                                               : ServingClass::Secondary;
+        if (c.serving == ServingClass::Secondary && m_clock.secondary != SecondaryMode::Always) {
+            c.servingNote = format("failed over: serving from the %s sources",
+                                   sourceKindName(m_clock.primary == SourceKind::Radio
+                                                      ? SourceKind::Ntp : SourceKind::Radio));
+        }
 
         // A leap warning is honoured only if every survivor agrees. One
         // receiver decoding the bit wrongly would otherwise announce a leap
@@ -443,8 +761,8 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
     // not look like it is their fault.
     for (const Candidate& k : survivors) {
         c.notUsedReasons[k.s->name] =
-            format("healthy, but only %d source(s) agree and min_sources is %d",
-                   static_cast<int>(survivors.size()), m_minSources);
+            format("healthy, but only %d source(s) agree and the minimum is %d",
+                   static_cast<int>(survivors.size()), minToServe);
     }
     std::lock_guard<std::mutex> lk(m_mu);
     if (m_haveLast) {
@@ -464,12 +782,29 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         c.hostOffsetSec = c.offsetSec + daemonMinusRealtime();
         c.dispersionSec = m_lastGoodDispersion + age * (m_coastDriftPpm * 1e-6 + m_lastGoodRateUncertainty);
         c.ageSec = now - m_lastGoodMeasuredAt;
+        // The reference is still the one the last good offset came from: this
+        // IS that offset, extrapolated, so naming anything else would attribute
+        // it to a source that did not produce it. Stratum and root delay travel
+        // with it for the same reason -- a coasted answer that came from an
+        // upstream is still that upstream's, however stale.
         c.refid = m_last.refid;
+        c.refidIsAddress = m_last.refidIsAddress;
+        c.refidAddress = m_last.refidAddress;
+        c.stratum = m_last.stratum;
+        c.rootDelaySec = m_last.rootDelaySec;
+        c.serving = ServingClass::Coasting;
         if (age <= m_coastSeconds) {
             c.synchronised = true;
             c.used = 0;
             c.note = cand.empty() ? "coasting: no source has a lock"
                                   : "coasting: no set of sources agreed";
+            // Coasting past a failover that has not happened yet is worth
+            // saying, because it is the one state where the answer is getting
+            // worse on purpose while a fix is already scheduled.
+            if (c.failoverInSec > 0.0) {
+                c.note += format("; the secondary sources take over in %.0f s",
+                                 c.failoverInSec);
+            }
         } else {
             c.synchronised = false;
             c.note = "unsynchronised: no lock for longer than the coast limit";
@@ -484,6 +819,8 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         c.atSec = now;
         c.note = cand.empty() ? "no source has produced a timestamp yet"
                               : "no set of sources agreed";
+        c.serving = ServingClass::None;
+        c.stratum = 16;
     }
 
     c.candidates = static_cast<int>(cand.size());

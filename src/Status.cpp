@@ -42,6 +42,9 @@ std::string f2(double v, int prec = 2) {
 // otherwise, and the stages after the first failure cannot pass while it is
 // down, so only the first is worth acting on.
 const char* funnelStage(const SourceSnapshot& s) {
+    // An upstream peer has no funnel: it is reachable or it is not, and the
+    // stages below all name parts of a radio receiver it does not have.
+    if (s.kind == SourceKind::Ntp) return s.clockState.c_str();
     if (s.clockState == "stopped") return "no audio";
     if (!s.toneDetected) return "no tick";
     if (!s.phaseLocked) return "no edge";
@@ -90,8 +93,9 @@ std::string renderTimeJson(const Combined& c, double receiveDaemonSec,
     const double xmit = c.utcAt(now);
 
     j["synchronised"] = c.synchronised;
-    j["stratum"] = c.synchronised ? 1 : 16;
+    j["stratum"] = c.synchronised ? c.stratum : 16;
     j["refid"] = c.refid;
+    j["root_delay_ms"] = c.rootDelaySec * 1000.0;
     j["leap_pending"] = c.leapPending;
 
     // Present even when unsynchronised, because "here is my best guess and
@@ -127,19 +131,28 @@ std::string renderTimeJson(const Combined& c, double receiveDaemonSec,
 }
 
 std::string renderStatusLine(const StatusInput& in) {
-    int locked = 0;
-    for (const SourceSnapshot& s : in.sources) if (s.clockState == "locked") ++locked;
+    // Ready, not locked: "locked" is a decoder's word and half the sources may
+    // not have a decoder. Ready is the question both kinds answer.
+    int ready = 0;
+    for (const SourceSnapshot& s : in.sources) if (s.ready) ++ready;
 
     std::ostringstream o;
     if (in.combined.synchronised) {
-        o << "synchronised, offset " << formatOffsetMs(in.combined.hostOffsetSec)
+        o << "synchronised, stratum " << in.combined.stratum
+          << ", offset " << formatOffsetMs(in.combined.hostOffsetSec)
           << " +/- " << f2(in.combined.dispersionSec * 1000.0, 1) << " ms";
     } else {
         o << "UNSYNCHRONISED";
         if (!in.combined.note.empty()) o << " (" << in.combined.note << ")";
     }
-    o << "; " << locked << "/" << in.sources.size() << " sources locked, "
+    o << "; " << ready << "/" << in.sources.size() << " sources ready, "
       << in.combined.used << " in use";
+    // Which class the answer came from, when that is not simply the primary.
+    if (in.combined.serving == ServingClass::Secondary) {
+        o << " [FAILED OVER to " << sourceKindName(in.secondaryKind) << "]";
+    } else if (in.combined.serving == ServingClass::Both) {
+        o << " (radio and ntp)";
+    }
     return o.str();
 }
 
@@ -149,10 +162,13 @@ std::string renderStatusBlock(const StatusInput& in) {
     // --- the served answer, first, because it is the product --------------
     o << "served time: ";
     if (in.combined.synchronised) {
-        o << "stratum 1 (" << in.combined.refid << "), offset "
+        o << "stratum " << in.combined.stratum << " (" << in.combined.refid << "), offset "
           << formatOffsetMs(in.combined.hostOffsetSec) << " to this host"
-          << ", root dispersion " << f2(in.combined.dispersionSec * 1000.0, 1) << " ms"
-          << ", from " << in.combined.used << " of " << in.combined.candidates << " candidate(s)"
+          << ", root dispersion " << f2(in.combined.dispersionSec * 1000.0, 1) << " ms";
+        if (in.combined.rootDelaySec > 0.0) {
+            o << ", root delay " << f2(in.combined.rootDelaySec * 1000.0, 1) << " ms";
+        }
+        o << ", from " << in.combined.used << " of " << in.combined.candidates << " candidate(s)"
           << ", " << formatDuration(in.combined.ageSec) << " old";
     } else {
         o << "UNSYNCHRONISED (stratum 16)";
@@ -180,6 +196,50 @@ std::string renderStatusBlock(const StatusInput& in) {
     }
     o << '\n';
 
+    // --- the two classes ----------------------------------------------------
+    o << "clock: primary is " << sourceKindName(in.primaryKind)
+      << " (" << in.combined.primaryCandidates << " candidate(s)), "
+      << sourceKindName(in.secondaryKind) << " is "
+      << secondaryModeName(in.secondaryMode)
+      << " (" << in.combined.secondaryCandidates << " candidate(s))";
+    o << "\n       serving from: " << servingClassName(in.combined.serving);
+    if (!in.combined.servingNote.empty()) o << " — " << in.combined.servingNote;
+    if (in.combined.failoverInSec > 0.0) {
+        o << "\n       FAILING OVER to the " << sourceKindName(in.secondaryKind)
+          << " sources in " << f2(in.combined.failoverInSec, 0) << " s "
+          << "unless the " << sourceKindName(in.primaryKind) << " sources recover";
+    }
+    if (in.combined.failbackInSec > 0.0) {
+        o << "\n       failing back to the " << sourceKindName(in.primaryKind)
+          << " sources in " << f2(in.combined.failbackInSec, 0) << " s "
+          << "if they stay healthy";
+    }
+    if (in.secondaryMode == SecondaryMode::Cold) {
+        o << "\n       " << sourceKindName(in.secondaryKind) << " standby is "
+          << (in.secondaryActive ? "UP" : "down");
+        if (!in.secondaryActiveReason.empty()) o << " — " << in.secondaryActiveReason;
+    }
+
+    // The difference between the two classes. This is the interesting number:
+    // see Selector.h. It is a measurement of the delay-model constants every
+    // radio source shares, which nothing else in this program can see.
+    if (in.combined.classDelta.valid) {
+        const ClassDelta& d = in.combined.classDelta;
+        o << "\n       " << sourceKindName(in.primaryKind) << " minus "
+          << sourceKindName(in.secondaryKind) << ": " << formatOffsetMs(d.averagedSec)
+          << " averaged (" << formatOffsetMs(d.instantSec) << " now)"
+          << ", over " << formatDuration(d.settledForSec)
+          << ", " << d.primarySources << " vs " << d.secondarySources << " source(s)";
+        if (in.primaryKind == SourceKind::Radio) {
+            o << "\n       "
+              << "  — the radio delay model's absolute error, which no number of "
+                 "receivers can measure. Reported, never applied.";
+        }
+    } else if (in.combined.primaryCandidates > 0 || in.combined.secondaryCandidates > 0) {
+        o << "\n       no cross-class comparison: only one class has a candidate";
+    }
+    o << '\n';
+
     if (in.combined.residuals.size() >= 2) {
         o << "agreement: ";
         bool first = true;
@@ -189,7 +249,9 @@ std::string renderStatusBlock(const StatusInput& in) {
             o << r.name << ' ' << formatOffsetMs(r.averagedSec);
             if (r.refused) o << " REFUSED";
         }
-        o << "   (each against its peers — same transmitter, so this is model error)\n";
+        o << "\n           (each against the others IN ITS OWN CLASS: radio sources hear one\n"
+             "            transmitter and one second edge, so that residual is model error;\n"
+             "            the two classes are compared above and never judge each other)\n";
     }
 
     o << "ntp :123 -> " << in.ntpPort << ": " << in.ntp.requests << " requests, "
@@ -205,31 +267,77 @@ std::string renderStatusBlock(const StatusInput& in) {
     // whether the decoder has a signal, where in the funnel it is, and only
     // then what time it thinks it is. Reading left to right is reading the
     // failure path.
-    char head[256];
-    std::snprintf(head, sizeof head,
-                  "%-14s %-10s %-6s %-9s %-10s %6s %5s %7s %11s %9s %7s",
-                  "source", "link", "stn", "state", "stage", "tickdB", "vote",
-                  "qual", "offset", "disp", "n");
-    o << head << '\n';
-    o << std::string(std::strlen(head), '-') << '\n';
-
+    // Two tables rather than one. The columns that matter differ completely --
+    // a tick SNR and a vote count say nothing about an upstream server, and a
+    // stratum and a reach register say nothing about a receiver -- and a single
+    // table would be two thirds dashes whichever way it was written.
+    int radioCount = 0, ntpCount = 0;
     for (const SourceSnapshot& s : in.sources) {
-        char row[320];
-        std::snprintf(row, sizeof row,
-                      "%-14s %-10s %-6s %-9s %-10s %6s %5s %7s %11s %9s %7d",
-                      s.name.c_str(),
-                      linkStateName(s.link),
-                      s.station.c_str(),
-                      s.clockState.c_str(),
-                      funnelStage(s),
-                      s.clockState == "stopped" ? "-" : f2(s.toneSnrDb, 1).c_str(),
-                      s.windowSize > 0 ? (std::to_string(s.framesInWindow) + "/" +
-                                          std::to_string(s.windowSize)).c_str() : "-",
-                      s.lastQuality > 0 ? (std::to_string(s.lastQuality) + "%").c_str() : "-",
-                      s.haveOffset ? formatOffsetMs(s.hostOffsetSec).c_str() : "-",
-                      s.haveOffset ? (f2(s.dispersionSec * 1000.0, 1) + "ms").c_str() : "-",
-                      s.offsetSamples);
-        o << row << '\n';
+        (s.kind == SourceKind::Radio ? radioCount : ntpCount)++;
+    }
+
+    if (radioCount > 0) {
+        char head[256];
+        std::snprintf(head, sizeof head,
+                      "%-14s %-10s %-6s %-9s %-10s %6s %5s %7s %11s %9s %7s",
+                      "radio source", "link", "stn", "state", "stage", "tickdB", "vote",
+                      "qual", "offset", "disp", "n");
+        o << head << '\n';
+        o << std::string(std::strlen(head), '-') << '\n';
+
+        for (const SourceSnapshot& s : in.sources) {
+            if (s.kind != SourceKind::Radio) continue;
+            char row[320];
+            std::snprintf(row, sizeof row,
+                          "%-14s %-10s %-6s %-9s %-10s %6s %5s %7s %11s %9s %7d",
+                          s.name.c_str(),
+                          linkStateName(s.link),
+                          s.station.c_str(),
+                          s.clockState.c_str(),
+                          funnelStage(s),
+                          s.clockState == "stopped" ? "-" : f2(s.toneSnrDb, 1).c_str(),
+                          s.windowSize > 0 ? (std::to_string(s.framesInWindow) + "/" +
+                                              std::to_string(s.windowSize)).c_str() : "-",
+                          s.lastQuality > 0 ? (std::to_string(s.lastQuality) + "%").c_str() : "-",
+                          s.haveOffset ? formatOffsetMs(s.hostOffsetSec).c_str() : "-",
+                          s.haveOffset ? (f2(s.dispersionSec * 1000.0, 1) + "ms").c_str() : "-",
+                          s.offsetSamples);
+            o << row << '\n';
+        }
+    }
+
+    if (ntpCount > 0) {
+        if (radioCount > 0) o << '\n';
+        char head[256];
+        std::snprintf(head, sizeof head,
+                      "%-14s %-11s %3s %-15s %5s %7s %8s %11s %9s %7s",
+                      "ntp source", "state", "st", "refid", "reach", "poll", "delay",
+                      "offset", "disp", "n");
+        o << head << '\n';
+        o << std::string(std::strlen(head), '-') << '\n';
+
+        for (const SourceSnapshot& s : in.sources) {
+            if (s.kind != SourceKind::Ntp) continue;
+            // Reach as a three-digit octal byte, which is how every other NTP
+            // implementation prints it and therefore how people read it: 377
+            // is eight polls out of eight.
+            char reach[8];
+            std::snprintf(reach, sizeof reach, "%03o", s.ntp.reach);
+            char row[320];
+            std::snprintf(row, sizeof row,
+                          "%-14s %-11s %3d %-15s %5s %7s %8s %11s %9s %7d",
+                          s.name.c_str(),
+                          s.clockState.c_str(),
+                          s.ntp.stratum,
+                          s.ntp.refid.empty() ? "-" : s.ntp.refid.c_str(),
+                          reach,
+                          (f2(s.ntp.pollSec, 0) + "s").c_str(),
+                          s.ntp.delaySec > 0.0 ? (f2(s.ntp.delaySec * 1000.0, 1) + "ms").c_str() : "-",
+                          s.haveOffset ? formatOffsetMs(s.hostOffsetSec).c_str() : "-",
+                          s.haveOffset ? (f2(s.dispersionSec * 1000.0, 1) + "ms").c_str() : "-",
+                          s.offsetSamples);
+            o << row << '\n';
+        }
     }
 
     // --- per-source detail -------------------------------------------------
@@ -239,6 +347,83 @@ std::string renderStatusBlock(const StatusInput& in) {
     // disagrees with the others by 20 ms is almost always a delay model that
     // is wrong rather than a decoder that is.
     for (const SourceSnapshot& s : in.sources) {
+        if (s.kind == SourceKind::Ntp) {
+            const NtpPeerInfo& n = s.ntp;
+            o << '\n' << s.name << ":  " << n.server << ':' << n.port;
+            // Only when it tells you something: a literal address resolves to
+            // itself, and "1.2.3.4:123 -> 1.2.3.4:123" is noise.
+            if (!n.address.empty() && n.address != n.server + ":" + std::to_string(n.port)) {
+                o << "  -> " << n.address;
+            }
+            o << "  [" << sourceKindName(s.kind)
+              << (s.primaryClass ? ", primary]" : ", secondary]") << '\n';
+
+            char reach[8];
+            std::snprintf(reach, sizeof reach, "%03o", n.reach);
+            o << "    peer:   " << s.clockState << ", reach " << reach
+              << ", polled every " << f2(n.pollSec, 0) << " s"
+              << ", " << n.sent << " sent / " << n.received << " answered";
+            if (n.rejected) o << " / " << n.rejected << " refused";
+            if (n.spikes) o << " / " << n.spikes << " dropped as delay spikes";
+            if (s.reacquisitions) o << ", started over " << s.reacquisitions << " time(s)";
+            o << '\n';
+            if (!s.ready && !s.notReadyReason.empty()) {
+                o << "            not ready: " << s.notReadyReason << '\n';
+            }
+            if (!n.lastRejectReason.empty()) {
+                o << "            last refusal: " << n.lastRejectReason << '\n';
+            }
+            if (!n.kissCode.empty()) {
+                o << "            kiss-o'-death " << n.kissCode
+                  << (n.stopped ? " — not polling it again" : "") << '\n';
+            }
+
+            if (n.received > 0) {
+                o << "    server: stratum " << n.stratum << ", refid " << n.refid
+                  << ", root delay " << f2(n.rootDelaySec * 1000.0, 1) << " ms"
+                  << ", root dispersion " << f2(n.rootDispersionSec * 1000.0, 1) << " ms"
+                  << ", precision " << f2(n.serverPrecisionSec * 1e6, 1) << " us";
+                if (n.leap == 1) o << ", LEAP SECOND PENDING (insertion)";
+                else if (n.leap == 2) o << ", LEAP SECOND PENDING (deletion)";
+                o << '\n';
+                o << "            root distance " << f2(n.rootDistanceSec * 1000.0, 1)
+                  << " ms of " << f2(n.maxRootDistanceSec * 1000.0, 0)
+                  << " ms allowed — how far IT is from ITS reference, "
+                     "which nothing here improves on\n";
+            }
+
+            if (s.haveOffset) {
+                o << "    timing: offset " << formatOffsetMs(s.hostOffsetSec)
+                  << " +/- " << f2(s.dispersionSec * 1000.0, 1) << " ms"
+                  << " (jitter " << f2(s.jitterSec * 1000.0, 1) << " ms"
+                  << ", " << s.offsetSamples << " samples, newest "
+                  << formatDuration(s.offsetAgeSec) << " old)"
+                  << ", worth " << f2(s.weightDispersionSec * 1000.0, 1)
+                  << " ms against the others\n";
+                o << "            rate " << f2(s.offsetRate * 1e6, 1) << " ppm";
+                if (s.offsetRateMeasured) {
+                    o << " +/- " << f2(s.offsetRateUncertainty * 1e6, 1) << " over "
+                      << formatDuration(s.offsetRateSpanSec);
+                } else {
+                    o << " assumed (not yet measured, up to "
+                      << f2(s.offsetRateUncertainty * 1e6, 0) << ")";
+                }
+                o << ", worth " << f2(s.rateTermSec * 1000.0, 2) << " ms\n";
+            } else {
+                o << "    timing: no usable offset yet\n";
+            }
+
+            o << "    path:   round trip " << f2(n.delaySec * 1000.0, 2) << " ms"
+              << " (filter jitter " << f2(n.filterJitterSec * 1000.0, 2) << " ms"
+              << ", best of " << 8 << ")"
+              << ", halved to " << f2(s.networkSec * 1000.0, 2) << " ms one way";
+            if (s.extraSec != 0.0) {
+                o << " + " << f2(s.extraSec * 1000.0, 2) << " ms configured asymmetry";
+            }
+            o << '\n';
+            continue;
+        }
+
         o << '\n' << s.name << ":  " << s.url << "  dial " << f2(s.dialHz / 1e6, 6)
           << " MHz (carrier " << f2(s.carrierHz / 1e6, 3) << " MHz), "
           << formatName(s.format);
@@ -351,8 +536,10 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
     json served;
     served["synchronised"] = in.combined.synchronised;
     served["valid"] = in.combined.valid;
-    served["stratum"] = in.combined.synchronised ? 1 : 16;
+    served["stratum"] = in.combined.synchronised ? in.combined.stratum : 16;
     served["refid"] = in.combined.refid;
+    served["refid_is_address"] = in.combined.refidIsAddress;
+    served["root_delay_ms"] = in.combined.rootDelaySec * 1000.0;
     // The correction this host would need; the served time itself is formed
     // from the daemon clock, which clock_offset_ms and clock_rate_ppm describe.
     served["offset_ms"] = in.combined.hostOffsetSec * 1000.0;
@@ -365,12 +552,51 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         json ag = json::array();
         for (const SourceResidual& r : in.combined.residuals) {
             ag.push_back({{"name", r.name},
+                          {"kind", sourceKindName(r.kind)},
                           {"residual_ms", r.averagedSec * 1000.0},
                           {"instant_ms", r.instantSec * 1000.0},
                           {"peers", r.peers},
+                          {"settled_for_seconds", r.settledForSec},
                           {"refused", r.refused}});
         }
         served["agreement"] = std::move(ag);
+    }
+
+    // --- the two classes ----------------------------------------------------
+    {
+        json k;
+        k["primary"] = sourceKindName(in.primaryKind);
+        k["secondary"] = sourceKindName(in.secondaryKind);
+        k["secondary_mode"] = secondaryModeName(in.secondaryMode);
+        k["secondary_active"] = in.secondaryActive;
+        k["secondary_active_reason"] = in.secondaryActiveReason;
+        k["serving"] = servingClassName(in.combined.serving);
+        k["serving_note"] = in.combined.servingNote;
+        k["primary_candidates"] = in.combined.primaryCandidates;
+        k["secondary_candidates"] = in.combined.secondaryCandidates;
+        // 0 means no swap is pending, which is not the same as "about to
+        // happen now" -- null says so rather than making a reader guess.
+        k["failover_in_seconds"] = in.combined.failoverInSec > 0.0
+                                       ? json(in.combined.failoverInSec) : json(nullptr);
+        k["failback_in_seconds"] = in.combined.failbackInSec > 0.0
+                                       ? json(in.combined.failbackInSec) : json(nullptr);
+
+        // The difference between the two classes: see Selector.h. With the
+        // radio as primary this is a direct measurement of the delay-model
+        // constants every receiver shares, which no arrangement of receivers
+        // can see. Reported, never applied.
+        const ClassDelta& d = in.combined.classDelta;
+        json cd;
+        cd["valid"] = d.valid;
+        if (d.valid) {
+            cd["delta_ms"] = d.averagedSec * 1000.0;
+            cd["instant_ms"] = d.instantSec * 1000.0;
+            cd["settled_for_seconds"] = d.settledForSec;
+            cd["primary_sources"] = d.primarySources;
+            cd["secondary_sources"] = d.secondarySources;
+        }
+        k["class_delta"] = std::move(cd);
+        j["clock"] = std::move(k);
     }
     served["age_seconds"] = in.combined.ageSec;
     served["sources_used"] = in.combined.used;
@@ -401,8 +627,15 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
     for (const SourceSnapshot& s : in.sources) {
         json o;
         o["name"] = s.name;
+        o["kind"] = sourceKindName(s.kind);
+        o["primary_class"] = s.primaryClass;
         o["url"] = s.url;
         o["enabled"] = s.enabled;
+        o["active"] = s.active;
+        o["active_reason"] = s.activeReason;
+        // The one question both kinds answer, and the one the Selector asks.
+        o["ready"] = s.ready;
+        o["not_ready_reason"] = s.notReadyReason;
         o["receiver_name"] = s.receiverName;
         o["carrier_hz"] = s.carrierHz;
         o["dial_hz"] = s.dialHz;
@@ -511,6 +744,47 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         sc["slope_held"] = s.clockSlopeHeld;
         sc["last_excess_delay_ms"] = s.lastExcessDelaySec * 1000.0;
         o["sample_clock"] = std::move(sc);
+
+        // Present only for an upstream peer: for a receiver every field in it
+        // would be a zero that a reader could mistake for a measurement.
+        if (s.kind == SourceKind::Ntp) {
+            const NtpPeerInfo& n = s.ntp;
+            json p;
+            p["server"] = n.server;
+            p["address"] = n.address;
+            p["address_host"] = n.addressHost;
+            p["port"] = n.port;
+            p["stratum"] = n.stratum;
+            p["refid"] = n.refid;
+            p["leap"] = n.leap;
+            p["root_delay_ms"] = n.rootDelaySec * 1000.0;
+            p["root_dispersion_ms"] = n.rootDispersionSec * 1000.0;
+            p["root_distance_ms"] = n.rootDistanceSec * 1000.0;
+            p["server_precision_us"] = n.serverPrecisionSec * 1e6;
+            p["poll_seconds"] = n.pollSec;
+            p["delay_ms"] = n.delaySec * 1000.0;
+            p["filter_jitter_ms"] = n.filterJitterSec * 1000.0;
+            p["reach"] = n.reach;
+            // The octal byte every other NTP implementation prints, because
+            // that is the form people recognise: 377 is eight polls of eight.
+            {
+                char b[8];
+                std::snprintf(b, sizeof b, "%03o", n.reach);
+                p["reach_octal"] = b;
+            }
+            p["last_reply_age_seconds"] = n.lastReplyAgeSec;
+            p["sent"] = n.sent;
+            p["received"] = n.received;
+            p["rejected"] = n.rejected;
+            p["spikes"] = n.spikes;
+            p["max_root_distance_ms"] = n.maxRootDistanceSec * 1000.0;
+            p["max_stratum"] = n.maxStratum;
+            p["configured_poll_seconds"] = n.configuredPollSec;
+            p["last_reject_reason"] = n.lastRejectReason;
+            p["kiss_code"] = n.kissCode;
+            p["stopped"] = n.stopped;
+            o["ntp"] = std::move(p);
+        }
 
         arr.push_back(std::move(o));
     }

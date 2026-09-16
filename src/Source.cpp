@@ -343,7 +343,49 @@ void Source::supervise() {
         return false;
     };
 
+    // Whether the last pass through this loop found the source held inactive,
+    // so the timing is thrown away once on the way down rather than every
+    // second for as long as it sits there.
+    bool wasInactive = false;
+
     while (m_running.load()) {
+        // Cold standby. Nothing is connected while the Selector says this class
+        // is not needed: a long-lived UberSDR session occupies a listener slot
+        // on a receiver that may not be ours, and holding one open to decode
+        // audio nobody is going to use is the one cost this mode exists to
+        // avoid. The timing goes with it -- an offset measured before an
+        // arbitrarily long idle period describes a sample clock that no longer
+        // exists, and carrying it forward would let a stale figure serve the
+        // moment the source came back.
+        if (!m_active.load()) {
+            if (!wasInactive) {
+                wasInactive = true;
+                discardTiming("held inactive");
+                std::string why;
+                {
+                    std::lock_guard<std::mutex> lk(m_mu);
+                    why = m_activeReason;
+                    m_snap.link = LinkState::Idle;
+                    m_snap.linkDetail = why.empty() ? "held in cold standby" : why;
+                    m_linkSince = monotonicNow();
+                }
+                LOG_INFO(tag, "idle: %s", why.empty() ? "held in cold standby" : why.c_str());
+            }
+            std::unique_lock<std::mutex> lk(m_wake);
+            m_wakeCv.wait_for(lk, std::chrono::seconds(1),
+                              [this] { return !m_running.load() || m_active.load(); });
+            continue;
+        }
+        if (wasInactive) {
+            wasInactive = false;
+            // A source coming up from cold starts the backoff over: it has not
+            // failed at anything, and inheriting a backoff from before it was
+            // put away would delay exactly the connection that is now urgent.
+            consecutiveFailures = 0;
+            backoff = kBackoffMin;
+            LOG_INFO(tag, "brought up from cold standby — acquiring from nothing");
+        }
+
         {
             std::lock_guard<std::mutex> lk(m_mu);
             m_snap.link = LinkState::Connecting;
@@ -450,9 +492,17 @@ void Source::supervise() {
             {
                 std::unique_lock<std::mutex> lk(m_wake);
                 m_wakeCv.wait_for(lk, std::chrono::seconds(1),
-                                  [this] { return !m_running.load(); });
+                                  [this] { return !m_running.load() || !m_active.load(); });
             }
             if (!m_running.load()) break;
+            // Put away while streaming. Breaking here rather than stopping the
+            // socket from setActive's thread: ix::WebSocket::stop() joins the
+            // socket's own thread with no guard, so only the supervisor may
+            // call it -- the same rule the shutdown path follows.
+            if (!m_active.load()) {
+                LOG_INFO(tag, "dropping the connection: no longer needed");
+                break;
+            }
 
             if (m_socketOpen.load()) {
                 // Once per connection, after it has opened: the receiver has
@@ -536,6 +586,10 @@ void Source::supervise() {
         resetStream("disconnected");
 
         if (!m_running.load()) break;
+        // Deactivated: straight back to the top, which parks it as idle. A
+        // backoff here would leave it in Backoff for half a minute saying it
+        // was retrying something it has been told not to do.
+        if (!m_active.load()) continue;
 
         {
             std::lock_guard<std::mutex> lk(m_mu);
@@ -1725,6 +1779,23 @@ void Source::requestReacquire(const std::string& why) {
     m_reacquire.store(true);
 }
 
+void Source::setActive(bool on, const std::string& why) {
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        // Kept even when the state is unchanged: the Selector calls this every
+        // pass and the REASON moves under it -- "the radio has not had a lock
+        // for 4 min" becomes "for 9 min" -- and the status page shows it.
+        m_activeReason = why;
+    }
+    if (m_active.exchange(on) == on) return;
+
+    // The supervisor does the work. It is waiting on m_wakeCv either way --
+    // parked at the idle gate, or inside the stream loop -- and it is the only
+    // thread allowed to stop the socket, so all this does is wake it.
+    { std::lock_guard<std::mutex> lk(m_wake); }
+    m_wakeCv.notify_all();
+}
+
 SourceSnapshot Source::snapshot() const {
     std::lock_guard<std::mutex> lk(m_mu);
     SourceSnapshot s = m_snap;
@@ -1752,6 +1823,38 @@ SourceSnapshot Source::snapshot() const {
     // page and the JSON showing a confident offset for a source that has gone
     // quiet.
     if (s.haveOffset && s.offsetAgeSec > kOffsetStaleSec) s.haveOffset = false;
+
+    // --- what the Selector reads, in the vocabulary it reads it in ---------
+    //
+    // The funnel below is the same one the status block renders, said once
+    // here so the reason a source is not being used and the reason it is not
+    // working are the same sentence. Most specific first: an unlocked decoder
+    // also has no offset, and "no offset" would send someone to the wrong
+    // place entirely.
+    s.kind = SourceKind::Radio;
+    s.active = m_active.load();
+    s.activeReason = m_activeReason;
+    s.ready = s.enabled && s.active && s.clockState == "locked";
+    if (!s.enabled) {
+        s.notReadyReason = "disabled in the configuration";
+    } else if (!s.active) {
+        s.notReadyReason = m_activeReason.empty() ? "held in cold standby" : m_activeReason;
+    } else if (s.clockState != "locked") {
+        // Name the stage that is actually missing. The most common cause by
+        // far -- a passband too narrow to pass the tick image -- is invisible
+        // from "not locked" and obvious from "no tick".
+        s.notReadyReason =
+            s.link != LinkState::Streaming ? "no audio: the link is " + std::string(linkStateName(s.link))
+          : !s.toneDetected                ? "no tick: nothing at 1000 Hz to time a second from"
+          : !s.phaseLocked                 ? "no edge: the tick is heard but not yet tracked"
+          : !s.anchored                    ? "no frame: edges are tracked but no minute has decoded"
+          : s.refusal != "none"            ? "frames refused: " + s.refusal
+          : s.framesInWindow < 2           ? "voting: " + std::to_string(s.framesInWindow) + " of " +
+                                             std::to_string(s.windowSize) + " frames agree so far"
+                                           : "decoder not locked yet";
+    } else {
+        s.notReadyReason.clear();
+    }
     return s;
 }
 

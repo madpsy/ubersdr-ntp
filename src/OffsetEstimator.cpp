@@ -8,22 +8,21 @@ namespace ubersdr_ntp {
 
 namespace {
 
-constexpr double kLevelWindowSec = 120.0;
-constexpr double kRateWindowSec = 1800.0;
-
-// The least history a rate may be fitted from. The per-second scatter is not
-// what limits it -- that is under a millisecond once the sample clock is sound
-// -- but the path delay's wander, milliseconds over a few minutes, which over a
-// short span is indistinguishable from rate. Measured live, fits over two to
-// ten minutes of one receiver read anything from +23 to -21 ppm against a
-// crystal public NTP put at -12.
-constexpr double kMinRateSpanSec = 600.0;
-constexpr int kMinRateSamples = 120;
-
-// Block length for judging the rate's uncertainty (see fitLine).
-constexpr double kBlockSec = 60.0;
-constexpr int kMinBlockSamples = 5;
-constexpr int kMinBlocks = 5;
+// The windows and minimum counts now live in OffsetTuning (OffsetEstimator.h),
+// because a source polled once a minute needs different ones from a source
+// producing a sample a second. The DEFAULTS there are the figures that were
+// here, and the reasoning behind the two that are not obvious is:
+//
+//   minRateSpanSec  the least history a rate may be fitted from. The
+//                   per-second scatter is not what limits it -- that is under a
+//                   millisecond once the sample clock is sound -- but the path
+//                   delay's wander, milliseconds over a few minutes, which over
+//                   a short span is indistinguishable from rate. Measured live,
+//                   fits over two to ten minutes of one receiver read anything
+//                   from +23 to -21 ppm against a crystal public NTP put at -12.
+//
+//   blockSec        how long a block is when judging that rate's uncertainty;
+//                   see fitLine, which explains what the blocks are for.
 
 // What a crystal may be assumed to be out by before its rate has been measured.
 // Generous: the one this was written on measured 13 ppm against public NTP, and
@@ -47,7 +46,6 @@ constexpr double kMaxRatePpm = 500.0;
 // shows in the rate's block uncertainty while it passes through.
 constexpr double kStepFloorSec = 0.010;
 
-constexpr int kMinLevelSamples = 5;
 constexpr double kMadToSigma = 1.4826;
 
 double median(std::vector<double> v) {
@@ -91,9 +89,9 @@ struct LineFit {
 // single such excursion could be off by: sqrt(12) times the blocks' scatter
 // about the line, over the span. Conservative, which is the right direction
 // for a figure a coasting server grows its dispersion by.
-LineFit fitLine(const std::vector<Point>& pts) {
+LineFit fitLine(const std::vector<Point>& pts, const OffsetTuning& t) {
     LineFit f;
-    if (static_cast<int>(pts.size()) < kMinRateSamples) return f;
+    if (static_cast<int>(pts.size()) < t.minRateSamples) return f;
 
     auto ols = [](const std::vector<Point>& p, const std::vector<bool>& keep, LineFit& out) {
         double n = 0.0, mx = 0.0, my = 0.0, xmin = 1e300, xmax = -1e300;
@@ -143,30 +141,30 @@ LineFit fitLine(const std::vector<Point>& pts) {
 
     if (!ols(pts, keep, f)) return LineFit{};
 
-    const int nBlocks = static_cast<int>(f.span / kBlockSec) + 1;
+    const int nBlocks = static_cast<int>(f.span / t.blockSec) + 1;
     std::vector<double> bx(static_cast<std::size_t>(nBlocks), 0.0), br(bx.size(), 0.0);
     std::vector<int> bn(bx.size(), 0);
     for (std::size_t i = 0; i < pts.size(); ++i) {
         if (!keep[i]) continue;
         const auto b = static_cast<std::size_t>(
-            std::min(nBlocks - 1, static_cast<int>((pts[i].x - f.xmin) / kBlockSec)));
+            std::min(nBlocks - 1, static_cast<int>((pts[i].x - f.xmin) / t.blockSec)));
         bx[b] += pts[i].x;
         br[b] += pts[i].y - (f.intercept + f.slope * pts[i].x);
         ++bn[b];
     }
     std::vector<Point> blocks;
     for (std::size_t b = 0; b < bx.size(); ++b) {
-        if (bn[b] >= kMinBlockSamples) blocks.push_back({bx[b] / bn[b], br[b] / bn[b]});
+        if (bn[b] >= t.minBlockSamples) blocks.push_back({bx[b] / bn[b], br[b] / bn[b]});
     }
-    if (static_cast<int>(blocks.size()) >= kMinBlocks && f.span > 0.0) {
+    if (static_cast<int>(blocks.size()) >= t.minBlocks && f.span > 0.0) {
         double ss = 0.0;
         for (const Point& p : blocks) ss += p.y * p.y;
         const double blockScatter = std::sqrt(ss / static_cast<double>(blocks.size() - 2));
         f.slopeSe = std::max(f.slopeSe, std::sqrt(12.0) * blockScatter / f.span);
     }
 
-    f.ok = f.kept >= kMinRateSamples && f.span >= kMinRateSpanSec &&
-           static_cast<int>(blocks.size()) >= kMinBlocks;
+    f.ok = f.kept >= t.minRateSamples && f.span >= t.minRateSpanSec &&
+           static_cast<int>(blocks.size()) >= t.minBlocks;
     return f;
 }
 
@@ -175,7 +173,7 @@ LineFit fitLine(const std::vector<Point>& pts) {
 void OffsetEstimator::add(double atSec, double offsetSec) {
     m_samples.push_back({atSec, offsetSec});
     m_newestAt = m_samples.size() == 1 ? atSec : std::max(m_newestAt, atSec);
-    while (!m_samples.empty() && m_samples.front().at < m_newestAt - kRateWindowSec) {
+    while (!m_samples.empty() && m_samples.front().at < m_newestAt - m_t.rateWindowSec) {
         m_samples.pop_front();
     }
     m_dirty = true;
@@ -211,25 +209,25 @@ void OffsetEstimator::recompute() {
         bool older = false;
         for (const Sample& s : m_samples) {
             pts.push_back({s.at - ref, s.offset});
-            if (s.at < ref - kLevelWindowSec) older = true;
+            if (s.at < ref - m_t.levelWindowSec) older = true;
         }
-        fit = fitLine(pts);
+        fit = fitLine(pts, m_t);
         if (!fit.ok || !older) break;
 
         const bool plausible = std::abs(fit.slope) <= kMaxRatePpm * 1e-6;
         std::vector<double> shortRes;
         for (const Point& p : pts) {
-            if (p.x >= -kLevelWindowSec) shortRes.push_back(p.y - (fit.intercept + fit.slope * p.x));
+            if (p.x >= -m_t.levelWindowSec) shortRes.push_back(p.y - (fit.intercept + fit.slope * p.x));
         }
         const double limit = std::max(kStepFloorSec,
                                       4.0 * fit.sigma / std::sqrt(static_cast<double>(shortRes.size())));
         if (plausible && std::abs(median(shortRes)) <= limit) break;
 
-        while (!m_samples.empty() && m_samples.front().at < ref - kLevelWindowSec) m_samples.pop_front();
+        while (!m_samples.empty() && m_samples.front().at < ref - m_t.levelWindowSec) m_samples.pop_front();
         // Samples arrive in time order, so the front is the oldest; this is
         // belt and braces for an edge the fit placed a little out of order.
         m_samples.erase(std::remove_if(m_samples.begin(), m_samples.end(),
-                                       [&](const Sample& s) { return s.at < ref - kLevelWindowSec; }),
+                                       [&](const Sample& s) { return s.at < ref - m_t.levelWindowSec; }),
                         m_samples.end());
         ++m_levelShifts;
         fit = LineFit{};
@@ -247,7 +245,7 @@ void OffsetEstimator::recompute() {
     std::vector<double> level;
     double carried = 0.0;
     for (const Sample& s : m_samples) {
-        if (s.at < ref - kLevelWindowSec) continue;
+        if (s.at < ref - m_t.levelWindowSec) continue;
         level.push_back(s.offset + m_est.rate * (ref - s.at));
         carried += ref - s.at;
     }
@@ -262,7 +260,7 @@ void OffsetEstimator::recompute() {
     // The median sits where the typical sample does, so the rate's doubt acts
     // over the mean distance a sample was carried.
     m_est.rateTermSec = m_est.rateUncertainty * (carried / static_cast<double>(level.size()));
-    m_est.valid = m_est.samples >= kMinLevelSamples;
+    m_est.valid = m_est.samples >= m_t.minLevelSamples;
 }
 
 } // namespace ubersdr_ntp

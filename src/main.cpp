@@ -29,11 +29,13 @@
 #include "Config.h"
 #include "HttpApi.h"
 #include "Log.h"
+#include "NtpClient.h"
 #include "NtpServer.h"
 #include "SampleClock.h"
 #include "Selector.h"
 #include "Source.h"
 #include "Status.h"
+#include "TimeSource.h"
 #include "Version.h"
 
 #include <curl/curl.h>
@@ -76,14 +78,24 @@ void usage() {
         "Usage:\n"
         "  ubersdr-ntp --config FILE [overrides]\n"
         "  ubersdr-ntp --source URL@CARRIER [--source ...] [overrides]\n"
+        "  ubersdr-ntp --ntp-source HOST [--ntp-source ...] [overrides]\n"
         "\n"
         "Configuration:\n"
         "  -c, --config FILE        JSON configuration file (comments allowed)\n"
-        "      --source URL@MHZ     A source, for a quick run without a config file.\n"
+        "      --source URL@MHZ     A radio source, for a quick run without a config file.\n"
         "                           e.g. --source https://sdr.example.org@10\n"
         "                           May be repeated. The dial is derived as 1 kHz below\n"
         "                           the carrier, which is the tuning WWV, WWVH and WWVB\n"
         "                           all want.\n"
+        "      --ntp-source HOST    An upstream NTP server, as a second class of source.\n"
+        "                           e.g. --ntp-source time.cloudflare.com, or HOST:PORT.\n"
+        "                           May be repeated.\n"
+        "      --primary WHICH      Which class is trusted first: radio (default) or ntp\n"
+        "      --secondary MODE     What the other class does while the primary is healthy:\n"
+        "                           always   contribute alongside it\n"
+        "                           standby  stay connected and measured, but do not serve\n"
+        "                                    (default) — failover is then instant\n"
+        "                           cold     do not connect at all until the primary fails\n"
         "      --password PW        Bypass password applied to every --source\n"
         "      --format FMT         opus (default) or pcm-v4 (lossless, ~4x the bandwidth,\n"
         "                           and no codec delay to calibrate out)\n"
@@ -141,6 +153,8 @@ int main(int argc, char** argv) {
 
     std::string configPath;
     std::vector<std::string> sourceSpecs;
+    std::vector<std::string> ntpSourceSpecs;
+    std::string cliPrimary, cliSecondary;
     std::string cliPassword;
     std::string cliFormat;
     int cliPort = -1, cliHttpPort = -1;
@@ -161,6 +175,9 @@ int main(int argc, char** argv) {
         else if (a == "--version") { std::printf("ubersdr-ntp %s\n", kVersion); return 0; }
         else if (a == "-c" || a == "--config") configPath = next("--config");
         else if (a == "--source") sourceSpecs.push_back(next("--source"));
+        else if (a == "--ntp-source") ntpSourceSpecs.push_back(next("--ntp-source"));
+        else if (a == "--primary") cliPrimary = next("--primary");
+        else if (a == "--secondary") cliSecondary = next("--secondary");
         else if (a == "--password") cliPassword = next("--password");
         else if (a == "--format") cliFormat = next("--format");
         else if (a == "--port") cliPort = std::atoi(next("--port").c_str());
@@ -186,10 +203,10 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "%s\n", err.c_str());
             return 1;
         }
-    } else if (sourceSpecs.empty()) {
+    } else if (sourceSpecs.empty() && ntpSourceSpecs.empty()) {
         std::fprintf(stderr,
-                     "nothing to do: give --config FILE or at least one --source URL@CARRIER.\n"
-                     "Try --help.\n");
+                     "nothing to do: give --config FILE, at least one --source URL@CARRIER, "
+                     "or at least one --ntp-source HOST.\nTry --help.\n");
         return 2;
     }
 
@@ -212,6 +229,25 @@ int main(int argc, char** argv) {
         }
         if (!cliPassword.empty()) s.password = cliPassword;
         cfg.sources.push_back(std::move(s));
+    }
+
+    for (const std::string& spec : ntpSourceSpecs) {
+        NtpSourceConfig n = cfg.ntpDefaults;
+        n.name.clear();
+        // host:port is split in finalise(), where the IPv6 bracket form is
+        // handled too, so there is one place that knows how an address is spelt.
+        n.server = spec;
+        cfg.ntpSources.push_back(std::move(n));
+    }
+
+    if (!cliPrimary.empty() && !parseSourceKind(cliPrimary, cfg.clock.primary)) {
+        std::fprintf(stderr, "unknown --primary %s (expected radio or ntp)\n", cliPrimary.c_str());
+        return 2;
+    }
+    if (!cliSecondary.empty() && !parseSecondaryMode(cliSecondary, cfg.clock.secondary)) {
+        std::fprintf(stderr, "unknown --secondary %s (expected always, standby or cold)\n",
+                     cliSecondary.c_str());
+        return 2;
     }
 
     if (cliPort > 0) cfg.ntp.port = cliPort;
@@ -247,15 +283,36 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO(kTag, "ubersdr-ntp %s starting (User-Agent: %s)", kVersion, kUserAgent);
+    for (const std::string& w : cfg.warnings) LOG_WARN(kTag, "%s", w.c_str());
     for (const SourceConfig& s : cfg.sources) {
-        LOG_INFO(kTag, "source %-14s %s  dial %.6f MHz (carrier %.3f MHz) %s%s%s",
+        LOG_INFO(kTag, "radio  %-14s %s  dial %.6f MHz (carrier %.3f MHz) %s%s%s",
                  s.name.c_str(), s.url.c_str(), s.dialHz / 1e6, s.carrierHz / 1e6,
                  formatName(s.format),
                  s.enabled ? "" : " [DISABLED]",
                  s.autoDelay ? "" : " [fixed delay]");
     }
-    LOG_INFO(kTag, "ntp on port %d, coasting up to %.0fs at %.0f ppm, min_sources %d",
-             cfg.ntp.port, cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm, cfg.ntp.minSources);
+    for (const NtpSourceConfig& s : cfg.ntpSources) {
+        LOG_INFO(kTag, "ntp    %-14s %s:%d  every %.0fs%s%s",
+                 s.name.c_str(), s.server.c_str(), s.port, s.pollSeconds,
+                 s.iburst ? " (iburst)" : "",
+                 s.enabled ? "" : " [DISABLED]");
+    }
+    LOG_INFO(kTag, "primary class is %s; the %s sources are %s",
+             sourceKindName(cfg.clock.primary), sourceKindName(cfg.secondaryKind()),
+             cfg.clock.secondary == SecondaryMode::Always
+                 ? "combined with them"
+                 : cfg.clock.secondary == SecondaryMode::Standby
+                       ? "measured continuously and held as a warm standby"
+                       : "left disconnected until the primary fails");
+    if (cfg.clock.secondary != SecondaryMode::Always) {
+        LOG_INFO(kTag, "failing over after %.0fs without a usable primary, "
+                 "back after %.0fs of one",
+                 cfg.clock.failoverAfterSec, cfg.clock.failbackAfterSec);
+    }
+    LOG_INFO(kTag, "ntp on port %d, coasting up to %.0fs at %.0f ppm, min_sources %d "
+             "(secondary %d)",
+             cfg.ntp.port, cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm, cfg.ntp.minSources,
+             cfg.clock.minSecondarySources);
 
     if (checkOnly) {
         LOG_INFO(kTag, "configuration is valid (--check); exiting");
@@ -280,17 +337,36 @@ int main(int argc, char** argv) {
     // thread takes a timestamp on it (SampleClock.h).
     daemonNow();
 
-    std::vector<std::unique_ptr<Source>> sources;
+    // Both kinds, in one list, because everything above them treats them alike:
+    // the Selector wants a vector of snapshots, the status report wants a vector
+    // of snapshots, and the only place the difference matters is here, where
+    // they are made.
+    std::vector<std::unique_ptr<TimeSource>> sources;
     for (const SourceConfig& s : cfg.sources) {
         sources.push_back(std::make_unique<Source>(s));
     }
+    if (!cfg.ntpSources.empty()) {
+        // Gathered once and shared: the list is for loop detection (see
+        // NtpClient.h) and re-reading the interface table per peer would tell
+        // us the same thing several times.
+        const std::vector<std::uint32_t> local = localIpv4Addresses();
+        for (const NtpSourceConfig& s : cfg.ntpSources) {
+            sources.push_back(std::make_unique<NtpPeer>(s, local));
+        }
+    }
 
-    Selector selector(cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm, cfg.ntp.minSources);
+    Selector selector(cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm, cfg.ntp.minSources, cfg.clock);
 
-    auto snapshots = [&sources] {
+    // Which class each source is in. Decided here, from the configuration,
+    // rather than by the source: a source has no opinion about which class is
+    // trusted first, and asking it would put the same conditional in two places.
+    auto snapshots = [&sources, &cfg] {
         std::vector<SourceSnapshot> v;
         v.reserve(sources.size());
-        for (const auto& s : sources) v.push_back(s->snapshot());
+        for (const auto& s : sources) {
+            v.push_back(s->snapshot());
+            v.back().primaryClass = cfg.isPrimary(v.back().kind);
+        }
         return v;
     };
 
@@ -304,6 +380,12 @@ int main(int argc, char** argv) {
         in.uptimeSec = monotonicNow() - startedAt;
         in.version = kVersion;
         in.ntpPort = cfg.ntp.port;
+        in.primaryKind = cfg.clock.primary;
+        in.secondaryKind = cfg.secondaryKind();
+        in.secondaryMode = cfg.clock.secondary;
+        const Selector::Activation act = selector.activation();
+        in.secondaryActive = act.secondaryActive;
+        in.secondaryActiveReason = act.reason;
         return in;
     };
 
@@ -354,6 +436,20 @@ int main(int argc, char** argv) {
                 const auto why = c.notUsedReasons.find(n);
                 s->requestReacquire(why != c.notUsedReasons.end() ? why->second
                                                                    : "refused by the consensus");
+            }
+        }
+
+        // Cold standby, connected and disconnected as the failover moves. The
+        // Selector decides -- it is the only thing that knows whether the
+        // primary class can serve -- and this owns the sources and acts, the
+        // same division as the re-acquisition above. In every other mode the
+        // answer is a constant `true` and this costs one atomic compare per
+        // source per pass.
+        {
+            const Selector::Activation act = selector.activation();
+            for (auto& s : sources) {
+                if (cfg.isPrimary(s->kind())) continue;
+                s->setActive(act.secondaryActive, act.reason);
             }
         }
 

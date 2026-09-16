@@ -138,8 +138,9 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
     j["unix_ms"] = utcMs;
     j["utc"] = iso8601(utcMs);
     j["synchronised"] = c.synchronised;
-    j["stratum"] = c.synchronised ? 1 : 16;
+    j["stratum"] = c.synchronised ? c.stratum : 16;
     j["refid"] = c.refid;
+    j["root_delay_ms"] = c.rootDelaySec * 1000.0;
     // The correction this HOST would need, which is what a person reading
     // "offset" wants to know.
     j["offset_ms"] = (utc - (nowDaemon - daemonMinusRealtime())) * 1000.0;
@@ -158,6 +159,51 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
     j["uptime_seconds"] = in.uptimeSec;
     j["version"] = in.version;
 
+    // The two classes, every second, because the page's headline figures now
+    // include which class is serving and how far apart the two are -- and a
+    // figure that only refreshes with the full status block would lag a
+    // failover by several seconds on the one screen someone is watching it on.
+    {
+        nlohmann::json k;
+        k["primary"] = sourceKindName(in.primaryKind);
+        k["secondary"] = sourceKindName(in.secondaryKind);
+        k["secondary_mode"] = secondaryModeName(in.secondaryMode);
+        k["secondary_active"] = in.secondaryActive;
+        k["serving"] = servingClassName(c.serving);
+        k["serving_note"] = c.servingNote;
+        k["primary_candidates"] = c.primaryCandidates;
+        k["secondary_candidates"] = c.secondaryCandidates;
+        k["failover_in_seconds"] = c.failoverInSec > 0.0 ? nlohmann::json(c.failoverInSec)
+                                                         : nlohmann::json(nullptr);
+        k["failback_in_seconds"] = c.failbackInSec > 0.0 ? nlohmann::json(c.failbackInSec)
+                                                         : nlohmann::json(nullptr);
+        nlohmann::json cd;
+        cd["valid"] = c.classDelta.valid;
+        if (c.classDelta.valid) {
+            cd["delta_ms"] = c.classDelta.averagedSec * 1000.0;
+            cd["instant_ms"] = c.classDelta.instantSec * 1000.0;
+            cd["settled_for_seconds"] = c.classDelta.settledForSec;
+            cd["primary_sources"] = c.classDelta.primarySources;
+            cd["secondary_sources"] = c.classDelta.secondarySources;
+        }
+        k["class_delta"] = std::move(cd);
+        j["clock"] = std::move(k);
+    }
+
+    // Per-source agreement, which the page draws as a column: each source
+    // against the others in its own class.
+    {
+        nlohmann::json ag = nlohmann::json::array();
+        for (const SourceResidual& r : c.residuals) {
+            ag.push_back({{"name", r.name},
+                          {"kind", sourceKindName(r.kind)},
+                          {"residual_ms", r.averagedSec * 1000.0},
+                          {"peers", r.peers},
+                          {"refused", r.refused}});
+        }
+        j["agreement"] = std::move(ag);
+    }
+
     nlohmann::json n;
     n["port"] = in.ntpPort;
     n["requests"] = in.ntp.requests;
@@ -167,11 +213,17 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
     j["ntp"] = std::move(n);
 
     nlohmann::json arr = nlohmann::json::array();
-    int locked = 0;
+    int ready = 0;
     for (const SourceSnapshot& s : in.sources) {
-        if (s.clockState == "locked") ++locked;
+        if (s.ready) ++ready;
         nlohmann::json o;
         o["name"] = s.name;
+        o["kind"] = sourceKindName(s.kind);
+        o["primary_class"] = s.primaryClass;
+        o["active"] = s.active;
+        o["ready"] = s.ready;
+        o["not_ready_reason"] = s.notReadyReason.empty() ? nlohmann::json(nullptr)
+                                                         : nlohmann::json(s.notReadyReason);
         o["link"] = linkStateName(s.link);
         o["state"] = s.clockState;
         o["station"] = s.station;
@@ -195,9 +247,31 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
         const auto why = c.notUsedReasons.find(s.name);
         o["not_used_reason"] = why != c.notUsedReasons.end()
                                    ? nlohmann::json(why->second) : nlohmann::json(nullptr);
+        if (s.kind == SourceKind::Ntp) {
+            nlohmann::json p;
+            p["server"] = s.ntp.server;
+            p["address"] = s.ntp.address;
+            p["stratum"] = s.ntp.stratum;
+            p["refid"] = s.ntp.refid;
+            p["reach"] = s.ntp.reach;
+            {
+                char b[8];
+                std::snprintf(b, sizeof b, "%03o", s.ntp.reach);
+                p["reach_octal"] = b;
+            }
+            p["poll_seconds"] = s.ntp.pollSec;
+            p["delay_ms"] = s.ntp.delaySec * 1000.0;
+            p["root_distance_ms"] = s.ntp.rootDistanceSec * 1000.0;
+            p["stopped"] = s.ntp.stopped;
+            p["kiss_code"] = s.ntp.kissCode;
+            o["ntp"] = std::move(p);
+        }
         arr.push_back(std::move(o));
     }
-    j["sources_locked"] = locked;
+    j["sources_ready"] = ready;
+    // Kept under its old name too: an external client written against the
+    // previous shape should not break over a word.
+    j["sources_locked"] = ready;
     j["sources_total"] = static_cast<int>(in.sources.size());
     j["sources"] = std::move(arr);
 

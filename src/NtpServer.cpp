@@ -401,7 +401,10 @@ void NtpServer::serve(int fd, const std::string& label) {
         std::memset(out, 0, sizeof out);
 
         int leap = 0;
-        int stratum = 1;
+        // What the Selector worked out from the sources that actually
+        // contributed: 1 while a radio source is in the answer, more when it
+        // came from an upstream instead. See Selector.cpp.
+        int stratum = c.stratum > 0 ? c.stratum : 1;
         if (!c.synchronised) {
             leap = 3;       // unsynchronised
             // Stratum 16 means unsynchronised INSIDE an implementation; RFC 5905
@@ -432,18 +435,30 @@ void NtpServer::serve(int fd, const std::string& label) {
         }
         out[3] = static_cast<std::uint8_t>(clockPrecision());
 
-        // Root delay is zero and means it: there is no NTP path above this
-        // server. The entire error budget is in root dispersion.
-        put32(out + 4, 0);
+        // Root delay: zero while the time comes from the radio, and it means it
+        // -- there is no NTP path above a radio clock. When the time has failed
+        // over to an upstream there IS such a path, and this is its length. The
+        // rest of the error budget is in root dispersion either way.
+        put32(out + 4, toShortFormat(c.rootDelaySec));
         put32(out + 8, toShortFormat(c.dispersionSec));
 
-        // Reference identifier: four ASCII characters naming the radio source,
-        // as RFC 5905 specifies for stratum 1. Before the first lock there is no
-        // source to name, and stratum 0 makes this field a kiss code: INIT is
-        // the one RFC 5905 defines for "not yet synchronised".
-        std::string refid = !c.valid ? "INIT" : c.refid.empty() ? "WWV" : c.refid;
-        refid.resize(4, '\0');
-        std::memcpy(out + 12, refid.data(), 4);
+        // Reference identifier: four ASCII characters naming the radio station
+        // at stratum 1, the upstream server's address above it. Before the
+        // first lock there is no source to name, and stratum 0 makes this field
+        // a kiss code: INIT is the one RFC 5905 defines for "not yet
+        // synchronised".
+        if (!c.valid) {
+            std::memcpy(out + 12, "INIT", 4);
+        } else if (c.refidIsAddress) {
+            // The upstream's address, which is what RFC 5905 requires above
+            // stratum 1 and what another implementation's loop detection looks
+            // for when deciding whether it is synchronised to us.
+            put32(out + 12, c.refidAddress);
+        } else {
+            std::string refid = c.refid.empty() ? "WWV" : c.refid;
+            refid.resize(4, '\0');
+            std::memcpy(out + 12, refid.data(), 4);
+        }
 
         // Reference timestamp: when this server's clock was last set from the
         // radio, which is the age of the newest contributing measurement. Left

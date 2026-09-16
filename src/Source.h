@@ -31,6 +31,7 @@
 
 #include "Config.h"
 #include "OffsetEstimator.h"
+#include "TimeSource.h"
 #include "OpusV4Header.h"
 #include "Propagation.h"
 #include "SampleClock.h"
@@ -52,134 +53,35 @@ namespace ix { class WebSocket; }
 
 namespace ubersdr_ntp {
 
-enum class LinkState { Idle, Connecting, Streaming, Backoff, Stopped };
-const char* linkStateName(LinkState s);
-
-// Everything one source knows about itself, copied out under lock.
-struct SourceSnapshot {
-    std::string name;
-    std::string url;
-    bool enabled = true;
-    std::uint64_t carrierHz = 0;
-    std::uint64_t dialHz = 0;
-    AudioFormat format = AudioFormat::Opus;
-
-    // link
-    LinkState link = LinkState::Idle;
-    std::string linkDetail;
-    double linkAgeSec = 0.0;        // how long in this link state
-    double lastAudioAgeSec = 1e9;   // since the last audio packet
-    std::uint64_t packets = 0;
-    std::uint64_t audioBytes = 0;
-    std::uint64_t decodeErrors = 0;
-    int connectAttempts = 0;
-    int reacquisitions = 0;         // times the consensus sent it back to start over
-    double httpRttMs = 0.0;
-    std::string receiverName;       // from /api/description
-    GeoPoint receiverLocation;
-
-    // audio
-    int sampleRate = 0;
-    double basebandPowerDb = -999.0;
-    double noiseDb = -999.0;
-
-    // decoder
-    std::string clockState = "stopped";
-    std::string station = "unknown";
-    double toneSnrDb = 0.0;
-    double delayEstMs = 0.0;
-    // WWV/WWVH: tick energy in the 2000 Hz band over the 2200 Hz band, in dB --
-    // what the station tag is decided from. Positive leans WWV, negative WWVH;
-    // NaN when there is none (WWVB, or no tick yet).
-    double tickBandRatioDb = std::numeric_limits<double>::quiet_NaN();
-    bool toneDetected = false;
-    bool phaseLocked = false;
-    bool anchored = false;
-    int badFrameStreak = 0;
-    int framesInWindow = 0;
-    int windowSize = 0;
-    double voteQuality = 0.0;
-    std::string refusal = "none";
-    std::int64_t samplesConsumed = 0;
-    int lastQuality = 0;            // voter confidence of the last `time`, 0..100
-    std::string lastDecodedUtc;
-    double lastTimeAgeSec = 1e9;
-    bool leapPending = false;
-    int dut1Tenths = 0;
-
-    // timing
-    bool haveOffset = false;
-    // UTC minus the DAEMON clock (SampleClock.h) at offsetAtSec, delay model
-    // applied, moving at offsetRate. What the selector combines.
-    double offsetSec = 0.0;
-    double offsetAtSec = 0.0;
-    double offsetRate = 0.0;             // d(offsetSec)/d(daemon time); 1e-6 is 1 ppm
-    double offsetRateUncertainty = 0.0;
-    bool offsetRateMeasured = false;     // false: zero assumed, uncertainty is the bound
-    double offsetRateSpanSec = 0.0;
-    double rateTermSec = 0.0;            // what the rate's doubt could move the offset by
-    // The same offset against THIS HOST's clock, now, and before the delay model.
-    // For people and the status page; nothing is formed from them.
-    double hostOffsetSec = 0.0;
-    double rawOffsetSec = 0.0;
-    double jitterSec = 0.0;         // spread of the measurements in the window
-    double dispersionSec = 0.0;     // jitter + fit residual + delay uncertainty
-    // What this source is worth RELATIVE TO THE OTHERS, which is not the same
-    // number. dispersionSec is dominated by the delay model's uncertainty, and
-    // every source shares that model: two receivers on similar paths both carry
-    // about 16 ms of it, so a source with seventeen times another's jitter still
-    // ends up only a third wider overall and keeps a third of the vote. The
-    // common term belongs in what the server ADVERTISES -- it is real, and the
-    // answer really is that uncertain -- but not in deciding which source to
-    // believe. This is the part that actually distinguishes them.
-    double weightDispersionSec = 0.0;
-    double offsetAgeSec = 1e9;
-    int offsetSamples = 0;
-
-    // delay model
-    double delaySec = 0.0;
-    double propagationSec = 0.0;
-    double networkSec = 0.0;
-    double codecSec = 0.0;
-    double decoderSec = 0.0;   // the running decoder's edge bias (negative: early)
-    double chainSec = 0.0;     // UberSDR's fixed RF-to-WebSocket delay
-    double extraSec = 0.0;
-    std::string pathDescription;
-
-    // sample clock
-    bool clockFitValid = false;
-    double clockResidualSec = 0.0;
-    double clockSpanSec = 0.0;
-    double clockPpm = 0.0;          // receiver sample clock against ours
-    double wsRttMs = 0.0;           // round trip over the audio connection
-    bool rttFromWs = false;         // ...and whether the delay model used it
-    double clockSlopeUncSec = 0.0;  // bias the slope could be putting on an edge
-    bool clockSlopeHeld = false;    // fitted slope refused as implausible
-    double lastExcessDelaySec = 0.0;
-
-    double weight = 1.0;
-};
-
-class Source {
+class Source final : public TimeSource {
 public:
     explicit Source(SourceConfig cfg);
-    ~Source();
+    ~Source() override;
 
     Source(const Source&) = delete;
     Source& operator=(const Source&) = delete;
 
-    void start();
-    void stop();
+    void start() override;
+    void stop() override;
 
-    const std::string& name() const { return m_cfg.name; }
-    SourceSnapshot snapshot() const;
+    const std::string& name() const override { return m_cfg.name; }
+    SourceKind kind() const override { return SourceKind::Radio; }
+    SourceSnapshot snapshot() const override;
 
     // Drop the connection and acquire from nothing, at the Selector's word
     // that this source has disagreed with the others for too long. Safe from
     // any thread; acted on by the supervisor within a second, and only while a
     // connection is up -- a source that is already reconnecting is already
     // starting over.
-    void requestReacquire(const std::string& why);
+    void requestReacquire(const std::string& why) override;
+
+    // Hold the receiver session open, or drop it and stay disconnected. Cold
+    // secondary mode (see ClockConfig): a public UberSDR receiver caps
+    // concurrent sessions per address, so a standby nobody is using should not
+    // be holding one of them. Coming back costs a full acquisition -- about
+    // five minutes of clean signal -- which is the price of the mode.
+    void setActive(bool on, const std::string& why) override;
+    bool active() const override { return m_active.load(); }
 
 private:
     void supervise();
@@ -224,6 +126,11 @@ private:
 
     std::thread m_thread;
     std::atomic<bool> m_running{false};
+    // Whether the supervisor should be holding a connection at all. Separate
+    // from m_running, which is about the thread's life: an inactive source
+    // still has its supervisor thread, waiting to be told to come back.
+    std::atomic<bool> m_active{true};
+    std::string m_activeReason;     // under m_mu
     std::mutex m_wake;
     std::condition_variable m_wakeCv;
     std::atomic<bool> m_reacquire{false};

@@ -59,6 +59,21 @@ td:last-child, th:last-child { padding-right:0; }
 .n { text-align:right; font-family:var(--mono); font-variant-numeric:tabular-nums; }
 .name { font-weight:600; }
 .name .used { color:var(--accent); font-weight:400; font-size:11px; }
+/* The two classes side by side with the difference between them in the middle,
+   because the difference is the point: it is the one figure in this program
+   that measures the radio delay model against something that does not share
+   its constants. Stacks on a narrow screen rather than shrinking to nothing. */
+.chain { display:grid; gap:18px; align-items:center;
+         grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); }
+.chain .gap { text-align:center; }
+.chain .figure.big { font-size:30px; margin-top:4px; }
+.reachbits { font:12px/1 var(--mono); letter-spacing:2px; color:var(--muted); }
+.warnfig { color:var(--warn); }
+.badfig  { color:var(--bad); }
+.sidehead { display:flex; align-items:center; gap:8px; margin-bottom:8px; flex-wrap:wrap; }
+.sidename { font:600 13px/1 var(--mono); }
+.side.serving { }
+.side.idle .figure, .side.idle .sidename { opacity:.5; }
 .bar { height:5px; border-radius:3px; background:var(--line); overflow:hidden; min-width:56px; }
 .bar i { display:block; height:100%; background:var(--accent); transition:width .4s; }
 .kv td:first-child { color:var(--muted); width:132px; }
@@ -107,6 +122,8 @@ a { color:var(--accent); }
         <div class="note">correction to this host</div></div>
       <div><div class="label">Root dispersion</div><div class="figure" id="disp">—</div>
         <div class="note">how far out that could be</div></div>
+      <div><div class="label">Stratum</div><div class="figure" id="stratum">—</div>
+        <div class="note" id="stratumnote">&nbsp;</div></div>
       <div><div class="label">Sources</div><div class="figure" id="srccount">—</div>
         <div class="note" id="srcnames">&nbsp;</div></div>
       <div><div class="label">Reference age</div><div class="figure" id="refage">—</div>
@@ -116,13 +133,46 @@ a { color:var(--accent); }
     </div>
   </div>
 
-  <div class="card">
-    <div class="label" style="margin-bottom:12px">Sources</div>
+  <div class="card" id="classcard" hidden>
+    <div class="label" style="margin-bottom:12px">Primary and secondary</div>
+    <div class="chain">
+      <div class="side" id="pside">
+        <div class="sidehead"><span class="pill" id="ppill">primary</span>
+          <span class="sidename" id="pname">radio</span></div>
+        <div class="figure" id="poffset">—</div>
+        <div class="note" id="pnote">&nbsp;</div>
+      </div>
+      <div class="gap">
+        <div class="label">Difference</div>
+        <div class="figure big" id="classdelta">—</div>
+        <div class="note" id="classdeltanote">&nbsp;</div>
+      </div>
+      <div class="side" id="sside">
+        <div class="sidehead"><span class="pill" id="spill">secondary</span>
+          <span class="sidename" id="sname">ntp</span></div>
+        <div class="figure" id="soffset">—</div>
+        <div class="note" id="snote">&nbsp;</div>
+      </div>
+    </div>
+    <div class="note" id="classexplain" style="margin-top:14px">&nbsp;</div>
+  </div>
+
+  <div class="card" id="radiocard">
+    <div class="label" style="margin-bottom:12px">Radio sources</div>
     <div class="scroll"><table><thead><tr>
       <th>Source</th><th>Link</th><th>Station</th><th>Stage</th>
       <th class="n">Tick</th><th>Vote</th><th class="n">Qual</th>
       <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">n</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
+  </div>
+
+  <div class="card" id="ntpcard" hidden>
+    <div class="label" style="margin-bottom:12px">NTP sources</div>
+    <div class="scroll"><table><thead><tr>
+      <th>Source</th><th>State</th><th class="n">St</th><th>Refid</th>
+      <th class="n">Reach</th><th class="n">Poll</th><th class="n">Delay</th>
+      <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">n</th>
+    </tr></thead><tbody id="ntprows"></tbody></table></div>
   </div>
 
   <div id="detail"></div>
@@ -174,6 +224,35 @@ const signedDb = (v) => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1) + " dB";
 
 // Where a clock stops being interesting and starts being wrong.
 const dispTone = (d) => d == null ? "dim" : (d < 50 ? "ok" : (d < 250 ? "warn" : "bad"));
+
+// An upstream peer's state, which is not a decoder funnel: it is reachable and
+// filtered, or it is somewhere short of that, or the server told us to go away.
+function peerTone(state) {
+  if (state === "locked") return "ok";
+  if (state === "reaching") return "warn";
+  return "bad";
+}
+
+// The reach register drawn out, newest poll first. The shape says more than
+// the number does: ●●●●●●●● is healthy, ●○○○○○○○ is a peer that has just come
+// back, ○●●●●●●● is one that has just missed a poll.
+function reachBits(r) {
+  r = r || 0;
+  let out = "";
+  for (let i = 7; i >= 0; --i) out += (r >> i) & 1 ? "●" : "○";
+  return out;
+}
+
+const leapWord = (l) => l === 1 ? "second to be inserted"
+  : l === 2 ? "second to be deleted"
+  : l === 3 ? "UNSYNCHRONISED" : "none";
+
+function median(v) {
+  if (!v.length) return null;
+  const a = v.slice().sort((x, y) => x - y);
+  const m = a.length >> 1;
+  return a.length % 2 ? a[m] : (a[m - 1] + a[m]) / 2;
+}
 
 // ---------------------------------------------------------------------------
 // The displayed time. A tick is stamped when it leaves the server and read when
@@ -388,6 +467,77 @@ function paintClock(ts) {
   }
 }
 
+// The primary and secondary classes, and the difference between them.
+//
+// The difference is the reason this card exists. Every radio source shares the
+// same chain delay, codec delay and decoder bias, so those terms cancel in any
+// comparison between receivers and no number of receivers can measure them. An
+// upstream NTP server does not share them. So while both classes are being
+// measured -- `always`, and `standby`, which is what standby is FOR -- this
+// figure is a direct reading of the delay model's absolute error. It is shown
+// and never applied: correcting the radio to agree with the network would make
+// them agree by construction and destroy the only independent check here.
+function renderClasses(d, k, radio, peers) {
+  const card = $("classcard");
+  // Nothing to compare with only one class configured.
+  if (!k.primary || !radio.length || !peers.length) { card.hidden = true; return; }
+  card.hidden = false;
+
+  const byKind = (kind) => d.sources.filter((s) => (s.kind === "ntp") === (kind === "ntp"));
+  const side = (which) => {
+    const kind = which === "p" ? k.primary : k.secondary;
+    const list = byKind(kind).filter((s) => s.have_offset && s.ready);
+    const med = median(list.map((s) => s.offset_ms));
+    const serving = which === "p"
+      ? (k.serving === "primary" || k.serving === "both")
+      : (k.serving === "secondary" || k.serving === "both");
+    $(which + "name").textContent = kind;
+    $(which + "pill").className = "pill " + (serving ? "ok" : "dim");
+    $(which + "pill").textContent = which === "p" ? "primary"
+      : (k.secondary_mode === "always" ? "secondary · always"
+         : "secondary · " + k.secondary_mode);
+    $(which + "offset").textContent = med == null ? "—" : signed(med);
+    $(which + "side").className = "side " + (serving ? "serving" : "idle");
+    const n = which === "p" ? k.primary_candidates : k.secondary_candidates;
+    $(which + "note").textContent =
+      (serving ? "serving · " : which === "s" && k.secondary_mode !== "always"
+         ? "standing by · " : "not serving · ") +
+      n + " candidate" + (n === 1 ? "" : "s") +
+      (list.length ? " · median of " + list.length + " ready" : "");
+  };
+  side("p");
+  side("s");
+
+  const cd = k.class_delta || {};
+  if (cd.valid) {
+    $("classdelta").textContent = signed(cd.delta_ms);
+    // Tone off how large it is against the radio delay budget: a few
+    // milliseconds is the expected residual, tens of milliseconds means one
+    // class is wrong and the page should not be calm about it.
+    const a = Math.abs(cd.delta_ms);
+    $("classdelta").className = "figure big " +
+      (a < 10 ? "" : a < 50 ? "warnfig" : "badfig");
+    $("classdeltanote").textContent =
+      esc(k.primary) + " − " + esc(k.secondary) + " · averaged over " +
+      dur(cd.settled_for_seconds) + " · " + signed(cd.instant_ms) + " now";
+    $("classexplain").textContent = k.primary === "radio"
+      ? "This is the radio delay model's absolute error: the chain, codec and " +
+        "decoder-bias constants every receiver shares cancel between receivers, " +
+        "so nothing but a source outside the radio class can measure them. " +
+        "Reported, never applied."
+      : "The difference between the two classes. Reported, never applied.";
+  } else {
+    $("classdelta").textContent = "—";
+    $("classdelta").className = "figure big";
+    $("classdeltanote").textContent = "both classes need a candidate to compare";
+    $("classexplain").textContent = k.secondary_mode === "cold"
+      ? "The " + esc(k.secondary) + " sources are cold and are not connected, so " +
+        "there is nothing to compare. Set clock.secondary to \"standby\" to measure " +
+        "them continuously without letting them into the served time."
+      : "";
+  }
+}
+
 function onTick(d) {
   tickUnix = d.unix; tickAt = performance.now();
   srvOffsetMs = d.clock_offset_ms; srvAt = tickAt; srvRatePpm = d.clock_rate_ppm || 0;
@@ -403,14 +553,32 @@ function onTick(d) {
   }
 
   $("ver").textContent = "v" + (d.version || "");
+  const nReady = d.sources_ready != null ? d.sources_ready : d.sources_locked;
   $("sub").textContent = "up " + dur(d.uptime_seconds) + " · NTP on port " + d.ntp.port +
-    " · " + d.sources_locked + " of " + d.sources_total + " sources locked";
+    " · " + nReady + " of " + d.sources_total + " sources ready";
 
   const tone = d.synchronised ? dispTone(d.dispersion_ms) : "bad";
+  const k = d.clock || {};
+  // The served stratum, which is no longer always 1: it is 1 while a radio
+  // source is in the answer and one below the upstream when the time has
+  // failed over to one. Saying "stratum 1" regardless would be the one lie
+  // this page could tell that a client would act on.
   $("syncpill").innerHTML = '<span class="pill ' + tone + '">' +
-    (d.synchronised ? "stratum 1 · " + esc(d.refid) : "unsynchronised") + "</span>" +
-    (d.leap_pending ? ' <span class="pill warn">leap pending</span>' : "");
-  $("syncnote").textContent = d.note || "";
+    (d.synchronised ? "stratum " + d.stratum + " · " + esc(d.refid) : "unsynchronised") +
+    "</span>" +
+    (d.leap_pending ? ' <span class="pill warn">leap pending</span>' : "") +
+    (k.serving === "secondary" ? ' <span class="pill bad">failed over to ' +
+        esc(k.secondary) + "</span>" : "") +
+    (k.failover_in_seconds != null ? ' <span class="pill warn">failing over in ' +
+        k.failover_in_seconds.toFixed(0) + "s</span>" : "") +
+    (k.failback_in_seconds != null ? ' <span class="pill warn">failing back in ' +
+        k.failback_in_seconds.toFixed(0) + "s</span>" : "");
+  $("syncnote").textContent = d.note || k.serving_note || "";
+
+  $("stratum").textContent = d.synchronised ? String(d.stratum) : "—";
+  $("stratumnote").textContent = !d.synchronised ? "unsynchronised"
+    : d.stratum === 1 ? "radio reference, no NTP path above"
+    : "via " + esc(d.refid) + ", root delay " + ms(d.root_delay_ms);
   const card = $("clockcard").classList;
   for (const t of ["ok", "warn", "bad"]) card.toggle("tone-" + t, t === tone);
 
@@ -424,7 +592,41 @@ function onTick(d) {
   $("ntpnote").textContent = d.ntp.answered.toLocaleString() + " answered, " +
     d.ntp.ignored.toLocaleString() + " ignored";
 
-  $("rows").innerHTML = d.sources.map((s) => {
+  // --- the two classes ---------------------------------------------------
+  const radio = d.sources.filter((s) => s.kind !== "ntp");
+  const peers = d.sources.filter((s) => s.kind === "ntp");
+  renderClasses(d, k, radio, peers);
+
+  $("radiocard").hidden = radio.length === 0;
+  $("ntpcard").hidden = peers.length === 0;
+
+  $("ntprows").innerHTML = peers.map((s) => {
+    const n = s.ntp || {};
+    return "<tr>" +
+      '<td class="name">' + esc(s.name) +
+        (s.in_use ? ' <span class="used">in use</span>' : "") +
+        (!s.in_use && s.not_used_reason
+          ? '<div class="note" style="white-space:normal">not used: ' +
+            esc(s.not_used_reason) + "</div>"
+          : "") +
+        '<div class="note">' + esc(n.address || n.server || "") + "</div></td>" +
+      '<td><span class="pill ' + peerTone(s.state) + '">' + esc(s.state) + "</span>" +
+        (n.kiss_code ? ' <span class="pill bad">' + esc(n.kiss_code) + "</span>" : "") +
+        "</td>" +
+      '<td class="n">' + (n.stratum ? n.stratum : "—") + "</td>" +
+      "<td>" + esc(n.refid || "—") + "</td>" +
+      // Octal, because that is the form every NTP tool prints a reach
+      // register in: 377 is eight polls answered out of eight.
+      '<td class="n" title="one bit per poll, newest first; 377 is eight of eight">' +
+        esc(n.reach_octal || "000") + "</td>" +
+      '<td class="n">' + (n.poll_seconds ? n.poll_seconds.toFixed(0) + "s" : "—") + "</td>" +
+      '<td class="n">' + (n.delay_ms ? ms(n.delay_ms, 2) : "—") + "</td>" +
+      '<td class="n">' + (s.have_offset ? signed(s.offset_ms) : "—") + "</td>" +
+      '<td class="n">' + (s.have_offset ? ms(s.dispersion_ms) : "—") + "</td>" +
+      '<td class="n">' + s.samples + "</td></tr>";
+  }).join("");
+
+  $("rows").innerHTML = radio.map((s) => {
     const stage = s.state === "locked" ? "locked"
       : s.link !== "streaming" ? "no audio"
       : !s.tone_detected ? "no tick"
@@ -453,8 +655,90 @@ function onTick(d) {
   }).join("");
 }
 
+// One upstream peer's detail. A receiver's card is mostly about acquisition --
+// a tick, an edge, a frame, a vote -- and a peer has none of those; what it has
+// instead is an account of its own quality, which it sends in every packet and
+// which is worth showing rather than folding away.
+function peerRows(x) {
+  const n = x.ntp || {}, t = x.timing;
+  return [
+    ["In use", x.in_use ? "yes"
+      : "no — " + esc(x.not_used_reason || x.not_ready_reason || "not yet considered")],
+    ["Server", esc(n.server || "") + ":" + n.port +
+      (n.address && n.address !== n.server + ":" + n.port
+        ? " → " + esc(n.address) : "") +
+      '<br><span class="note">' + (x.primary_class ? "primary" : "secondary") +
+      " class · weight " + x.weight + "</span>"],
+    ["Reachability", '<span class="pill ' + peerTone(x.decoder ? x.decoder.state : "") +
+      '">reach ' + esc(n.reach_octal || "000") + "</span> " +
+      // The register drawn out, newest poll on the left, because the shape of
+      // it says more than the number: 377 is healthy, 300 is a peer that has
+      // just come back, 177 is one that has just missed a poll.
+      '<span class="reachbits">' + reachBits(n.reach) + "</span>" +
+      '<br><span class="note">one bit per poll, newest first; 377 is eight of eight' +
+      (n.last_reply_age_seconds != null && n.last_reply_age_seconds < 1e8
+        ? " · last reply " + dur(n.last_reply_age_seconds) + " ago" : "") + "</span>"],
+    ["Polling", (n.poll_seconds || 0).toFixed(0) + " s" +
+      (n.configured_poll_seconds && n.poll_seconds > n.configured_poll_seconds
+        ? " — backed off from " + n.configured_poll_seconds.toFixed(0) +
+          " s at the server's request"
+        : "") +
+      '<br><span class="note">' +
+      (n.sent || 0).toLocaleString() + " sent · " + (n.received || 0).toLocaleString() +
+      " answered · " + (n.rejected || 0).toLocaleString() + " refused · " +
+      (n.spikes || 0).toLocaleString() + " dropped as delay spikes</span>" +
+      (n.last_reject_reason
+        ? '<br><span class="note">last refusal: ' + esc(n.last_reject_reason) + "</span>"
+        : "")],
+    ["Server's own claim", n.received
+      ? "stratum " + n.stratum + " of " + (n.max_stratum || "—") + " allowed, refid " +
+        esc(n.refid) + ", leap " + leapWord(n.leap) +
+        '<br><span class="note">root delay ' + ms(n.root_delay_ms) +
+        " · root dispersion " + ms(n.root_dispersion_ms) + " · precision " +
+        (n.server_precision_us || 0).toFixed(1) + " µs</span>"
+      : "no reply yet"],
+    ["Root distance", n.received
+      ? ms(n.root_distance_ms) + " of " + ms(n.max_root_distance_ms, 0) + " allowed" +
+        '<br><span class="note">(root delay + this round trip) / 2 + root dispersion — ' +
+        "how far the server is from its own reference, which nothing here improves on " +
+        "and which sets the floor under the dispersion below</span>"
+      : "—"],
+    ["Offset", t.have_offset
+      ? signed(t.offset_ms) + " ± " + ms(t.dispersion_ms) + " — jitter " + ms(t.jitter_ms) +
+        ", " + t.samples + " samples, newest " + dur(t.age_seconds) + " old" +
+        '<br><span class="note">worth ' + ms(t.weight_dispersion_ms) +
+        " against the other sources: the round trip and its scatter, without the " +
+        "server's own distance, which is not this path's to claim credit or blame for</span>"
+      : "none yet"],
+    ["Frequency", t.rate_measured
+      ? t.rate_ppm.toFixed(2) + " ± " + t.rate_uncertainty_ppm.toFixed(2) + " ppm over " +
+        dur(t.rate_span_seconds) +
+        '<br><span class="note">this host\'s crystal against the server, worth ' +
+        ms(t.rate_term_ms, 2) + " on the offset above</span>"
+      : "not yet measured — up to " + (t.rate_uncertainty_ppm || 0).toFixed(0) +
+        " ppm assumed, worth " + ms(t.rate_term_ms, 2)],
+    ["Path", "round trip " + ms(n.delay_ms, 2) + ", filter jitter " +
+      ms(n.filter_jitter_ms, 2) + " (best of the last 8 polls)" +
+      '<br><span class="note">halved to ' + ms((n.delay_ms || 0) / 2, 2) +
+      " one way, which is the assumption the protocol rests on; samples arriving " +
+      "far behind the best are dropped rather than averaged in, because delay " +
+      "above the minimum is queueing and queueing is what asymmetry is made of</span>"],
+    ["Kiss-o'-death", n.kiss_code
+      ? '<span class="pill bad">' + esc(n.kiss_code) + "</span> " +
+        (n.stopped ? "— not polling it again" : "— backing off")
+      : "none"],
+  ];
+}
+
 function onStatus(d) {
   $("detail").innerHTML = d.sources.map((x) => {
+    if (x.kind === "ntp") {
+      return '<div class="card"><div class="label">' + esc(x.name) +
+        ' <span class="pill dim">ntp</span></div>' +
+        '<div class="scroll"><table class="kv"><tbody>' +
+        peerRows(x).map((r) => "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>").join("") +
+        "</tbody></table></div></div>";
+    }
     const dec = x.decoder, t = x.timing, dl = x.delay, sc = x.sample_clock,
           l = x.link, a = x.audio;
     const rows = [
@@ -505,7 +789,8 @@ function onStatus(d) {
           ms(sc.last_excess_delay_ms) + " late"
         : "not yet fitted"],
     ];
-    return '<div class="card"><div class="label">' + esc(x.name) + "</div>" +
+    return '<div class="card"><div class="label">' + esc(x.name) +
+      ' <span class="pill dim">radio</span></div>' +
       '<div class="scroll"><table class="kv"><tbody>' +
       rows.map((r) => "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>").join("") +
       "</tbody></table></div></div>";

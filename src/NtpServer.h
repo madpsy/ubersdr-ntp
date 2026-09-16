@@ -11,11 +11,21 @@
 //
 // A radio clock is stratum 1 by definition: its reference is not another NTP
 // server. That does not make it accurate, and the fields that say how accurate
-// are the ones that matter here. Root delay is genuinely zero — there is no NTP
-// path above us — and root dispersion carries the whole error budget from the
-// Selector, propagation model included. Precision is the clock's reading
-// resolution, as RFC 5905 defines it, and nothing more: a client adds it to
-// root dispersion, so carrying the error budget in both would count it twice.
+// are the ones that matter here. Root dispersion carries the whole error budget
+// from the Selector, propagation model included.
+//
+// Stratum 1 is no longer unconditional, because the time can now come from an
+// upstream NTP server instead — as a fallback, or alongside the radio; see
+// ClockConfig. When it does, this server is one stratum below that upstream and
+// says so, and the root delay stops being zero (there is no NTP path above a
+// radio clock; there is one above a pool server) and becomes the length of the
+// path back to the primary reference. Claiming stratum 1 off a pool server
+// would be a lie of the kind everything else here takes trouble to avoid, and a
+// client told this was a radio clock would weigh it accordingly.
+//
+// Precision is the clock's reading resolution, as RFC 5905 defines it, and
+// nothing more: a client adds it to root dispersion, so carrying the error
+// budget in both would count it twice.
 //
 // TIMESTAMPS
 //

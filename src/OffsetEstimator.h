@@ -33,10 +33,62 @@
 // doubt that leaves is reported rather than hidden: the level carries up to
 // kUnmeasuredRatePpm times the distance it was carried forward.
 
+#include <algorithm>
 #include <cstddef>
 #include <deque>
 
 namespace ubersdr_ntp {
+
+// The windows the two estimates above are taken over.
+//
+// They were constants, and for the radio sources they still are: the defaults
+// here are those values unchanged. They had to become a parameter when a source
+// arrived that does not produce a sample a second. An upstream NTP peer polled
+// every 64 seconds puts TWO samples in a 120-second level window, and the level
+// needs five to be valid, so the estimator would have reported no offset for
+// that peer for ever -- not badly, but never.
+//
+// Everything here is therefore expressed against how often samples arrive, and
+// forPollInterval() derives a set from the poll interval. A window is a span of
+// time because the things it is fighting -- the path delay's wander, a step, a
+// crystal's drift -- happen in time and not in samples; a minimum count is a
+// count because a median of three is not a median. Both have to hold.
+struct OffsetTuning {
+    double levelWindowSec = 120.0;
+    int minLevelSamples = 5;
+
+    double rateWindowSec = 1800.0;
+    double minRateSpanSec = 600.0;
+    int minRateSamples = 120;
+
+    // Block length for judging the rate's uncertainty (see fitLine).
+    double blockSec = 60.0;
+    int minBlockSamples = 5;
+    int minBlocks = 5;
+
+    // A set suited to a source sampled once every `pollSec` seconds.
+    //
+    // The counts are what a robust statistic needs and no more -- a median and
+    // a MAD over four samples, a line through twenty -- because a peer polled
+    // every 64 s gathers samples slowly and a count meant for a source
+    // producing one a second would put the first usable rate hours away. The
+    // spans are the radio figures stretched to hold those counts, never
+    // shortened: the wander they are there to average over does not get faster
+    // because the polling got slower.
+    static OffsetTuning forPollInterval(double pollSec) {
+        if (!(pollSec > 0.0)) return OffsetTuning{};
+        OffsetTuning t;
+        t.minLevelSamples = 4;
+        t.levelWindowSec = std::max(120.0, 8.0 * pollSec);
+        t.minRateSamples = 20;
+        t.minRateSpanSec = std::max(600.0, 30.0 * pollSec);
+        t.rateWindowSec = std::max(1800.0, 120.0 * pollSec);
+        t.minBlockSamples = 3;
+        t.blockSec = std::max(60.0, 5.0 * pollSec);
+        t.minBlocks = 5;
+        return t;
+    }
+};
 
 struct OffsetEstimate {
     bool valid = false;          // enough samples in the level window to be a filtered value
@@ -58,6 +110,9 @@ struct OffsetEstimate {
 
 class OffsetEstimator {
 public:
+    OffsetEstimator() = default;
+    explicit OffsetEstimator(const OffsetTuning& t) : m_t(t) {}
+
     void add(double atSec, double offsetSec);
     void clear();
     bool empty() const { return m_samples.empty(); }
@@ -69,6 +124,8 @@ public:
 private:
     struct Sample { double at; double offset; };
     void recompute();
+
+    OffsetTuning m_t;
 
     std::deque<Sample> m_samples;
     double m_newestAt = 0.0;

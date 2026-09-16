@@ -14,10 +14,21 @@ and gone at 3am, 5 MHz is the other way round, and a receiver on another
 continent hears a different subset again. Redundancy here is about the band, not
 about hardware.
 
+It can also take time from ordinary **upstream NTP servers**, as a second and
+deliberately different class of source — see [Two classes of
+source](#two-classes-of-source). The band dies every night and takes every
+receiver hearing the same transmitter with it; the network dies for its own
+unrelated reasons. Neither failure covers the other.
+
 ## What this is, and what it is not
 
 It is a **stratum-1 radio clock**: its reference is not another NTP server. That
 is a statement about topology, not accuracy.
+
+(That holds while the time is coming from the radio, which is the default and
+the point. If it has failed over to an upstream NTP server it is stratum *N+1*
+for that server's *N*, and it says so in every packet — see [Two classes of
+source](#two-classes-of-source).)
 
 ### How accurate is it, actually
 
@@ -131,6 +142,31 @@ statically, the rest are not:
 ```bash
 sudo apt-get install -y libopus0 libcurl4 libssl3
 ```
+
+### Tests
+
+`build.sh` runs `tools/selftest.py` against each release binary — it drives the
+real NTP socket and the real HTTP service, including synchronising from an
+upstream NTP server (a fake one on the loopback, so it needs no network). The
+rest are offline, need no receiver and no network, and are built alongside the
+daemon:
+
+```bash
+./build-native/ubersdr-ntp-decodertest   # the DSP: synthesised WWV/WWVH/WWVB
+./build-native/ubersdr-ntp-clocktest     # offset/rate estimator, sample clock, Selector
+./build-native/ubersdr-ntp-ntptest       # the NTP client, against a fake server
+./build-native/ubersdr-ntp-configtest    # the configuration reader
+python3 tools/selftest.py ./build-native/ubersdr-ntp
+```
+
+`clocktest` covers the two-class logic: failover and failback, the
+[anti-oscillation hysteresis](#failing-over-and-not-oscillating), the stratum
+rule, and that the agreement test never lets one class convict the other.
+`ntptest` points a real peer at a fake server whose clock is deliberately wrong
+by a known amount, and checks that the offset is recovered, that queued replies
+are filtered out, and that a forged reply, an unsynchronised server, an
+excessive stratum or root distance, and a synchronisation loop are each refused
+with a reason a person can read.
 
 ## Run
 
@@ -417,8 +453,10 @@ and `/api/status` show the rate each source measures and how well.
 
 ## Several sources
 
-Each source runs its own session, its own decoder and its own offset estimate.
-Combining them is the same problem NTP solves, so it is solved the same way:
+Each source runs its own connection and its own offset estimate — a receiver
+its decoder, an upstream peer its clock filter — and each reports the same
+quantity: UTC minus this daemon's own free-running oscillator. Combining them
+is the same problem NTP solves, so it is solved the same way:
 
 1. **Candidates** — locked, fresh, and with enough measurements to have been
    filtered.
@@ -519,6 +557,169 @@ where you have one, also removes the session time limit; without one a receiver
 may disconnect you, and re-acquiring a lock costs about four minutes of clean
 signal.
 
+## Two classes of source
+
+There are two kinds of reference: the **radio** sources above, and **upstream
+NTP servers**. They are not interchangeable, and the difference is not that one
+is more accurate — a public NTP server is very likely more accurate than this
+daemon's own radio estimate. It is **what they fail to**. The band dies every
+night and takes every receiver hearing the same transmitter with it. The network
+dies for its own unrelated reasons. Neither covers the other, and a clock meant
+to run for months unattended wants both.
+
+So one class is the **primary** and the other the **secondary**:
+
+```jsonc
+"clock": {
+  "primary":   "radio",     // or "ntp"
+  "secondary": "standby",   // "always" | "standby" | "cold"
+  "failover_after_seconds": 60,
+  "failback_after_seconds": 300,
+  "min_secondary_sources": 1
+},
+"ntp_sources": [
+  "time.cloudflare.com",
+  "0.pool.ntp.org",
+  { "server": "192.168.1.1", "poll_seconds": 32, "weight": 2.0 }
+]
+```
+
+As many upstreams as you like, exactly as with the radio sources, and for the
+same reason: each is an independent candidate, so the agreement test that
+catches one receiver misdecoding also catches one NTP server that has gone
+wrong. A bare string is a hostname; `HOST:PORT` and `[v6addr]:PORT` also work.
+
+### The three secondary modes
+
+They differ in two independent things — whether the secondary is **connected**,
+and whether it **contributes**:
+
+| | connected | contributes | failover costs |
+|---|---|---|---|
+| `always` | yes | yes | nothing; it is already in the answer |
+| `standby` *(default)* | yes | only on failover | nothing; it is already warm |
+| `cold` | only on failover | only on failover | minutes, while it acquires |
+
+`standby` is the default because it is almost free and it buys two things
+`cold` does not: the standby is **known to be working before it is needed**, and
+the difference between the two classes is measured continuously — which is worth
+more than the failover, and is the next section.
+
+`cold` earns its place on a public receiver, which caps concurrent sessions per
+address (two is common). A standby nobody is using should not hold one of them.
+
+### The difference between the classes is the interesting number
+
+Every radio source shares the same chain delay, the same codec delay and the
+same decoder edge bias. Those terms **cancel exactly** in any comparison between
+receivers, so no number of receivers can measure them — which is why [the chain
+constant](#the-chain-constant-is-about-3-ms-too-large) has only ever been an
+estimate, and why the 3.4 ms bias at the top of this README could be stated but
+not attributed.
+
+An upstream NTP server does not share them. So while both classes are measured
+at once — `always`, and `standby`, which is what standby is *for* — the
+difference between their consensuses is a **direct reading of the radio delay
+model's absolute error**. It is on the status page as a headline figure, in
+`/api/status` as `clock.class_delta`, and in the log block:
+
+```
+clock: primary is radio (2 candidate(s)), ntp is standby (2 candidate(s))
+       serving from: primary
+       radio minus ntp: +3.2 ms averaged (+2.9 ms now), over 41m, 2 vs 2 source(s)
+         — the radio delay model's absolute error, which no number of
+           receivers can measure. Reported, never applied.
+```
+
+**Reported, never applied.** Correcting the radio to agree with the network
+would make the two agree by construction and destroy the only independent check
+in the arrangement — and it would be steering a stratum-1 radio clock to match a
+stratum-2 network one, which is the wrong way round on a machine whose whole
+purpose is not depending on that network.
+
+### Failing over, and not oscillating
+
+The two hold-downs are deliberately different numbers. Failing over is cheap and
+failing over late is expensive, so a minute is enough. Failing *back* costs a
+step in the served time for no gain if the primary is about to drop out again —
+and a decoder coming out of a fade does not return cleanly, it locks and loses
+the lock repeatedly for several minutes. So the primary has to stay healthy for
+five minutes before it is believed again.
+
+That asymmetry is what keeps a flapping receiver from turning into a sawtooth on
+every client. Measured in `tools/clocktest.cpp`, against a radio source flapping
+for an hour with the two classes 6 ms apart:
+
+| flap | switches in an hour | unsynchronised | worst step seen |
+|---|---|---|---|
+| 30 s up / 30 s down | **0** — it coasts through | none | 0.000 ms |
+| 200 s up / 200 s down (9 cycles) | **1** | none | 6.0 ms |
+
+Zero for the fast flap because 30 s never clears the 60 s hold-down; one for the
+slow flap because the 200 s healthy half never reaches the 300 s failback
+interval, so it fails over once and stays put rather than switching every cycle.
+Hysteresis that never releases would be a one-way door, so that is checked too:
+a primary healthy for longer than the failback interval does take back.
+
+In `cold` mode the standby is brought up **the moment the primary drops**, not
+after the hold-down — acquiring takes minutes, so waiting would spend the
+hold-down doing nothing — and is stood down again only once the primary has
+proved itself for the full failback interval.
+
+### Stratum, honestly
+
+A radio source is a *reference*, not a server, so it counts as stratum 0 and
+serving from one is stratum 1. An upstream at stratum 2 makes this stratum 3.
+The rule is NTP's own — one more than the lowest stratum among the selected
+sources — so a mixed set is still stratum 1, because a radio reference really is
+in it.
+
+When the answer does come from an upstream, the reference identifier becomes
+that server's address (as RFC 5905 requires above stratum 1) and **root delay
+stops being zero**: there is an NTP path above this server now, and its length
+is reported. Serving stratum 1 off a pool server would be a lie of exactly the
+kind the rest of this program takes trouble to avoid.
+
+### What the client does
+
+It is an ordinary NTPv4 client — mode 3 out, mode 4 back, offset and delay from
+the four timestamps — with the usual protections and two details worth naming.
+
+The transmit timestamp it sends is **64 random bits, not the clock**, and a
+reply is refused unless its originate field returns them verbatim. Forging a
+reply then requires being on the path; a real clock is guessable to within the
+poll interval, and random bits are not. `chrony` does the same.
+
+And the timestamps are taken on the **daemon clock** (the free-running
+oscillator this program measures everything on), not the host clock, so the
+offset a peer produces is "UTC minus the daemon clock" — bit for bit the same
+quantity a WWV decoder produces. That is what lets one Selector intersect and
+average both kinds without a conversion in between.
+
+A reply is refused, with a reason that reaches the status page, if it does not
+echo the nonce, if the server says it is unsynchronised, if its stratum or its
+own root distance is past the configured limit, or if **its reference is one of
+this host's own addresses** — which means it is synchronised to this daemon and
+taking time from it would close a loop with no radio anywhere in the circle.
+Kiss-o'-death `DENY` and `RSTR` stop the polling for good; `RATE` slows it down
+to what the server asked for, and eases back after eight clean polls so one kiss
+on the opening burst does not leave a fallback permanently too slow to be one.
+
+Eight samples sit in a clock filter and the smallest round trip among them sets
+the reference, because delay above the minimum is queueing and queueing is what
+path asymmetry is made of. Samples far behind that minimum are **dropped**
+rather than averaged in.
+
+### The agreement test does not cross the classes
+
+The [consensus veto](#the-consensus-veto) refuses a source more than 30 ms from
+its fellows, and that is only sound because every radio source is hearing one
+transmitter and one second edge. A radio source and an NTP server have no such
+relationship — the gap between them is the delay model's error, a real quantity
+that can honestly exceed 30 ms on a path the model does not fit. So residuals
+are computed **within a class**, and the two classes never convict each other.
+Their disagreement is reported instead, above.
+
 ## Reconnection
 
 Forever, with exponential backoff from 2 s to **30 s**, jittered by ±25%.
@@ -574,6 +775,12 @@ reason: an operator can only trust what it says if nobody can change it.
 
 ## When nothing is locked
 
+If a secondary class is configured, it takes over — after
+`failover_after_seconds`, which pre-empts the coast below, because a reachable
+NTP server is a better answer than an hour of extrapolating a crystal. What
+follows is what happens when there is nothing to fail over to, or the secondary
+is down as well.
+
 It keeps answering, coasting along the last good offset at the rate it was
 last measured moving — the daemon clock is a crystal, and a crystal keeps its
 rate when the radio goes quiet — with root dispersion growing at
@@ -589,11 +796,29 @@ per-source block every `status_interval_seconds` — which is how you see what
 each source is doing under systemd with no terminal:
 
 ```
-source         link       stn    state     stage      tickdB  vote    qual      offset      disp       n
+clock: primary is radio (2 candidate(s)), ntp is standby (2 candidate(s))
+       serving from: primary
+       radio minus ntp: +0.4 ms averaged (-0.0 ms now), over 12m, 2 vs 2 source(s)
+         — the radio delay model's absolute error, which no number of
+           receivers can measure. Reported, never applied.
+
+radio source   link       stn    state     stage      tickdB  vote    qual      offset      disp       n
 --------------------------------------------------------------------------------------------------------
 wwv10          streaming  wwv    locked    locked       18.3   4/8    100%    +12.4 ms    21.0ms      97
 wwv15          streaming  unknown acquiring no tick       0.4   0/8       -           -         -       0
+
+ntp source     state       st refid           reach    poll    delay      offset      disp       n
+--------------------------------------------------------------------------------------------------
+time.cloudflare.com locked  3 10.29.8.4         377     64s    11.9ms     +0.1 ms    18.9ms       9
+192.168.9.1    locked       2 192.168.9.99      377     64s     0.2ms     -2.0 ms    26.6ms       9
 ```
+
+The two classes get their own tables, because the columns that matter differ
+completely: a tick SNR and a vote count say nothing about an upstream server,
+and a stratum and a reach register say nothing about a receiver. `reach` is
+NTP's own eight-bit shift register, one bit per poll with the newest at the top
+and printed in octal as every other NTP tool prints it — `377` is eight polls
+answered out of eight.
 
 The `stage` column is the useful one. A time-signal decoder that is not working
 looks exactly like one working on a dead band — it says nothing either way — so
@@ -628,6 +853,33 @@ daemon uses, so set `http.listen` to `127.0.0.1` to keep it on this machine.
 | `/api/status` | Everything this daemon knows, pretty-printed |
 | `/api/sources` | Just the per-source array |
 | `/api/health` | 200 when synchronised, 503 when not, tiny either way |
+
+Every source in `/api/status` carries a `kind` of `radio` or `ntp`, a
+`primary_class` flag, and `ready` / `not_ready_reason` — the one question both
+kinds answer, and the one the Selector asks. An upstream peer adds an `ntp`
+object with its stratum, refid, reach register, round trip, filter jitter, root
+distance against the configured limit, and the counts of polls sent, answered,
+refused and dropped as delay spikes.
+
+`served.stratum` and `served.root_delay_ms` say where the time actually came
+from, and a `clock` object carries the arrangement and the headline figure:
+
+```jsonc
+"clock": {
+  "primary": "radio", "secondary": "ntp", "secondary_mode": "standby",
+  "serving": "primary",              // primary | secondary | both | coasting | none
+  "primary_candidates": 2, "secondary_candidates": 2,
+  "failover_in_seconds": null,       // non-null while a swap is pending
+  "failback_in_seconds": null,
+  "class_delta": {                   // the radio delay model's absolute error
+    "valid": true, "delta_ms": 0.42, "instant_ms": 0.07,
+    "settled_for_seconds": 1412, "primary_sources": 2, "secondary_sources": 2
+  }
+}
+```
+
+The same summary rides on every one-second `tick` event, so a display follows a
+failover as it happens rather than at the next 5 s `status`.
 
 ### `/api/time`
 

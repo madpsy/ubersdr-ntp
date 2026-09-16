@@ -255,6 +255,15 @@ SourceSnapshot snapshotAt(const std::string& name, double atSec, double offsetSe
     SourceSnapshot s;
     s.name = name;
     s.enabled = true;
+    s.kind = SourceKind::Radio;
+    s.primaryClass = true;
+    s.active = true;
+    // `ready` is the field the Selector actually reads -- a source says in one
+    // bool whether it has anything worth considering, so that the Selector does
+    // not have to know what a decoder lock or a reach register is. clockState
+    // is what the status report renders; setting only that would build a
+    // snapshot that looks locked and is not a candidate.
+    s.ready = true;
     s.clockState = "locked";
     s.station = "wwv";
     s.haveOffset = true;
@@ -269,6 +278,496 @@ SourceSnapshot snapshotAt(const std::string& name, double atSec, double offsetSe
     s.weightDispersionSec = 0.003;
     s.jitterSec = 0.002;
     return s;
+}
+
+// An upstream NTP peer's snapshot, for the two-class tests below.
+SourceSnapshot peerAt(const std::string& name, double atSec, double offsetSec, double now,
+                      int stratum = 2) {
+    SourceSnapshot s;
+    s.name = name;
+    s.enabled = true;
+    s.active = true;
+    s.ready = true;
+    s.kind = SourceKind::Ntp;
+    s.primaryClass = false;          // overridden by the caller when ntp is primary
+    s.clockState = "locked";
+    s.haveOffset = true;
+    s.offsetSec = offsetSec;
+    s.offsetAtSec = atSec;
+    s.offsetRate = 0.0;
+    s.offsetRateMeasured = true;
+    s.offsetRateUncertainty = 1e-6;
+    s.offsetAgeSec = now - atSec;
+    s.offsetSamples = 40;
+    s.dispersionSec = 0.010;
+    s.weightDispersionSec = 0.002;
+    s.jitterSec = 0.001;
+    s.ntp.stratum = stratum;
+    s.ntp.refid = "198.51.100.7";
+    s.ntp.address = "198.51.100.7:123";
+    s.ntp.addressRefid = 0xC6336407u;   // 198.51.100.7
+    s.ntp.rootDelaySec = 0.012;
+    s.ntp.rootDispersionSec = 0.004;
+    s.ntp.delaySec = 0.008;
+    s.ntp.reach = 0377;
+    return s;
+}
+
+// Runs the selector forward over `seconds`, one call a second, and returns the
+// last result. combine() is driven by the `now` it is handed, so a test can
+// cover an hour in a millisecond -- and the hold-downs and the five-minute
+// residual average are all measured in that time rather than in calls.
+Combined run(Selector& sel, std::vector<SourceSnapshot>& snaps, double& now, double seconds,
+             void (*each)(std::vector<SourceSnapshot>&, double) = nullptr) {
+    Combined c;
+    for (double t = 0.0; t < seconds; t += 1.0) {
+        now += 1.0;
+        if (each) each(snaps, now);
+        c = sel.combine(snaps, now);
+    }
+    return c;
+}
+
+bool used(const Combined& c, const std::string& name) {
+    return std::find(c.usedNames.begin(), c.usedNames.end(), name) != c.usedNames.end();
+}
+
+std::string reasonFor(const Combined& c, const std::string& name) {
+    const auto it = c.notUsedReasons.find(name);
+    return it == c.notUsedReasons.end() ? std::string() : it->second;
+}
+
+// --- both classes at once -------------------------------------------------
+void testAlwaysMode() {
+    std::printf("\nTwo classes, secondary \"always\": both contribute to one answer\n");
+
+    ClockConfig k;
+    k.primary = SourceKind::Radio;
+    k.secondary = SecondaryMode::Always;
+    Selector sel(3600.0, 15.0, 1, k);
+
+    double now = 1000.0;
+    std::vector<SourceSnapshot> snaps = {
+        snapshotAt("wwv10", now, 0.100, 0.0, now),
+        snapshotAt("wwv15", now, 0.102, 0.0, now),
+        peerAt("pool-a", now, 0.101, now),
+        peerAt("pool-b", now, 0.099, now),
+    };
+    const Combined c = sel.combine(snaps, now);
+
+    check("all four are candidates", c.candidates == 4, "%d", c.candidates);
+    check("all four are used", c.used == 4, "%d", c.used);
+    check("a radio source and a peer are both in the answer",
+          used(c, "wwv10") && used(c, "pool-a"));
+    check("serving from both classes", c.serving == ServingClass::Both,
+          "%s", servingClassName(c.serving));
+    // A radio reference is in the selected set, so this is a stratum-1 radio
+    // clock -- which is what NTP would say of any server with a refclock among
+    // its selected peers.
+    check("stratum stays 1 while a radio source is in the answer", c.stratum == 1,
+          "%d", c.stratum);
+    check("...so the refid is the station, not an address",
+          !c.refidIsAddress && c.refid == "WWV", "%s", c.refid.c_str());
+    check("...and the root delay is zero: no NTP path above a radio clock",
+          c.rootDelaySec == 0.0, "%.1f ms", c.rootDelaySec * 1000.0);
+    check("the combined offset sits among the sources",
+          std::abs(c.offsetSec - 0.1005) < 0.002, "%+.2f ms", c.offsetSec * 1000.0);
+}
+
+void testStratumFromUpstream() {
+    std::printf("\nServing from upstreams alone: the stratum has to say so\n");
+
+    ClockConfig k;
+    k.secondary = SecondaryMode::Always;
+    Selector sel(3600.0, 15.0, 1, k);
+
+    double now = 1000.0;
+    std::vector<SourceSnapshot> snaps = {
+        peerAt("pool-a", now, 0.100, now, 2),
+        peerAt("pool-b", now, 0.101, now, 3),
+    };
+    const Combined c = sel.combine(snaps, now);
+
+    check("both peers are used", c.used == 2, "%d", c.used);
+    // One more than the LOWEST stratum among the survivors. Claiming stratum 1
+    // here would tell every client this was a radio clock.
+    check("stratum is one below the best upstream", c.stratum == 3, "%d", c.stratum);
+    check("the refid becomes the server's address", c.refidIsAddress,
+          "%s", c.refid.c_str());
+    check("...carried as the four bytes the packet needs",
+          c.refidAddress == 0xC6336407u, "%08x", c.refidAddress);
+    // There IS an NTP path above us now, and its length is not zero.
+    check("the root delay is the path back to the primary reference",
+          c.rootDelaySec > 0.015 && c.rootDelaySec < 0.025,
+          "%.1f ms", c.rootDelaySec * 1000.0);
+    check("serving from the secondary class", c.serving == ServingClass::Secondary,
+          "%s", servingClassName(c.serving));
+}
+
+// --- standby, and the failover ---------------------------------------------
+void testStandbyAndFailover() {
+    std::printf("\nSecondary \"standby\": measured continuously, held out until needed\n");
+
+    ClockConfig k;
+    k.primary = SourceKind::Radio;
+    k.secondary = SecondaryMode::Standby;
+    k.failoverAfterSec = 60.0;
+    k.failbackAfterSec = 300.0;
+    Selector sel(3600.0, 15.0, 1, k);
+
+    double now = 1000.0;
+    std::vector<SourceSnapshot> snaps = {
+        snapshotAt("wwv10", now, 0.100, 0.0, now),
+        peerAt("pool-a", now, 0.104, now),
+    };
+    // Keep both measurements fresh as the clock advances, so nothing drops out
+    // for staleness while the hold-downs are being tested.
+    auto refresh = [](std::vector<SourceSnapshot>& v, double t) {
+        for (SourceSnapshot& s : v) {
+            if (!s.ready) continue;
+            s.offsetAtSec = t;
+            s.offsetAgeSec = 0.0;
+        }
+    };
+
+    Combined c = run(sel, snaps, now, 130.0, refresh);
+    check("the radio serves", used(c, "wwv10") && c.used == 1, "%d used", c.used);
+    check("the peer is held out", !used(c, "pool-a"));
+    // Held out is not broken, and the page has to say which of the two it is.
+    check("...and said to be standing by, not failing",
+          reasonFor(c, "pool-a").find("standing by") != std::string::npos,
+          "%s", reasonFor(c, "pool-a").c_str());
+    check("serving from the primary", c.serving == ServingClass::Primary,
+          "%s", servingClassName(c.serving));
+
+    // The class delta: the whole reason standby is worth having over cold.
+    check("the two classes are compared anyway", c.classDelta.valid);
+    check("...and the difference is the planted 4 ms",
+          std::abs(c.classDelta.averagedSec - (-0.004)) < 0.0005,
+          "%+.2f ms", c.classDelta.averagedSec * 1000.0);
+    check("...measured over the time both have been up",
+          c.classDelta.settledForSec > 100.0, "%.0f s", c.classDelta.settledForSec);
+
+    // --- the radio goes away ------------------------------------------------
+    snaps[0].ready = false;
+    snaps[0].haveOffset = false;
+    snaps[0].clockState = "unlocked";
+    snaps[0].notReadyReason = "no tick: nothing at 1000 Hz to time a second from";
+
+    c = run(sel, snaps, now, 30.0, refresh);
+    check("30 s in, it coasts rather than switching", c.serving == ServingClass::Coasting,
+          "%s", servingClassName(c.serving));
+    check("...and says the swap is coming, with how long is left",
+          c.failoverInSec > 0.0 && c.failoverInSec < 35.0, "%.0f s", c.failoverInSec);
+
+    c = run(sel, snaps, now, 45.0, refresh);
+    check("past the hold-down it fails over to the peer",
+          c.serving == ServingClass::Secondary && used(c, "pool-a"),
+          "%s", servingClassName(c.serving));
+    check("...and the stratum follows the source it is now serving from",
+          c.stratum == 3, "%d", c.stratum);
+    check("...and it is still synchronised throughout", c.synchronised);
+
+    // --- the radio comes back, and must not be believed at once -------------
+    snaps[0] = snapshotAt("wwv10", now, 0.100, 0.0, now);
+    c = run(sel, snaps, now, 120.0, refresh);
+    check("a returning radio source does not take back immediately",
+          c.serving == ServingClass::Secondary, "%s", servingClassName(c.serving));
+    check("...and says how long it must stay healthy first",
+          c.failbackInSec > 0.0, "%.0f s", c.failbackInSec);
+    check("...and the radio is named as recovering, not as broken",
+          reasonFor(c, "wwv10").find("taking back") != std::string::npos,
+          "%s", reasonFor(c, "wwv10").c_str());
+
+    c = run(sel, snaps, now, 200.0, refresh);
+    check("after the failback interval the radio takes back",
+          c.serving == ServingClass::Primary && used(c, "wwv10"),
+          "%s", servingClassName(c.serving));
+    check("...and the stratum returns to 1", c.stratum == 1, "%d", c.stratum);
+}
+
+// --- flapping must not become oscillation ----------------------------------
+//
+// The failure this guards against is specific and it is not hypothetical: a
+// decoder coming out of a fade does not come back cleanly, it locks and loses
+// the lock repeatedly for several minutes. If the served time followed that,
+// every cycle would be a step of the whole radio-to-network difference --
+// several milliseconds, sometimes tens -- landing on clients as a sawtooth,
+// which is worse for them than either class alone would have been.
+//
+// Two flap rates, because they fail differently. A flap shorter than the
+// failover hold-down must not switch at all; a flap longer than it must switch
+// ONCE and then stay put, because the failback interval is longer than the
+// flap's healthy half. And through both, the clock must stay synchronised --
+// stability that was bought by refusing to serve would be no bargain.
+void testNoOscillation() {
+    std::printf("\nA flapping primary must not make the served time oscillate\n");
+
+    ClockConfig k;
+    k.primary = SourceKind::Radio;
+    k.secondary = SecondaryMode::Standby;
+    k.failoverAfterSec = 60.0;
+    k.failbackAfterSec = 300.0;
+
+    // Counts class switches and watches for any loss of synchronisation over a
+    // run in which the radio is up for `upSec` and down for `downSec`, round
+    // and round.
+    struct Result {
+        int switches = 0;
+        int unsyncSeconds = 0;
+        double worstStep = 0.0;   // largest jump in the served offset between seconds
+        ServingClass ended = ServingClass::None;
+    };
+
+    auto flap = [&](double upSec, double downSec, double totalSec) {
+        Selector sel(3600.0, 15.0, 1, k);
+        double now = 1000.0;
+        // The two classes 6 ms apart, which is about what a real radio delay
+        // model leaves: every switch costs a step of that size, so a count of
+        // switches is a count of steps a client would see.
+        std::vector<SourceSnapshot> snaps = {
+            snapshotAt("wwv10", now, 0.106, 0.0, now),
+            peerAt("pool-a", now, 0.100, now),
+        };
+
+        Result r;
+        ServingClass last = ServingClass::None;
+        double lastOffset = 0.0;
+        bool haveLast = false;
+        bool radioUp = true;
+        double phaseLeft = upSec;
+
+        for (double t = 0.0; t < totalSec; t += 1.0) {
+            now += 1.0;
+            phaseLeft -= 1.0;
+            if (phaseLeft <= 0.0) {
+                radioUp = !radioUp;
+                phaseLeft = radioUp ? upSec : downSec;
+                if (radioUp) {
+                    // It comes back from nothing, as a decoder does.
+                    snaps[0] = snapshotAt("wwv10", now, 0.106, 0.0, now);
+                } else {
+                    snaps[0].ready = false;
+                    snaps[0].haveOffset = false;
+                    snaps[0].clockState = "unlocked";
+                    snaps[0].notReadyReason = "no tick";
+                }
+            }
+            for (SourceSnapshot& s : snaps) {
+                if (!s.ready) continue;
+                s.offsetAtSec = now;
+                s.offsetAgeSec = 0.0;
+            }
+
+            const Combined c = sel.combine(snaps, now);
+            // Coasting is not a class change: it is the same answer carried
+            // forward, and a client sees no step from it.
+            const ServingClass serving =
+                (c.serving == ServingClass::Coasting || c.serving == ServingClass::None)
+                    ? last : c.serving;
+            if (last != ServingClass::None && serving != last) ++r.switches;
+            if (serving != ServingClass::None) last = serving;
+            if (!c.synchronised) ++r.unsyncSeconds;
+            if (haveLast) r.worstStep = std::max(r.worstStep, std::abs(c.offsetSec - lastOffset));
+            lastOffset = c.offsetSec;
+            haveLast = true;
+        }
+        r.ended = last;
+        return r;
+    };
+
+    // A fast flap: 30 s down is shorter than the 60 s hold-down, so the
+    // failover never fires and the gaps are covered by coasting on the crystal.
+    {
+        const Result r = flap(30.0, 30.0, 1800.0);
+        check("a 30 s flap under the 60 s hold-down never switches class at all",
+              r.switches == 0, "%d switches in 30 min", r.switches);
+        check("...and the clock stays synchronised throughout", r.unsyncSeconds == 0,
+              "%d s unsynchronised", r.unsyncSeconds);
+        check("...so a client sees no step from it", r.worstStep < 0.001,
+              "worst step %.3f ms", r.worstStep * 1000.0);
+    }
+
+    // A slow flap: 200 s down clears the hold-down, so it fails over once --
+    // and then the 200 s healthy half never reaches the 300 s failback
+    // interval, so it stays put instead of switching back and forth every
+    // cycle. This is the whole reason the two hold-downs are different numbers.
+    {
+        const Result r = flap(200.0, 200.0, 3600.0);
+        check("a 200 s flap over the hold-down switches once, not once a cycle",
+              r.switches == 1, "%d switches in an hour of flapping (9 cycles)", r.switches);
+        check("...and settles on the secondary", r.ended == ServingClass::Secondary,
+              "%s", servingClassName(r.ended));
+        check("...and the clock stays synchronised throughout", r.unsyncSeconds == 0,
+              "%d s unsynchronised", r.unsyncSeconds);
+        check("...with one step, of about the difference between the classes",
+              r.worstStep > 0.001 && r.worstStep < 0.020,
+              "worst step %.1f ms", r.worstStep * 1000.0);
+    }
+
+    // And once the primary is genuinely well again, it does take back --
+    // hysteresis that never releases is not hysteresis, it is a one-way door.
+    {
+        Selector sel(3600.0, 15.0, 1, k);
+        double now = 1000.0;
+        std::vector<SourceSnapshot> snaps = {
+            snapshotAt("wwv10", now, 0.106, 0.0, now),
+            peerAt("pool-a", now, 0.100, now),
+        };
+        auto refresh = [](std::vector<SourceSnapshot>& v, double t) {
+            for (SourceSnapshot& s : v) {
+                if (!s.ready) continue;
+                s.offsetAtSec = t;
+                s.offsetAgeSec = 0.0;
+            }
+        };
+        run(sel, snaps, now, 60.0, refresh);
+        snaps[0].ready = false;
+        snaps[0].haveOffset = false;
+        Combined c = run(sel, snaps, now, 90.0, refresh);
+        check("it failed over to start with", c.serving == ServingClass::Secondary,
+              "%s", servingClassName(c.serving));
+
+        snaps[0] = snapshotAt("wwv10", now, 0.106, 0.0, now);
+        c = run(sel, snaps, now, 400.0, refresh);
+        check("a primary healthy for longer than the failback interval does take back",
+              c.serving == ServingClass::Primary, "%s", servingClassName(c.serving));
+    }
+}
+
+// --- the refusal test must not cross the classes ---------------------------
+void testRefusalIsWithinAClass() {
+    std::printf("\nA source is judged by its own class and never by the other\n");
+
+    ClockConfig k;
+    k.secondary = SecondaryMode::Always;
+    Selector sel(3600.0, 15.0, 1, k);
+
+    double now = 1000.0;
+    // Three radio sources that agree with each other, and three peers that
+    // agree with each other, with the two classes 100 ms apart. That is far
+    // past the +/-30 ms refusal limit -- and it is not a fault: it is what a
+    // badly modelled radio path looks like, and the figure the class delta
+    // exists to report.
+    std::vector<SourceSnapshot> snaps = {
+        snapshotAt("wwv10", now, 0.200, 0.0, now),
+        snapshotAt("wwv15", now, 0.201, 0.0, now),
+        snapshotAt("wwv20", now, 0.199, 0.0, now),
+        peerAt("pool-a", now, 0.100, now),
+        peerAt("pool-b", now, 0.101, now),
+        peerAt("pool-c", now, 0.099, now),
+    };
+    auto refresh = [](std::vector<SourceSnapshot>& v, double t) {
+        for (SourceSnapshot& s : v) { s.offsetAtSec = t; s.offsetAgeSec = 0.0; }
+    };
+
+    Combined c = run(sel, snaps, now, 400.0, refresh);
+
+    bool anyRefused = false;
+    for (const SourceResidual& r : c.residuals) if (r.refused) anyRefused = true;
+    check("100 ms between the classes refuses nobody", !anyRefused);
+    check("every source is still a candidate", c.candidates == 6, "%d", c.candidates);
+    check("...and the gap is reported instead",
+          c.classDelta.valid && std::abs(c.classDelta.averagedSec - 0.100) < 0.002,
+          "%+.0f ms", c.classDelta.averagedSec * 1000.0);
+    // Each source's residual is against its OWN class, so they are all small
+    // despite the classes being 100 ms apart.
+    double worst = 0.0;
+    for (const SourceResidual& r : c.residuals) worst = std::max(worst, std::abs(r.averagedSec));
+    check("...and each residual is against its own class, so all are small",
+          worst < 0.005, "worst %+.1f ms", worst * 1000.0);
+
+    // Now move ONE radio source away from its own class. That is a misdecode,
+    // there is no arrangement of receivers that explains it, and it must be
+    // refused -- which is the behaviour the cross-class exemption must not
+    // have broken.
+    Selector sel2(3600.0, 15.0, 1, k);
+    double now2 = 1000.0;
+    std::vector<SourceSnapshot> snaps2 = {
+        snapshotAt("wwv10", now2, 0.200, 0.0, now2),
+        snapshotAt("wwv15", now2, 0.201, 0.0, now2),
+        snapshotAt("wwv20", now2, 0.300, 0.0, now2),   // 100 ms from its peers
+        peerAt("pool-a", now2, 0.100, now2),
+        peerAt("pool-b", now2, 0.101, now2),
+        peerAt("pool-c", now2, 0.099, now2),
+    };
+    Combined c2 = run(sel2, snaps2, now2, 400.0, refresh);
+
+    bool oddRefused = false;
+    for (const SourceResidual& r : c2.residuals) if (r.name == "wwv20") oddRefused = r.refused;
+    check("a radio source 100 ms from its OWN class is still refused", oddRefused);
+    check("...and only that one", c2.candidates == 5, "%d", c2.candidates);
+    check("...with a reason naming the class it disagreed with",
+          reasonFor(c2, "wwv20").find("radio") != std::string::npos,
+          "%s", reasonFor(c2, "wwv20").c_str());
+}
+
+// --- cold standby -----------------------------------------------------------
+void testColdActivation() {
+    std::printf("\nSecondary \"cold\": nothing is connected until it is needed\n");
+
+    ClockConfig k;
+    k.primary = SourceKind::Radio;
+    k.secondary = SecondaryMode::Cold;
+    k.failoverAfterSec = 60.0;
+    k.failbackAfterSec = 300.0;
+    Selector sel(3600.0, 15.0, 1, k);
+
+    check("before the first combine the standby is already down",
+          !sel.activation().secondaryActive);
+
+    double now = 1000.0;
+    // The cold peer is present but has nothing: that is what a disconnected
+    // source looks like, and the Selector must not need it to be ready in
+    // order to decide to bring it up.
+    SourceSnapshot cold = peerAt("pool-a", now, 0.0, now);
+    cold.ready = false;
+    cold.haveOffset = false;
+    cold.active = false;
+    cold.notReadyReason = "held in cold standby";
+
+    std::vector<SourceSnapshot> snaps = { snapshotAt("wwv10", now, 0.100, 0.0, now), cold };
+    auto refresh = [](std::vector<SourceSnapshot>& v, double t) {
+        for (SourceSnapshot& s : v) {
+            if (!s.ready) continue;
+            s.offsetAtSec = t;
+            s.offsetAgeSec = 0.0;
+        }
+    };
+
+    run(sel, snaps, now, 60.0, refresh);
+    check("while the radio is healthy it stays down", !sel.activation().secondaryActive);
+    check("...and says why", sel.activation().reason.find("healthy") != std::string::npos,
+          "%s", sel.activation().reason.c_str());
+
+    // The radio drops. Bringing a cold source up takes minutes, so it must
+    // start AT ONCE rather than after the failover hold-down -- otherwise the
+    // hold-down is spent doing nothing.
+    snaps[0].ready = false;
+    snaps[0].haveOffset = false;
+    run(sel, snaps, now, 2.0, refresh);
+    check("the moment the radio drops, the standby is brought up",
+          sel.activation().secondaryActive);
+    check("...before the failover hold-down has expired, because acquiring takes time",
+          sel.activation().reason.find("warming up") != std::string::npos,
+          "%s", sel.activation().reason.c_str());
+
+    // It acquires, and then serves.
+    snaps[1] = peerAt("pool-a", now, 0.104, now);
+    Combined c = run(sel, snaps, now, 90.0, refresh);
+    check("once it has acquired and the hold-down passes, it serves",
+          c.serving == ServingClass::Secondary, "%s", servingClassName(c.serving));
+
+    // The radio returns. The standby has to stay up through the whole failback
+    // interval, or a receiver that re-locks and loses it would tear the
+    // standby down between attempts.
+    snaps[0] = snapshotAt("wwv10", now, 0.100, 0.0, now);
+    run(sel, snaps, now, 120.0, refresh);
+    check("a returning radio does not stand the standby down at once",
+          sel.activation().secondaryActive);
+    run(sel, snaps, now, 250.0, refresh);
+    check("...but it is stood down once the radio has proven itself",
+          !sel.activation().secondaryActive);
 }
 
 void testSelector() {
@@ -326,6 +825,12 @@ int main() {
     testImplausibleRate();
     testSampleClock();
     testSelector();
+    testAlwaysMode();
+    testStratumFromUpstream();
+    testStandbyAndFailover();
+    testNoOscillation();
+    testRefusalIsWithinAClass();
+    testColdActivation();
     std::printf("\n%d ok, %d failed\n", g_ok, g_failed);
     return g_failed ? 1 : 0;
 }

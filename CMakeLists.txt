@@ -70,6 +70,7 @@ target_compile_options(ubersdr-ntp-decodertest PRIVATE -Wall -Wextra)
 # selector extrapolating and coasting along the measured rate. Not installed.
 add_executable(ubersdr-ntp-clocktest
     tools/clocktest.cpp
+    src/Config.cpp
     src/OffsetEstimator.cpp
     src/SampleClock.cpp
     src/Selector.cpp
@@ -79,6 +80,40 @@ target_include_directories(ubersdr-ntp-clocktest PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_link_libraries(ubersdr-ntp-clocktest PRIVATE Threads::Threads)
 target_compile_options(ubersdr-ntp-clocktest PRIVATE -Wall -Wextra)
+
+# Offline test of the upstream NTP client: an NtpPeer against a fake NTP server
+# running in the same process on the loopback, whose clock is wrong by a known
+# amount. Checks that the offset is recovered, that the minimum-delay filter
+# rejects queued replies, that a forged reply, an unsynchronised server, an
+# excessive stratum or root distance and a synchronisation loop are all refused
+# with a reason, that kiss-o'-death is honoured, and that cold standby really
+# disconnects. Needs no network beyond the loopback; not installed.
+add_executable(ubersdr-ntp-ntptest
+    tools/ntptest.cpp
+    src/NtpClient.cpp
+    src/Config.cpp
+    src/OffsetEstimator.cpp
+    src/SampleClock.cpp
+    src/Log.cpp)
+target_include_directories(ubersdr-ntp-ntptest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(ubersdr-ntp-ntptest PRIVATE Threads::Threads)
+target_compile_options(ubersdr-ntp-ntptest PRIVATE -Wall -Wextra)
+
+# Offline test of the configuration reader: per-source passwords and other
+# per-source settings, the upstream NTP server spellings, the clock block, and
+# the validation that refuses a configuration which cannot work. Writes its
+# cases to a temporary directory and reads them back through the real loader.
+# Not installed.
+add_executable(ubersdr-ntp-configtest
+    tools/configtest.cpp
+    src/Config.cpp
+    src/Log.cpp)
+target_include_directories(ubersdr-ntp-configtest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_options(ubersdr-ntp-configtest PRIVATE -Wall -Wextra)
 
 # ---------------------------------------------------------------------------
 # The page is a real file in src/web/ and is served from the binary. This is
@@ -118,6 +153,7 @@ add_executable(ubersdr-ntp
     src/Config.cpp
     src/HttpApi.cpp
     src/Log.cpp
+    src/NtpClient.cpp
     src/NtpServer.cpp
     src/OffsetEstimator.cpp
     src/Propagation.cpp
@@ -127,7 +163,9 @@ add_executable(ubersdr-ntp
     src/Status.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc")
 add_dependencies(ubersdr-ntp index_html version_header)
-add_dependencies(ubersdr-ntp-clocktest version_header)   # Selector.h reaches Config.h, which needs it
+add_dependencies(ubersdr-ntp-clocktest version_header)
+add_dependencies(ubersdr-ntp-configtest version_header)
+add_dependencies(ubersdr-ntp-ntptest version_header)   # Selector.h reaches Config.h, which needs it
 
 target_include_directories(ubersdr-ntp PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"

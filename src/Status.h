@@ -29,6 +29,17 @@ struct StatusInput {
     double uptimeSec = 0.0;
     std::string version;
     int ntpPort = 123;
+
+    // The clock arrangement, so the report can say which class is primary and
+    // what the other is doing without a second route to the configuration.
+    // `secondaryKind` is derivable from `primaryKind` and carried anyway,
+    // because every site that wants it wants the word rather than the
+    // conditional.
+    SourceKind primaryKind = SourceKind::Radio;
+    SourceKind secondaryKind = SourceKind::Ntp;
+    SecondaryMode secondaryMode = SecondaryMode::Standby;
+    bool secondaryActive = true;
+    std::string secondaryActiveReason;
 };
 
 // The multi-line block for the log. No trailing newline; Log::block indents it.

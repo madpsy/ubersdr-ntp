@@ -34,7 +34,8 @@
     "coast_seconds": 3600,
     "coast_drift_ppm": 15.0,
 
-    // Sources that must agree before any time is served. 1 suits a
+    // Sources that must agree before any time is served, WITHIN THE PRIMARY
+    // CLASS (see "clock" below; the secondary has its own figure). 1 suits a
     // single-receiver install. 2 makes the agreement test load-bearing, which
     // buys protection against one receiver producing a CONFIDENT misread — a
     // real failure mode here, because a deep fade biases the same bits in
@@ -61,12 +62,147 @@
   },
 
   // =====================================================================
+  // THE TWO CLASSES OF SOURCE
+  //
+  // There are two kinds of reference here: the radio sources below, and
+  // upstream NTP servers. They are not interchangeable, and the difference
+  // is not about which is more accurate — a public NTP server very likely
+  // beats this daemon's own radio estimate. It is about WHAT THEY FAIL TO.
+  // The band dies every night and takes every receiver hearing the same
+  // transmitter with it. The network dies for its own unrelated reasons.
+  // Neither failure covers the other, and a clock meant to run unattended
+  // for months wants both.
+  //
+  // So one class is the primary and the other the secondary.
+  // =====================================================================
+  "clock": {
+    // Which class is trusted first. "radio" (the default) is the point of
+    // this program: a stratum-1 reference that does not depend on the
+    // network. "ntp" makes the upstreams primary and the radio the check on
+    // them, which is the right way round on a machine where the network is
+    // the reliable part and the radio is the interesting part.
+    "primary": "radio",
+
+    // What the OTHER class does while the primary is healthy.
+    //
+    //   "always"   Connected, and contributing. Both classes go into one
+    //              intersection and one weighted mean. The most accurate
+    //              arrangement, and any disagreement shows up as it happens.
+    //
+    //   "standby"  Connected and measured, but held out of the served time.
+    //              The default, and the best trade for most installs:
+    //              failover costs nothing because the standby is already
+    //              warm, a broken standby is known about BEFORE it is
+    //              needed, and the difference between the two classes is
+    //              measured continuously — which is the only absolute
+    //              reference this daemon has ever had for the constants
+    //              every radio source shares. See "the delta" below.
+    //
+    //   "cold"     Not connected at all until the primary fails. The only
+    //              mode that costs a remote receiver nothing while it is not
+    //              needed — public UberSDR receivers cap concurrent sessions
+    //              per address, usually at two — and the only one where
+    //              failover is slow, because a radio source needs about five
+    //              minutes to acquire a lock from nothing.
+    "secondary": "standby",
+
+    // How long the primary must have had nothing usable before the secondary
+    // takes over, and how long it must be healthy again before it takes back.
+    //
+    // Deliberately different. Failing over is cheap and failing over late is
+    // expensive. Failing BACK costs a step in the served time for no gain if
+    // the primary is about to drop out again — and a decoder coming out of a
+    // fade re-locks and loses it repeatedly for several minutes.
+    "failover_after_seconds": 60,
+    "failback_after_seconds": 300,
+
+    // Sources that must agree within the SECONDARY class before it may serve.
+    // ntp.min_sources governs the primary; an install with two receivers and
+    // one NTP server wants 2 and 1, and one number cannot be both.
+    "min_secondary_sources": 1
+  },
+
+  // =====================================================================
+  // UPSTREAM NTP SERVERS
+  //
+  // As many as you like, exactly as with the radio sources below, and for
+  // the same reason: each one is an independent candidate, so the same
+  // agreement test that catches one receiver misdecoding also catches one
+  // NTP server that has gone wrong.
+  //
+  // A bare string is a hostname. HOST:PORT works, and [v6addr]:PORT for an
+  // IPv6 literal.
+  //
+  // THE DELTA. While both classes are measured at once — "always", and
+  // "standby", which is what standby is for — the status page shows the
+  // difference between them. That figure is worth understanding: every radio
+  // source shares the same chain delay, codec delay and decoder edge bias, so
+  // those terms cancel exactly in any comparison between receivers and NO
+  // NUMBER OF RECEIVERS CAN MEASURE THEM. An NTP server does not share them.
+  // So the difference is a direct reading of the radio delay model's absolute
+  // error — the roughly 3 ms the README has only ever been able to estimate.
+  // It is reported and never applied: a correction that made the radio agree
+  // with the network by construction would destroy the only independent check
+  // in the arrangement.
+  // =====================================================================
+  "ntp_defaults": {
+    // Seconds between polls. 64 is NTP's own default and what a public server
+    // expects. Anything under 16 is rude to a server you do not own, and the
+    // pool's terms of service say so. The offset estimator's windows scale off
+    // this, so changing it needs nothing else changed with it.
+    "poll_seconds": 64,
+
+    // A short burst on the first poll, and whenever a cold peer is brought up.
+    // One sample is not a measurement, and a fallback that takes six minutes
+    // to become usable arrives after the outage it was for.
+    "iburst": true,
+
+    // Refuse a server whose OWN root distance is worse than this: it is
+    // telling you, in the packet, how well it knows the time.
+    "max_root_distance_ms": 500,
+
+    // The furthest up the tree to follow. Stratum 16 is unsynchronised and is
+    // always refused; this is about how much accumulated path to accept.
+    "max_stratum": 15
+  },
+
+  "ntp_sources": [
+    // A router or a server on your own network: the lowest delay available,
+    // and the one worth weighting up. Uncomment and put a comma after the
+    // entry below it.
+    // { "server": "192.168.1.1", "poll_seconds": 32, "weight": 2.0 },
+
+    // More public servers. Three or more and the agreement test has something
+    // to work with, so one of them going wrong cannot move the clock.
+    // "0.pool.ntp.org",
+    // "1.pool.ntp.org",
+
+    // Cloudflare's anycast time service, ON BY DEFAULT.
+    //
+    // A reasonable thing to ship enabled: anycast, no registration, no
+    // rate-limit surprises, and it costs one packet a minute. With the
+    // secondary on "standby" it never touches the served time while the radio
+    // is healthy — it is there to notice the radio going wrong, to measure the
+    // delay model against something that does not share its constants, and to
+    // take over when the band dies.
+    //
+    // Delete this line if the machine must talk to nothing but the receivers.
+    // That is a real requirement, and it is one line.
+    "time.cloudflare.com"
+  ],
+
+  // =====================================================================
   // SOURCES — the receivers, and what each listens to.
   //
   // More than one because HF propagation makes any single frequency
   // unreliable: 10 MHz from Fort Collins is excellent in the afternoon and
   // gone at 3am, 5 MHz is the other way round, and a receiver on another
   // continent hears a different subset again.
+  //
+  // This array is the RADIO class; upstream NTP servers are "ntp_sources"
+  // above. Every setting here is per source, passwords included: several
+  // receivers with different bypass passwords is an ordinary arrangement, and
+  // "defaults" only supplies what a source does not set for itself.
   //
   // Note that public receivers usually cap concurrent sessions per IP — two
   // is common — so several frequencies on ONE receiver often is not
