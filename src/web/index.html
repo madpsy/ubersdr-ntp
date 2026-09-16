@@ -467,6 +467,59 @@ function paintClock(ts) {
   }
 }
 
+// The failover countdowns, counted down HERE rather than redrawn from whatever
+// the server last said.
+//
+// The server's figure is correct every time it is sent. The problem is WHEN it
+// is sent: a tick is emitted on the CORRECTED second boundary, and that
+// boundary moves whenever the served offset does — which is exactly what
+// happens while a class is failing over. Two ticks can land inside one wall
+// second and the next can be skipped, so a countdown redrawn per tick reads
+// 27, 27, 25, 24 — the number is right each time and the sequence is visibly
+// erratic, which is worse than useless on a figure someone is watching to know
+// how long is left.
+//
+// So each arriving value is an ANCHOR: the seconds remaining, and the local
+// instant that was true at. Between ticks the display is interpolated from the
+// page's own monotonic clock at a steady 1 Hz, and every fresh tick re-anchors
+// it, so it stays honest without inheriting the stream's jitter. A countdown
+// that jumps back up is then a real reset — the primary recovered and lost it
+// again — rather than an artefact of when a packet arrived.
+let cdOver = null;   // {sec, at} or null
+let cdBack = null;
+
+function setCountdown(overSec, backSec) {
+  const now = performance.now();
+  cdOver = overSec != null ? { sec: overSec, at: now } : null;
+  cdBack = backSec != null ? { sec: backSec, at: now } : null;
+  paintCountdowns();
+}
+
+function paintCountdowns() {
+  const now = performance.now();
+  const draw = (id, anchor, verb) => {
+    const el = $(id);
+    if (!el) return;
+    if (!anchor) { el.textContent = ""; return; }
+    const left = anchor.sec - (now - anchor.at) / 1000;
+    // Ceiling, not rounding: "in 3s" should mean up to three seconds away, and
+    // should read 3, 2, 1 rather than spending two ticks on the same number.
+    el.textContent = left > 0.5
+      ? verb + " in " + Math.ceil(left) + "s"
+      // Past its own deadline and the server has not confirmed the swap. That
+      // is a real state, not a rounding artefact: failing over also needs the
+      // secondary to be usable, and it may not be yet.
+      : verb + " imminent";
+  };
+  draw("cdover", cdOver, "failing over");
+  draw("cdback", cdBack, "failing back");
+}
+
+// Every 250 ms rather than every second: a 1 Hz timer that is not aligned with
+// the countdown's own second boundary shows each number for anything between
+// nothing and two seconds, which is the stutter this exists to remove.
+setInterval(paintCountdowns, 250);
+
 // The primary and secondary classes, and the difference between them.
 //
 // The difference is the reason this card exists. Every radio source shares the
@@ -569,10 +622,12 @@ function onTick(d) {
     (d.leap_pending ? ' <span class="pill warn">leap pending</span>' : "") +
     (k.serving === "secondary" ? ' <span class="pill bad">failed over to ' +
         esc(k.secondary) + "</span>" : "") +
-    (k.failover_in_seconds != null ? ' <span class="pill warn">failing over in ' +
-        k.failover_in_seconds.toFixed(0) + "s</span>" : "") +
-    (k.failback_in_seconds != null ? ' <span class="pill warn">failing back in ' +
-        k.failback_in_seconds.toFixed(0) + "s</span>" : "");
+    // The two countdowns are written by paintCountdowns() rather than here,
+    // on a local 1 Hz timer -- see setCountdown. Emitted empty and filled in
+    // immediately below, so they never flash blank.
+    (k.failover_in_seconds != null ? ' <span class="pill warn" id="cdover"></span>' : "") +
+    (k.failback_in_seconds != null ? ' <span class="pill warn" id="cdback"></span>' : "");
+  setCountdown(k.failover_in_seconds, k.failback_in_seconds);
   $("syncnote").textContent = d.note || k.serving_note || "";
 
   $("stratum").textContent = d.synchronised ? String(d.stratum) : "—";

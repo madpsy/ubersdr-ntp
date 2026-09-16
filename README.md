@@ -881,6 +881,18 @@ from, and a `clock` object carries the arrangement and the headline figure:
 The same summary rides on every one-second `tick` event, so a display follows a
 failover as it happens rather than at the next 5 s `status`.
 
+The status page treats the two countdowns as *anchors* rather than redrawing
+them per tick. A tick is emitted on the **corrected** second boundary, and that
+boundary moves whenever the served offset does — which is precisely what is
+happening while a class is failing over — so two ticks can land inside one wall
+second and the next can be skipped. Redrawn per tick the figure reads 27, 27,
+25, 24: right every time it is sent, and visibly erratic, which is no use on a
+number someone is watching to know how long is left. The page interpolates from
+its own monotonic clock at a steady 1 Hz instead and re-anchors on every tick,
+so the sequence is smooth and still honest — a countdown that jumps back up is
+then a real reset, the primary having recovered and lost it again, rather than
+an artefact of when a packet arrived.
+
 ### `/api/time`
 
 NTP over UDP remains the primary and the better interface — it is what
