@@ -1454,7 +1454,7 @@ function renderMetrics() {
   // Primary and secondary on one scale, so the two sides of the card can be
   // compared by eye -- the gap between the lines is the difference in the
   // middle.
-  const pSeries = one("class.primary_ms", slot(0)), sSeries = one("class.secondary_ms", slot(1));
+  const pSeries = one("class.primary_ms", slot(0)), sSeries = one("class.secondary_ms", slot(2));
   const shared = pSeries.concat(sSeries);
   const pc = chart("ch-primary", { unit: "ms", band: true, signed: true, title: "Primary median offset" });
   const sc = chart("ch-secondary", { unit: "ms", band: true, signed: true, title: "Secondary median offset" });
@@ -1470,7 +1470,7 @@ function renderMetrics() {
   pc.update(frame(withBounds(pSeries)));
   sc.update(frame(withBounds(sSeries)));
   chart("ch-delta", { unit: "ms", band: true, signed: true, title: "Primary minus secondary" })
-    .update(frame(one("class.delta_ms", slot(6)), { emptyText: "needs both classes measured" }));
+    .update(frame(one("class.delta_ms", cssVar("--muted")), { emptyText: "needs both classes measured" }));
 
   // Per source: one colour per source, in configuration order, so a receiver
   // is the same colour on every chart. Past eight, the rest are named in the
@@ -1503,14 +1503,18 @@ function renderMetrics() {
 // is named in the legend and the tooltip rather than left to its colour.
 let lastClock = {};
 const tlStates = () => ({
+  // Primary and secondary are the colours of their charts below. Blue and
+  // teal: the secondary was orange, and orange sits too near the failure red
+  // for a bar whose whole job is telling a failover from an outage.
   primary:   { color: slot(0), label: "primary" + (lastClock.primary ? " (" + lastClock.primary + ")" : "") },
-  secondary: { color: slot(1), label: "secondary" + (lastClock.secondary ? " (" + lastClock.secondary + ")" : "") },
-  both:      { color: slot(2), label: "both classes" },
-  // States, not classes: striped rather than solid, so they can never be
-  // mistaken for a class colour whose hue happens to sit near theirs (the
-  // secondary's orange beside the failure red, in dark mode especially).
-  coasting:  { color: cssVar("--warn"), label: "coasting", hatch: true },
-  none:      { color: cssVar("--bad"), label: "unsynchronised", hatch: true },
+  secondary: { color: slot(2), label: "secondary" + (lastClock.secondary ? " (" + lastClock.secondary + ")" : "") },
+  // Both classes contributing: striped in both their colours, not a third hue.
+  both:      { color: slot(0), color2: slot(2), label: "both classes", hatch: true },
+  // States, not classes: striped, in the fixed status warning and critical
+  // colours, which are validated apart from the class colours and each other.
+  // A solid fill always means a class serving; a stripe means something else.
+  coasting:  { color: "#fab219", label: "coasting", hatch: true },
+  none:      { color: "#d03b3b", label: "unsynchronised", hatch: true },
 });
 
 function spanDur(sec) {
@@ -1522,9 +1526,12 @@ function spanDur(sec) {
 const hhmmss = (t) => { const d = new Date(t * 1000); return hhmm(t) + ":" + pad(d.getUTCSeconds()); };
 
 function paintSwatch(el, st) {
+  const second = st.color2 || "color-mix(in srgb, " + st.color + " 22%, transparent)";
   el.style.background = st.hatch
-    ? "repeating-linear-gradient(45deg, " + st.color + " 0 2px, color-mix(in srgb, " + st.color +
-      " 22%, transparent) 2px 4.2px)"
+    // Two-colour stripes a little wider, or at swatch size they blend into one.
+    ? (st.color2
+        ? "repeating-linear-gradient(45deg, " + st.color + " 0 3px, " + second + " 3px 6px)"
+        : "repeating-linear-gradient(45deg, " + st.color + " 0 2px, " + second + " 2px 4.2px)")
     : st.color;
 }
 
@@ -1573,7 +1580,7 @@ function renderTimeline() {
     if (!st.hatch) continue;
     const pat = svgEl("pattern", { id: "tl-hatch-" + key, width: 6, height: 6,
       patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, defs);
-    svgEl("rect", { width: 6, height: 6, fill: st.color, "fill-opacity": 0.22 }, pat);
+    svgEl("rect", { width: 6, height: 6, fill: st.color2 || st.color, "fill-opacity": st.color2 ? 1 : 0.22 }, pat);
     svgEl("rect", { width: 3, height: 6, fill: st.color }, pat);
   }
 
