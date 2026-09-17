@@ -1506,8 +1506,11 @@ const tlStates = () => ({
   primary:   { color: slot(0), label: "primary" + (lastClock.primary ? " (" + lastClock.primary + ")" : "") },
   secondary: { color: slot(1), label: "secondary" + (lastClock.secondary ? " (" + lastClock.secondary + ")" : "") },
   both:      { color: slot(2), label: "both classes" },
-  coasting:  { color: cssVar("--warn"), label: "coasting" },
-  none:      { color: cssVar("--bad"), label: "unsynchronised" },
+  // States, not classes: striped rather than solid, so they can never be
+  // mistaken for a class colour whose hue happens to sit near theirs (the
+  // secondary's orange beside the failure red, in dark mode especially).
+  coasting:  { color: cssVar("--warn"), label: "coasting", hatch: true },
+  none:      { color: cssVar("--bad"), label: "unsynchronised", hatch: true },
 });
 
 function spanDur(sec) {
@@ -1517,6 +1520,13 @@ function spanDur(sec) {
   return h ? h + "h" + (m ? " " + m + "m" : "") : m + "m" + (sec % 60 && m < 10 ? " " + sec % 60 + "s" : "");
 }
 const hhmmss = (t) => { const d = new Date(t * 1000); return hhmm(t) + ":" + pad(d.getUTCSeconds()); };
+
+function paintSwatch(el, st) {
+  el.style.background = st.hatch
+    ? "repeating-linear-gradient(45deg, " + st.color + " 0 2px, color-mix(in srgb, " + st.color +
+      " 22%, transparent) 2px 4.2px)"
+    : st.color;
+}
 
 let tlState = null, tlHover = null;
 function renderTimeline() {
@@ -1558,6 +1568,15 @@ function renderTimeline() {
   // stays the bare track, rather than being painted as any state.
   svgEl("rect", { x: 0, y: 0, width: pw, height: barH, rx: 5, fill: cssVar("--grid") }, svg);
 
+  const defs = svgEl("defs", {}, svg);
+  for (const [key, st] of Object.entries(states)) {
+    if (!st.hatch) continue;
+    const pat = svgEl("pattern", { id: "tl-hatch-" + key, width: 6, height: 6,
+      patternUnits: "userSpaceOnUse", patternTransform: "rotate(45)" }, defs);
+    svgEl("rect", { width: 6, height: 6, fill: st.color, "fill-opacity": 0.22 }, pat);
+    svgEl("rect", { width: 3, height: 6, fill: st.color }, pat);
+  }
+
   const end = Math.min(now, x1);
   const segs = [];
   spans.forEach((sp, i) => {
@@ -1576,7 +1595,8 @@ function renderTimeline() {
     let xa = X(g.a), xb = X(g.b);
     if (i > 0 && xb - xa > 4) xa += 2;
     const w = Math.max(1.5, xb - xa);
-    const r = svgEl("rect", { class: "seg-r" + (tlHover === i ? " on" : ""), x: xa, y: 0, width: w, height: barH, fill: st.color,
+    const r = svgEl("rect", { class: "seg-r" + (tlHover === i ? " on" : ""), x: xa, y: 0, width: w, height: barH,
+                              fill: st.hatch ? "url(#tl-hatch-" + g.state + ")" : st.color,
                               rx: Math.min(5, w / 2) }, svg);
     if (tlHover === i) r.setAttribute("stroke", cssVar("--ink")), r.setAttribute("stroke-width", 1.5);
   });
@@ -1597,7 +1617,7 @@ function renderTimeline() {
     head.textContent = hhmmss(g.from) + (g.from < x0 ? " (before this window)" : "") + " → " +
       (ongoing ? "now" : hhmmss(g.b)) + " UTC";
     const row = document.createElement("div"); row.className = "r";
-    const k = document.createElement("span"); k.className = "sw"; k.style.background = st.color;
+    const k = document.createElement("span"); k.className = "sw"; paintSwatch(k, st);
     const b = document.createElement("b"); b.textContent = spanDur((ongoing ? now : g.b) - g.from);
     const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = st.label + (ongoing ? " · ongoing" : "");
     row.append(k, b, nm);
@@ -1617,7 +1637,7 @@ function renderTimeline() {
   for (const key of Object.keys(states)) {
     if (!totals[key]) continue;
     const i = document.createElement("span"); i.className = "i";
-    const k = document.createElement("span"); k.className = "sw"; k.style.background = states[key].color;
+    const k = document.createElement("span"); k.className = "sw"; paintSwatch(k, states[key]);
     const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = states[key].label;
     const b = document.createElement("b"); b.textContent = spanDur(totals[key]);
     i.append(k, nm, b);
