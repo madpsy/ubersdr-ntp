@@ -67,6 +67,16 @@ while [ $# -gt 0 ]; do
 done
 
 say()  { printf '\n== %s\n' "$*"; }
+
+# Copy a built binary into the repo root by renaming a temporary copy into
+# place. A plain cp opens the destination for writing, which Linux refuses with
+# "Text file busy" while that binary is running -- and the repo-root binary is
+# exactly the one somebody runs. A rename replaces the directory entry instead:
+# the running process keeps the old file and the next start gets the new one.
+place() {
+    local dest="$2/$(basename "$1")"
+    cp "$1" "$dest.tmp.$$" && mv -f "$dest.tmp.$$" "$dest"
+}
 fail() { printf '\nbuild.sh: %s\n' "$*" >&2; exit 1; }
 
 for a in $arches; do
@@ -214,7 +224,7 @@ if [ "$native" = 1 ]; then
     [ -x "$repo/build/ubersdr-ntp" ] || fail "the build produced no binary"
     built_name=$(basename "$(ls -t "$repo"/build/ubersdr-ntp_* 2>/dev/null | head -1)")
     [ -n "$built_name" ] || built_name=ubersdr-ntp
-    cp "$repo/build/$built_name" "$repo/"
+    place "$repo/build/$built_name" "$repo"
     binary="$repo/$built_name"
 
     if [ "$check" = 1 ]; then
@@ -315,7 +325,7 @@ for arch in $arches; do
 
     binary="$repo/build-$arch/ubersdr-ntp_$arch"
     [ -x "$binary" ] || { echo "  $arch: the build produced no binary" >&2; failed=1; continue; }
-    cp "$binary" "$repo/"
+    place "$binary" "$repo" || { echo "  $arch: could not copy the binary into $repo" >&2; failed=1; continue; }
     built="$built $repo/ubersdr-ntp_$arch"
 done
 
