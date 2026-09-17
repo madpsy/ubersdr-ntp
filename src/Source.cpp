@@ -78,12 +78,19 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // It is a property of the software, the same on every instance, so it is one
 // constant rather than something each operator has to calibrate.
 //
-// Measured live, 2026-09-13, against a north-eastern US receiver hearing WWV on
-// 10 and 15 MHz for 14 minutes of lock, from a host disciplined by ntpd to about
-// 1.4 ms: with this term equal to the decoder bias above, the served offset
-// averaged +0.1 ms and stayed within ±2.6 ms. One receiver and one session, so
-// good to perhaps ±2.5 ms; worth refining against more receivers.
-constexpr double kUberSdrChainDelaySec = 0.0136;
+// First measured live, 2026-09-13, against a north-eastern US receiver hearing
+// WWV on 10 and 15 MHz for 14 minutes of lock, from a host disciplined by ntpd
+// to about 1.4 ms: 13.6 ms, equal to the decoder bias above, good to perhaps
+// ±2.5 ms.
+//
+// Refined 2026-09-17 to 12.6 ms against the NTP class, which is the one
+// reference that does not share this term. Over many hours with two receivers
+// in standby against time.cloudflare.com, the radio-minus-NTP difference held
+// between +0.8 and +1.5 ms: the radio put UTC about 1 ms LATE, so the delay it
+// added was about 1 ms too large. A per-path error would not hold that steady
+// across hours and two receivers; a shared constant does, and this is the
+// loosest shared one.
+constexpr double kUberSdrChainDelaySec = 0.0126;
 
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
