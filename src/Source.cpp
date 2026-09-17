@@ -95,10 +95,22 @@ constexpr double kUberSdrChainDelaySec = 0.0126;
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
 // nothing here can see it.
-constexpr double kDelayUncertaintyFloorSec = 0.015;
+//
+// Set from the worst errors measured against an absolute reference, with
+// margin, rather than guessed. Two north-eastern US receivers, ~65 ms of
+// modelled delay each: against a PPS-disciplined stratum 1 on 2026-09-17 the
+// worst single receiver was 9.0 ms out and the served time 5.3 ms; against
+// ntpd on 2026-09-13 the served time was at worst +8.6 ms, about 7.6 ms after
+// the chain constant was corrected. With the 1-3 ms each source measures of
+// itself on top, a 10 ms floor still covers every one of those by about 1.4x.
+// It was 15 ms, which covered them about 2x and left the served dispersion
+// near 21 ms for an error that has not been seen past 9.
+constexpr double kDelayUncertaintyFloorSec = 0.010;
 // And a proportional part, because a long path is a worse-known path: more
-// hops, more spread between them, more of the virtual height assumption.
-constexpr double kDelayUncertaintyFraction = 0.25;
+// hops, more spread between them, more of the virtual height assumption. At
+// 15% it only overtakes the floor past about 67 ms of delay, i.e. on paths
+// longer than the ones the floor was measured on.
+constexpr double kDelayUncertaintyFraction = 0.15;
 
 // The smallest uncertainty a source may claim when it is being weighed against
 // the others. See the use site.
