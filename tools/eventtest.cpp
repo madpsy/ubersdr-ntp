@@ -124,6 +124,13 @@ void testQuietStartup() {
     check("a first pass with nothing ready records nothing", ev.empty(), "%s", join(ev).c_str());
     const auto ev2 = h.step({a, b}, Combined{});
     check("...and nor does a second identical one", ev2.empty(), "%s", join(ev2).c_str());
+
+    Harness fast(makeConfig());
+    auto quick = radio("quick");
+    quick.link = LinkState::Streaming;
+    const auto ev3 = fast.step({quick}, Combined{});
+    check("a receiver already streaming on the first pass still gets link_up",
+          has(ev3, "link_up:quick"), "%s", join(ev3).c_str());
 }
 
 void testLockAndFailover() {

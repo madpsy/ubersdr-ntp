@@ -216,6 +216,31 @@ std::string httpToWs(const std::string& url) {
     return url;
 }
 
+// A WebSocket close code (RFC 6455 section 7.4, and the IANA registry) in
+// words. Says what the code means and nothing about who sent it.
+std::string describeClose(unsigned code, bool remote) {
+    const char* what = nullptr;
+    switch (code) {
+        case 1000: what = "closed normally"; break;
+        case 1001: what = "the far end is going away: restarting or shutting down"; break;
+        case 1002: what = "protocol error"; break;
+        case 1003: what = "unsupported data"; break;
+        case 1006: what = "connection lost without a close"; break;
+        case 1007: what = "invalid data"; break;
+        case 1008: what = "refused by the far end's policy"; break;
+        case 1009: what = "message too large"; break;
+        case 1011: what = "server error"; break;
+        case 1012: what = "the far end is restarting"; break;
+        case 1013: what = "the far end is overloaded; try again later"; break;
+        case 1014: what = "bad gateway"; break;
+        default: break;
+    }
+    std::string out = what ? what : "closed";
+    if (code != 0) out += " (code " + std::to_string(code) + ")";
+    if (!remote && code != 1006) out += ", by this end";
+    return out;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -460,9 +485,21 @@ void Source::supervise() {
                 case ix::WebSocketMessageType::Open:
                     onOpen();
                     break;
-                case ix::WebSocketMessageType::Close:
-                    onClose(msg->closeInfo.reason.empty() ? "closed" : msg->closeInfo.reason);
+                case ix::WebSocketMessageType::Close: {
+                    // Described in our words, from the close code. The reason
+                    // TEXT is whatever terminated the socket chose to say --
+                    // the receiver, or any proxy or tunnel in front of it,
+                    // which may name its own vendor -- so it is logged as
+                    // received and kept out of the status page and events,
+                    // where it would read as this daemon's diagnosis.
+                    const auto& ci = msg->closeInfo;
+                    if (!ci.reason.empty()) {
+                        LOG_INFO(m_cfg.name.c_str(), "close frame: code %u, reason \"%s\"",
+                                 static_cast<unsigned>(ci.code), ci.reason.c_str());
+                    }
+                    onClose(describeClose(ci.code, ci.remote));
                     break;
+                }
                 case ix::WebSocketMessageType::Error:
                     onClose("error: " + msg->errorInfo.reason);
                     break;

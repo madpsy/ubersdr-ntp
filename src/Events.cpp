@@ -206,7 +206,10 @@ void EventMonitor::observe(const Pass& p) {
         if (!st.seen) {
             // First sight: take the state as it stands. Nothing has changed yet.
             st.seen = true;
-            st.link = s.link;
+            // Not the link: a receiver that is already streaming by the first
+            // pass (a local one connects inside a quarter second) would never
+            // get its link_up. Idle is what every link starts from anyway.
+            st.link = LinkState::Idle;
             st.station = s.station;
             st.kiss = s.ntp.kissCode;
             st.stratum = s.ntp.stratum;
