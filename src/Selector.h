@@ -113,6 +113,10 @@ struct SourceResidual {
     bool haveAverage = false;
     int peers = 0;            // how many others IN ITS OWN CLASS it was compared against
     bool refused = false;     // ...and it disagreed with them past explaining
+    // Whether the consensus was entitled to a verdict at all: enough peers,
+    // measured for long enough. Not refused and not judged is "could not
+    // say", which is not the same as accepted.
+    bool judged = false;
     double settledForSec = 0.0; // how long it has been measured at all
     SourceKind kind = SourceKind::Radio;
 };

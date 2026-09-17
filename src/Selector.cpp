@@ -294,6 +294,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         // Whether the consensus was entitled to a verdict at all. Not refused
         // is only "accepted" when it was; otherwise it is "could not say".
         const bool judged = r.peers >= kMinPeersToJudge && r.settledForSec >= kResidualSettleSec;
+        r.judged = judged;
         ReacquireState& rq = m_reacquire[r.name];
         if (r.refused) {
             refused.insert(r.name);
@@ -547,8 +548,9 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
     }
     c.candidates = static_cast<int>(cand.size());
 
-    // The minimum that must agree. min_sources governs the primary class; a set
-    // made entirely of secondary sources answers to the secondary's own figure,
+    // The minimum that must agree. The primary's figure governs a set with any
+    // primary source in it; one made entirely of secondary sources answers to
+    // the secondary's own figure,
     // because "two receivers must agree" is a statement about receivers and
     // cannot be satisfied, or meaningfully applied, by one NTP server.
     bool anyPrimary = false;

@@ -22,6 +22,14 @@
 // A PERSON who wants to know why a source is not locking asks GET /api/status,
 // or opens the page.
 //
+// A PERSON who wants to know what HAPPENED -- when it lost lock, when it
+// failed over -- asks GET /api/eventlog: the last hundred transitions worth
+// knowing about, and the list of types they come in. GET /api/metrics is the
+// recent history of the figures the page draws charts for: an hour of minute
+// averages, or a day of half-hour ones. Not /api/events, which
+// was already the one-second stream; each tick carries `events_latest_id` so
+// a follower knows when to ask again.
+//
 // Read-only without qualification: no route changes anything, no route takes a
 // body, and anything but GET or HEAD is refused. That is what makes it safe to
 // leave running, and why there is no authentication — there is nothing to
@@ -37,6 +45,8 @@
 // there is a small HTTP/1.1 server here instead — a few hundred lines for GET
 // and HEAD on a fixed set of paths, which is the whole requirement.
 
+#include "Events.h"
+#include "Metrics.h"
 #include "NtpServer.h"
 #include "Selector.h"
 #include "Source.h"
@@ -59,7 +69,10 @@ public:
     // the state now and not the state at the last status tick.
     using StatusProvider = std::function<StatusInput()>;
 
-    HttpApi(HttpConfig cfg, Selector& selector, StatusProvider provider);
+    // `events` and `metrics` may be null, and /api/eventlog and /api/metrics
+    // then serve empty lists.
+    HttpApi(HttpConfig cfg, Selector& selector, StatusProvider provider,
+            const EventLog* events = nullptr, const MetricHistory* metrics = nullptr);
     ~HttpApi();
 
     HttpApi(const HttpApi&) = delete;
@@ -78,6 +91,8 @@ private:
     HttpConfig m_cfg;
     Selector& m_selector;
     StatusProvider m_provider;
+    const EventLog* m_events;
+    const MetricHistory* m_metrics;
 
     int m_listenFd = -1;
     std::thread m_acceptor;

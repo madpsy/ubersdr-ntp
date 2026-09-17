@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <cctype>
 #include <cerrno>
 #include <cmath>
 #include <cstdlib>
@@ -15,6 +16,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <set>
 #include <sstream>
 #include <thread>
 #include <sys/socket.h>
@@ -126,6 +128,158 @@ std::string queryValue(const std::string& query, const std::string& key) {
 
 bool truthy(const std::string& v) { return !v.empty() && v != "0" && v != "false" && v != "no"; }
 
+// Splits a comma-separated query value. Empty items are dropped.
+std::set<std::string> csvSet(const std::string& v) {
+    std::set<std::string> out;
+    std::size_t pos = 0;
+    while (pos <= v.size()) {
+        std::size_t comma = v.find(',', pos);
+        if (comma == std::string::npos) comma = v.size();
+        if (comma > pos) out.insert(v.substr(pos, comma - pos));
+        pos = comma + 1;
+    }
+    return out;
+}
+
+// Enough of percent-decoding for a source name or a type list: %XX and '+'.
+std::string urlDecode(const std::string& v) {
+    std::string out;
+    for (std::size_t i = 0; i < v.size(); ++i) {
+        if (v[i] == '+') { out += ' '; continue; }
+        if (v[i] == '%' && i + 2 < v.size() && std::isxdigit(static_cast<unsigned char>(v[i + 1])) &&
+            std::isxdigit(static_cast<unsigned char>(v[i + 2]))) {
+            out += static_cast<char>(std::strtol(v.substr(i + 1, 2).c_str(), nullptr, 16));
+            i += 2;
+            continue;
+        }
+        out += v[i];
+    }
+    return out;
+}
+
+// GET /api/eventlog. Every event held, newest first, with the type catalogue
+// alongside so a client can label and filter without knowing the daemon's
+// vocabulary in advance. The filters are all optional and combine as AND:
+//
+//   type=a,b        only these types
+//   category=a,b    only these categories (daemon, clock, class, source, radio, ntp)
+//   source=name     only events about this source
+//   kind=radio|ntp  only events about this kind of source or class
+//   severity=s      this severity or worse (info, notice, warning, error)
+//   since_id=n      only events newer than n
+//   limit=n         at most n of them
+std::string eventLogJson(const EventLog* log, const std::string& query, bool pretty) {
+    nlohmann::json j;
+    j["capacity"] = EventLog::kCapacity;
+    j["latest_id"] = log ? log->latestId() : 0;
+
+    nlohmann::json types = nlohmann::json::array();
+    for (const EventTypeInfo& t : eventTypes()) {
+        types.push_back({{"type", t.name},
+                         {"label", t.label},
+                         {"category", t.category},
+                         {"severity", eventSeverityName(t.severity)},
+                         {"description", t.description}});
+    }
+    j["types"] = std::move(types);
+    j["severities"] = {"info", "notice", "warning", "error"};
+
+    const std::set<std::string> wantTypes = csvSet(urlDecode(queryValue(query, "type")));
+    const std::set<std::string> wantCats = csvSet(urlDecode(queryValue(query, "category")));
+    const std::string wantSource = urlDecode(queryValue(query, "source"));
+    const std::string wantKind = urlDecode(queryValue(query, "kind"));
+    const std::string sev = queryValue(query, "severity");
+    int minSev = 0;
+    for (int i = 0; i <= 3; ++i) {
+        if (sev == eventSeverityName(static_cast<EventSeverity>(i))) minSev = i;
+    }
+    const std::string sinceText = queryValue(query, "since_id");
+    const std::uint64_t since = sinceText.empty() ? 0 : std::strtoull(sinceText.c_str(), nullptr, 10);
+    const std::string limitText = queryValue(query, "limit");
+    const long limit = limitText.empty() ? -1 : std::strtol(limitText.c_str(), nullptr, 10);
+
+    nlohmann::json events = nlohmann::json::array();
+    if (log) {
+        for (const Event& e : log->all()) {
+            if (limit >= 0 && static_cast<long>(events.size()) >= limit) break;
+            const EventTypeInfo& info = eventTypeInfo(e.type);
+            if (e.id <= since) continue;
+            if (!wantTypes.empty() && !wantTypes.count(info.name)) continue;
+            if (!wantCats.empty() && !wantCats.count(info.category)) continue;
+            if (!wantSource.empty() && e.source != wantSource) continue;
+            if (!wantKind.empty() && (!e.haveKind || wantKind != sourceKindName(e.kind))) continue;
+            if (static_cast<int>(info.severity) < minSev) continue;
+
+            const long long ms = static_cast<long long>(std::llround(e.unix * 1000.0));
+            nlohmann::json o;
+            o["id"] = e.id;
+            o["unix"] = e.unix;
+            o["utc"] = iso8601(ms);
+            o["uptime_seconds"] = e.uptimeSec;
+            o["type"] = info.name;
+            o["category"] = info.category;
+            o["severity"] = eventSeverityName(info.severity);
+            o["source"] = e.source.empty() ? nlohmann::json(nullptr) : nlohmann::json(e.source);
+            o["kind"] = e.haveKind ? nlohmann::json(sourceKindName(e.kind)) : nlohmann::json(nullptr);
+            o["message"] = e.message;
+            events.push_back(std::move(o));
+        }
+    }
+    j["events"] = std::move(events);
+    return dumpJson(j, pretty);
+}
+
+// GET /api/metrics. One range at a time -- `range=hour` (the default: 60
+// one-minute buckets) or `range=day` (48 half-hour ones) -- and optionally only
+// some groups, `group=served,class,radio,ntp`. Each point is
+// [bucket start (UTC s), mean, min, max, samples], oldest first; the last one
+// is still filling. Values to a microsecond of a millisecond is more precision
+// than any of them has, and rounding keeps a day of every source small.
+std::string metricsJson(const MetricHistory* h, const std::string& query, bool pretty,
+                        double now) {
+    const bool day = queryValue(query, "range") == "day";
+    const std::set<std::string> groups = csvSet(urlDecode(queryValue(query, "group")));
+    const auto r3 = [](double v) { return std::round(v * 1000.0) / 1000.0; };
+
+    nlohmann::json j;
+    j["range"] = day ? "day" : "hour";
+    j["bucket_seconds"] = day ? MetricHistory::kDayWidthSec : MetricHistory::kHourWidthSec;
+    j["buckets"] = day ? MetricHistory::kDayBuckets : MetricHistory::kHourBuckets;
+    j["now"] = now;
+    nlohmann::json series = nlohmann::json::array();
+    if (h) {
+        for (const auto& s : h->snapshot(day ? MetricHistory::Range::Day
+                                             : MetricHistory::Range::Hour, now)) {
+            if (!groups.empty() && !groups.count(s.info.group)) continue;
+            nlohmann::json pts = nlohmann::json::array();
+            for (const MetricBucket& b : s.points) {
+                pts.push_back({b.start, r3(b.mean()), r3(b.min), r3(b.max), b.count});
+            }
+            series.push_back({{"id", s.info.id},
+                              {"label", s.info.label},
+                              {"unit", s.info.unit},
+                              {"group", s.info.group},
+                              {"source", s.info.source.empty() ? nlohmann::json(nullptr)
+                                                               : nlohmann::json(s.info.source)},
+                              {"points", std::move(pts)}});
+        }
+    }
+    j["series"] = std::move(series);
+
+    // Which class served, as spans: [start, state], oldest first, each
+    // lasting until the next and the last until `now`. The first may start
+    // before the window, and says what held at its beginning.
+    nlohmann::json spans = nlohmann::json::array();
+    if (h) {
+        for (const auto& sp : h->serving(day ? MetricHistory::Range::Day
+                                             : MetricHistory::Range::Hour, now)) {
+            spans.push_back({sp.start, sp.state});
+        }
+    }
+    j["serving"] = std::move(spans);
+    return dumpJson(j, pretty);
+}
+
 // The compact per-second payload: the corrected time, what is being served,
 // and one line per source. Everything a live display or the summary half of the
 // page needs, at a size that is reasonable to send every second.
@@ -158,6 +312,7 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
     j["used_names"] = c.usedNames;
     j["uptime_seconds"] = in.uptimeSec;
     j["version"] = in.version;
+    j["events_latest_id"] = in.eventsLatestId;
 
     // The two classes, every second, because the page's headline figures now
     // include which class is serving and how far apart the two are -- and a
@@ -280,8 +435,13 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
 
 } // namespace
 
-HttpApi::HttpApi(HttpConfig cfg, Selector& selector, StatusProvider provider)
-    : m_cfg(std::move(cfg)), m_selector(selector), m_provider(std::move(provider)) {}
+HttpApi::HttpApi(HttpConfig cfg, Selector& selector, StatusProvider provider,
+                 const EventLog* events, const MetricHistory* metrics)
+    : m_cfg(std::move(cfg)),
+      m_selector(selector),
+      m_provider(std::move(provider)),
+      m_events(events),
+      m_metrics(metrics) {}
 
 HttpApi::~HttpApi() { stop(); }
 
@@ -543,6 +703,27 @@ void HttpApi::serveConnection(int fd) {
         return;
     }
 
+    if (path == "/api/eventlog") {
+        const std::string p = queryValue(query, "pretty");
+        const bool pretty = p.empty() ? true : truthy(p);
+        writeAll(fd, httpResponse(200, "OK", "application/json; charset=utf-8",
+                                  eventLogJson(m_events, query, pretty) + "\n", headOnly));
+        return;
+    }
+
+    if (path == "/api/metrics") {
+        // Compact by default: this one is read by the page, and a day of every
+        // source pretty-printed is mostly whitespace.
+        const Combined c = m_selector.current();
+        const double d = daemonNow();
+        const double now = c.valid ? c.utcAt(d) : d - daemonMinusRealtime();
+        writeAll(fd, httpResponse(200, "OK", "application/json; charset=utf-8",
+                                  metricsJson(m_metrics, query,
+                                              truthy(queryValue(query, "pretty")), now) + "\n",
+                                  headOnly));
+        return;
+    }
+
     if (path == "/api/health") {
         // Deliberately tiny and deliberately honest: 200 when a time is being
         // served, 503 when it is not, so a health check need not parse
@@ -567,6 +748,8 @@ void HttpApi::serveConnection(int fd) {
                               "  /api/time      the time, for clients that do not speak NTP\n"
                               "  /api/status    everything this daemon knows\n"
                               "  /api/sources   just the per-source array\n"
+                              "  /api/eventlog  the last 100 events worth knowing about\n"
+                              "  /api/metrics   recent history: ?range=hour or ?range=day\n"
                               "  /api/health    200 when synchronised, 503 when not\n",
                               headOnly));
 }

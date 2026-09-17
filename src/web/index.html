@@ -33,6 +33,14 @@ h1 span { color:var(--muted); font-weight:400; }
 .now .frac { color:var(--muted); font-size:.45em; }
 .date { color:var(--muted); font-size:13px; margin-top:6px; }
 .linknote { margin-top:10px; }
+/* The viewer's own clock, set apart from the two times above so it cannot be
+   read as the server's: it is a statement about the machine in front of them. */
+.devclock { align-self:stretch; display:flex; flex-direction:column; justify-content:flex-end;
+  padding-left:22px; border-left:1px solid var(--line); }
+.devfig { margin-top:8px; }
+.devfig .pill { font:600 clamp(18px,4.2vw,26px)/1.2 var(--mono); padding:4px 14px; border-radius:10px;
+  text-transform:none; letter-spacing:-.01em; font-variant-numeric:tabular-nums; }
+@media (max-width:560px) { .devclock { padding-left:0; border-left:0; } }
 .tickdot { width:9px; height:9px; border-radius:50%; background:var(--ok);
   transition:opacity .12s; opacity:.25; margin-bottom:14px; }
 .tickdot.on { opacity:1; }
@@ -81,6 +89,75 @@ td:last-child, th:last-child { padding-right:0; }
 .foot { color:var(--muted); font-size:12px; margin-top:20px; }
 .foot code { font-family:var(--mono); }
 a { color:var(--accent); }
+/* history charts. Series colours are a validated categorical order (see the
+   dataviz notes in the commit): fixed slots, never cycled, stepped separately
+   for the dark surface rather than flipped. */
+:root { --s1:#2a78d6; --s2:#eb6834; --s3:#1baf7a; --s4:#eda100;
+        --s5:#e87ba4; --s6:#008300; --s7:#4a3aa7; --s8:#e34948;
+        --grid:#ecebe7; --axis:#d6d5cf; }
+@media (prefers-color-scheme: dark) {
+  :root { --s1:#3987e5; --s2:#d95926; --s3:#199e70; --s4:#c98500;
+          --s5:#d55181; --s6:#008300; --s7:#9085e9; --s8:#e66767;
+          --grid:#2a2d33; --axis:#3a3e46; }
+}
+.rangebar { display:flex; flex-wrap:wrap; align-items:center; gap:8px 12px; margin:-8px 0 14px; }
+.seg { display:inline-flex; background:var(--panel); border:1px solid var(--line);
+  border-radius:8px; padding:2px; }
+.seg button { border:0; background:transparent; border-radius:6px; padding:3px 12px;
+  color:var(--muted); font-weight:600; }
+.seg button[aria-pressed="true"] { background:color-mix(in srgb,var(--accent) 14%,transparent);
+  color:var(--ink); }
+.trends { display:grid; gap:16px 28px; margin-top:18px;
+  grid-template-columns:repeat(auto-fit,minmax(min(300px,100%),1fr)); }
+.trendhead { display:flex; align-items:baseline; justify-content:space-between; gap:8px;
+  margin-bottom:4px; }
+.chart { position:relative; width:100%; transition:opacity .2s; }
+.chart.loading { opacity:.45; }
+.chart svg { display:block; width:100%; overflow:visible; outline:none; touch-action:pan-y; }
+.chart:focus-within svg .plotbg { stroke:var(--accent); stroke-width:1; }
+.chart .tick, .tl .tick { font:10px/1 var(--mono); fill:var(--muted); font-variant-numeric:tabular-nums; }
+.chart .gridl, .tl .gridl { stroke:var(--grid); stroke-width:1; shape-rendering:crispEdges; }
+.chart .zero { stroke:var(--axis); stroke-width:1; shape-rendering:crispEdges; }
+.chart .xhair { stroke:var(--muted); stroke-width:1; shape-rendering:crispEdges; }
+.chart .empty-msg { font-size:11px; fill:var(--muted); }
+.chart.mini { margin-top:10px; }
+.tip { position:absolute; top:0; z-index:5; pointer-events:none; background:var(--panel);
+  border:1px solid var(--line); border-radius:8px; padding:7px 9px; font-size:12px;
+  box-shadow:0 6px 22px rgba(0,0,0,.14); white-space:nowrap; }
+.tip .t { color:var(--muted); font-size:11px; margin-bottom:3px; }
+.tip .r { display:flex; align-items:center; gap:7px; line-height:1.5; }
+.tip .r b { font:600 12px/1.5 var(--mono); font-variant-numeric:tabular-nums; }
+.tip .r .k, .legend .k { display:inline-block; width:12px; height:2px; border-radius:1px; }
+.tip .r .nm { color:var(--muted); }
+.legend { display:flex; flex-wrap:wrap; gap:4px 14px; margin-top:6px; font-size:12px; }
+.legend span.i { display:inline-flex; align-items:center; gap:6px; }
+.legend b { font:600 12px var(--mono); font-variant-numeric:tabular-nums; }
+.legend .nm { color:var(--muted); }
+
+/* the serving timeline */
+.timeline { margin-bottom:20px; }
+.tl { position:relative; }
+.tl svg { display:block; width:100%; overflow:visible; outline:none; }
+.tl .seg-r { transition:opacity .15s; }
+.tl svg:hover .seg-r { opacity:.75; }
+.tl svg .seg-r.on { opacity:1; }
+.legend .sw { display:inline-block; width:10px; height:10px; border-radius:3px; }
+
+/* the event log */
+.evhead { display:flex; flex-wrap:wrap; align-items:center; gap:10px 14px; margin-bottom:12px; }
+.evhead .label { margin-right:auto; }
+.evfilters { display:flex; flex-wrap:wrap; gap:8px; }
+select { font:inherit; font-size:12px; color:var(--ink); background:var(--panel);
+  border:1px solid var(--line); border-radius:6px; padding:4px 6px; max-width:100%; }
+button { font:inherit; font-size:12px; color:var(--ink); background:var(--panel);
+  border:1px solid var(--line); border-radius:6px; padding:4px 10px; cursor:pointer; }
+button:disabled { opacity:.4; cursor:default; }
+td.msg { white-space:normal; min-width:260px; }
+td.when { font-family:var(--mono); font-variant-numeric:tabular-nums; }
+tr.fresh td { animation:fresh 4s ease-out; }
+@keyframes fresh { from { background:color-mix(in srgb,var(--accent) 14%,transparent); } to { background:transparent; } }
+.evpager { display:flex; align-items:center; justify-content:flex-end; gap:10px; margin-top:12px; }
+.empty { color:var(--muted); padding:14px 0 4px; }
 /* The clock card takes the same tone as the status pill. Faint, over the panel
    colour rather than instead of it, so the time stays the loudest thing on it. */
 .card.tone-ok   { background:color-mix(in srgb,var(--ok) 7%,var(--panel));
@@ -97,6 +174,14 @@ a { color:var(--accent); }
     <span id="linkpill" class="pill dim">connecting</span>
   </header>
   <div class="sub" id="sub">waiting for the event stream&hellip;</div>
+  <div class="rangebar">
+    <span class="label">History</span>
+    <div class="seg" role="group" aria-label="History range">
+      <button type="button" data-range="hour" aria-pressed="true">1 hour</button>
+      <button type="button" data-range="day" aria-pressed="false">24 hours</button>
+    </div>
+    <span class="note" id="rangenote">1-minute averages · kept in memory since the daemon started</span>
+  </div>
 
   <div class="card" id="clockcard">
     <div class="clocks">
@@ -112,6 +197,11 @@ a { color:var(--accent); }
         <div class="label" id="loclabel">Local time</div>
         <div class="clock"><div class="now local" id="lnow">--:--:--</div></div>
         <div class="date" id="ldate">&nbsp;</div>
+      </div>
+      <div class="devclock" id="devclock">
+        <div class="label">Your device's clock</div>
+        <div class="devfig"><span class="pill dim" id="devpill">measuring…</span></div>
+        <div class="date" id="devnote">the computer or phone showing this page</div>
       </div>
     </div>
     <div class="note linknote" id="linknote">&nbsp;</div>
@@ -131,27 +221,44 @@ a { color:var(--accent); }
       <div><div class="label">NTP requests</div><div class="figure" id="ntpreq">—</div>
         <div class="note" id="ntpnote">&nbsp;</div></div>
     </div>
+    <div class="trends">
+      <div><div class="trendhead"><span class="label">Clock offset</span>
+        <span class="note">correction to this host, with min–max</span></div>
+        <div class="chart" id="ch-offset" data-height="130"></div></div>
+      <div><div class="trendhead"><span class="label">Root dispersion</span>
+        <span class="note">with min–max</span></div>
+        <div class="chart" id="ch-disp" data-height="130"></div></div>
+    </div>
   </div>
 
   <div class="card" id="classcard" hidden>
     <div class="label" style="margin-bottom:12px">Primary and secondary</div>
+    <div class="timeline">
+      <div class="trendhead"><span class="note">Which class served the time</span>
+        <span class="note" id="tlnote"></span></div>
+      <div class="tl" id="tl"></div>
+      <div class="legend" id="tllegend"></div>
+    </div>
     <div class="chain">
       <div class="side" id="pside">
         <div class="sidehead"><span class="pill" id="ppill">primary</span>
           <span class="sidename" id="pname">radio</span></div>
         <div class="figure" id="poffset">—</div>
         <div class="note" id="pnote">&nbsp;</div>
+        <div class="chart mini" id="ch-primary" data-height="90"></div>
       </div>
       <div class="gap">
         <div class="label">Difference</div>
         <div class="figure big" id="classdelta">—</div>
         <div class="note" id="classdeltanote">&nbsp;</div>
+        <div class="chart mini" id="ch-delta" data-height="90"></div>
       </div>
       <div class="side" id="sside">
         <div class="sidehead"><span class="pill" id="spill">secondary</span>
           <span class="sidename" id="sname">ntp</span></div>
         <div class="figure" id="soffset">—</div>
         <div class="note" id="snote">&nbsp;</div>
+        <div class="chart mini" id="ch-secondary" data-height="90"></div>
       </div>
     </div>
     <div class="note" id="classexplain" style="margin-top:14px">&nbsp;</div>
@@ -164,6 +271,17 @@ a { color:var(--accent); }
       <th class="n">Tick</th><th>Vote</th><th class="n">Qual</th>
       <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">n</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
+    <div class="trends">
+      <div><div class="trendhead"><span class="label">Offset</span>
+        <span class="note">correction to this host</span></div>
+        <div class="chart" id="ch-radio-offset" data-height="150"></div></div>
+      <div><div class="trendhead"><span class="label">Agreement</span>
+        <span class="note">against the radio median</span></div>
+        <div class="chart" id="ch-radio-resid" data-height="150"></div></div>
+      <div><div class="trendhead"><span class="label">Tick SNR</span>
+        <span class="note">while the tick is heard</span></div>
+        <div class="chart" id="ch-radio-snr" data-height="150"></div></div>
+    </div>
   </div>
 
   <div class="card" id="ntpcard" hidden>
@@ -173,6 +291,39 @@ a { color:var(--accent); }
       <th class="n">Reach</th><th class="n">Poll</th><th class="n">Delay</th>
       <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">n</th>
     </tr></thead><tbody id="ntprows"></tbody></table></div>
+    <div class="trends">
+      <div><div class="trendhead"><span class="label">Offset</span>
+        <span class="note">correction to this host</span></div>
+        <div class="chart" id="ch-ntp-offset" data-height="150"></div></div>
+      <div><div class="trendhead"><span class="label">Round trip</span>
+        <span class="note">of the sample each filter chose</span></div>
+        <div class="chart" id="ch-ntp-delay" data-height="150"></div></div>
+    </div>
+  </div>
+
+  <div class="card" id="eventcard">
+    <div class="evhead">
+      <div class="label">Events <span id="evcount" style="text-transform:none;letter-spacing:0;font-weight:400"></span></div>
+      <div class="evfilters">
+        <select id="evtype" aria-label="Filter by event type"><option value="">All types</option></select>
+        <select id="evsource" aria-label="Filter by source"><option value="">All sources</option></select>
+        <select id="evsev" aria-label="Filter by severity">
+          <option value="info">Any severity</option>
+          <option value="notice">Notice and worse</option>
+          <option value="warning">Warnings and errors</option>
+          <option value="error">Errors only</option>
+        </select>
+      </div>
+    </div>
+    <div class="scroll"><table><thead><tr>
+      <th>When (UTC)</th><th>Severity</th><th>Event</th><th>Source</th><th>Detail</th>
+    </tr></thead><tbody id="evrows"></tbody></table></div>
+    <div class="empty" id="evempty" hidden></div>
+    <div class="evpager">
+      <span class="note" id="evrange"></span>
+      <button id="evnewer" type="button">&lsaquo; Newer</button>
+      <button id="evolder" type="button">Older &rsaquo;</button>
+    </div>
   </div>
 
   <div id="detail"></div>
@@ -182,7 +333,9 @@ a { color:var(--accent); }
     <code><a href="/api/time">/api/time</a></code> the time &middot;
     <code><a href="/api/status">/api/status</a></code> everything &middot;
     <code><a href="/api/sources">/api/sources</a></code> &middot;
-    <code><a href="/api/health">/api/health</a></code>
+    <code><a href="/api/health">/api/health</a></code> &middot;
+    <code><a href="/api/eventlog">/api/eventlog</a></code> the last 100 events &middot;
+    <code><a href="/api/metrics?pretty=1">/api/metrics</a></code> history
   </div>
 </div>
 
@@ -451,19 +604,36 @@ function paintClock(ts) {
   $("loclabel").textContent = "Local time · " + (tz ? tz + " " : "") + "(" + utcOffsetText(d) + ")";
 
   if (est) {
+    // This browser's wall clock against the corrected time: a fact about the
+    // viewer's machine, not the server, and worth saying loudly -- a phone or
+    // laptop half a second out is common and is exactly what someone opening
+    // a time server's page wants to find out.
     const device = Date.now() - (performance.now() + est.theta);
-    const devText = Math.abs(device) < 1
-      ? "device clock within 1 ms"
-      : "device clock " + (Math.abs(device) < 10000
-          ? Math.abs(device).toFixed(0) + " ms"
-          : dur(Math.abs(device) / 1000)) + (device > 0 ? " fast" : " slow");
+    const a = Math.abs(device);
+    // Anything inside the measurement's own error bound cannot be told from
+    // correct, so it is not called fast or slow.
+    const within = Math.max(1, est.err);
+    const devText = a <= within
+      ? "correct to within " + within.toFixed(0) + " ms"
+      : (a < 1000 ? a.toFixed(0) + " ms" : a < 60000 ? (a / 1000).toFixed(1) + " s" : dur(a / 1000)) +
+        (device > 0 ? " fast" : " slow");
+    const devTone = a <= Math.max(20, within) ? "ok" : a < 500 ? "warn" : "bad";
+    $("devpill").className = "pill " + devTone;
+    $("devpill").textContent = devText;
+    $("devnote").textContent = devTone === "ok"
+      ? "the computer or phone showing this page"
+      : "the computer or phone showing this page, not the server";
+    $("devclock").title = "Your device's own clock, compared with the broadcast time above. " +
+      "Nothing to do with the server: the times shown on this page do not use it.";
     $("linknote").textContent = "browser latency " + ms(est.delay) + " round trip, corrected (±" +
-      ms(est.err) + ") · " + devText;
+      ms(est.err) + ")";
     $("linknote").title = "The displayed time is advanced by half the measured round trip " +
       "between this browser and the server. ± is the most an asymmetric path could leave, " +
       "on top of the root dispersion.";
   } else {
     $("linknote").textContent = "measuring browser latency…";
+    $("devpill").className = "pill dim";
+    $("devpill").textContent = "measuring…";
   }
 }
 
@@ -571,8 +741,11 @@ function renderClasses(d, k, radio, peers) {
     $("classdelta").className = "figure big " +
       (a < 10 ? "" : a < 50 ? "warnfig" : "badfig");
     $("classdeltanote").textContent =
-      esc(k.primary) + " − " + esc(k.secondary) + " · averaged over " +
-      dur(cd.settled_for_seconds) + " · " + signed(cd.instant_ms) + " now";
+      // A moving average over about the last five minutes (the selector's
+      // time constant), not over the whole time both classes have been
+      // measured: that span is shown separately so it is not read as one.
+      k.primary + " − " + k.secondary + " · 5-min average · " + signed(cd.instant_ms) +
+      " now · compared for " + dur(cd.settled_for_seconds);
     $("classexplain").textContent = k.primary === "radio"
       ? "This is the radio delay model's absolute error: the chain, codec and " +
         "decoder-bias constants every receiver shares cancel between receivers, " +
@@ -612,6 +785,8 @@ function onTick(d) {
 
   const tone = d.synchronised ? dispTone(d.dispersion_ms) : "bad";
   const k = d.clock || {};
+  if (k.primary !== lastClock.primary || k.secondary !== lastClock.secondary) { lastClock = k; renderTimeline(); }
+  lastClock = k;
   // The served stratum, which is no longer always 1: it is 1 while a radio
   // source is in the answer and one below the upstream when the time has
   // failed over to one. Saying "stratum 1" regardless would be the one lie
@@ -852,6 +1027,648 @@ function onStatus(d) {
   }).join("");
 }
 
+// ---------------------------------------------------------------------------
+// The event log: the last hundred transitions the daemon thought worth
+// recording. Fetched whole from /api/eventlog -- a hundred small objects -- and
+// filtered and paged here, so changing a filter or a page costs no request.
+// Each tick carries the newest event's id, and the page asks again only when
+// that moves.
+// ---------------------------------------------------------------------------
+const kEventsPerPage = 10;
+const sevRank = { info: 0, notice: 1, warning: 2, error: 3 };
+const sevTone = { info: "dim", notice: "ok", warning: "warn", error: "bad" };
+let evTypes = {}, evAll = [], evPage = 0, evLatest = null, evFetching = false, evSeenMax = null;
+let evFresh = new Set();
+
+async function fetchEvents() {
+  if (evFetching) return;
+  evFetching = true;
+  try {
+    const r = await fetch("/api/eventlog?pretty=0", { cache: "no-store" });
+    const d = await r.json();
+    if (!Object.keys(evTypes).length) buildTypeFilter(d.types);
+    // Rows newer than what was already on the page flash once, but not on the
+    // first load, when every row is "new" and none of them is news.
+    evFresh = new Set();
+    if (evSeenMax != null) for (const e of d.events) if (e.id > evSeenMax) evFresh.add(e.id);
+    evSeenMax = d.latest_id;
+    evLatest = d.latest_id;
+    evAll = d.events;
+    buildSourceFilter();
+    renderEvents();
+  } catch (x) {
+    evLatest = null;   // try again on the next tick
+  } finally {
+    evFetching = false;
+  }
+}
+
+function buildTypeFilter(types) {
+  const sel = $("evtype");
+  const groups = {};
+  for (const t of types) {
+    evTypes[t.type] = t;
+    (groups[t.category] = groups[t.category] || []).push(t);
+  }
+  const catLabel = { daemon: "Daemon", clock: "Served time", class: "Primary and secondary",
+                     source: "Any source", radio: "Radio sources", ntp: "NTP sources" };
+  let html = '<option value="">All types</option>';
+  for (const cat of Object.keys(groups)) {
+    html += '<option value="cat:' + esc(cat) + '">All ' + esc((catLabel[cat] || cat).toLowerCase()) +
+      " events</option>";
+  }
+  for (const [cat, list] of Object.entries(groups)) {
+    html += '<optgroup label="' + esc(catLabel[cat] || cat) + '">' +
+      list.map((t) => '<option value="' + esc(t.type) + '" title="' + esc(t.description) + '">' +
+        esc(t.label) + "</option>").join("") + "</optgroup>";
+  }
+  sel.innerHTML = html;
+}
+
+// Every source any held event mentions, plus the classes, so a filter can
+// still find a source that has since been removed from the configuration.
+function buildSourceFilter() {
+  const sel = $("evsource"), cur = sel.value;
+  const names = [...new Set(evAll.filter((e) => e.source).map((e) => e.source))].sort();
+  const kinds = [...new Set(evAll.filter((e) => e.kind).map((e) => e.kind))].sort();
+  let html = '<option value="">All sources</option>' +
+    kinds.map((k) => '<option value="kind:' + esc(k) + '">Everything ' + esc(k) + "</option>").join("") +
+    names.map((n) => '<option value="' + esc(n) + '">' + esc(n) + "</option>").join("");
+  if (html !== sel.dataset.html) {
+    sel.innerHTML = html;
+    sel.dataset.html = html;
+    if ([...sel.options].some((o) => o.value === cur)) sel.value = cur;
+  }
+}
+
+function filteredEvents() {
+  const type = $("evtype").value, src = $("evsource").value;
+  const minSev = sevRank[$("evsev").value] || 0;
+  return evAll.filter((e) => {
+    if (type.startsWith("cat:")) { if (e.category !== type.slice(4)) return false; }
+    else if (type && e.type !== type) return false;
+    if (src.startsWith("kind:")) { if (e.kind !== src.slice(5)) return false; }
+    else if (src && e.source !== src) return false;
+    return (sevRank[e.severity] || 0) >= minSev;
+  });
+}
+
+function whenText(unix) {
+  const d = new Date(unix * 1000);
+  const now = haveTick ? new Date(tickUnix * 1000) : new Date();
+  const time = pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()) + ":" + pad(d.getUTCSeconds());
+  const sameDay = d.getUTCFullYear() === now.getUTCFullYear() &&
+    d.getUTCMonth() === now.getUTCMonth() && d.getUTCDate() === now.getUTCDate();
+  return sameDay ? time
+    : d.toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" }) + " " + time;
+}
+
+function renderEvents() {
+  const list = filteredEvents();
+  const pages = Math.max(1, Math.ceil(list.length / kEventsPerPage));
+  if (evPage >= pages) evPage = pages - 1;
+  const first = evPage * kEventsPerPage;
+  const page = list.slice(first, first + kEventsPerPage);
+  const nowUnix = haveTick ? tickUnix : Date.now() / 1000;
+
+  $("evcount").textContent = evAll.length
+    ? "· " + evAll.length + " held" + (list.length !== evAll.length ? ", " + list.length + " shown" : "")
+    : "";
+  $("evrows").innerHTML = page.map((e) => {
+    const t = evTypes[e.type] || {};
+    return '<tr class="' + (evFresh.has(e.id) ? "fresh" : "") + '">' +
+      '<td class="when" title="' + esc(e.utc) + " · " + dur(e.uptime_seconds) + ' after start">' +
+        whenText(e.unix) + '<div class="note">' + dur(Math.max(0, nowUnix - e.unix)) + " ago</div></td>" +
+      '<td><span class="pill ' + (sevTone[e.severity] || "dim") + '">' + esc(e.severity) + "</span></td>" +
+      '<td title="' + esc(t.description || "") + '">' + esc(t.label || e.type) + "</td>" +
+      '<td class="name">' + (e.source ? esc(e.source)
+        : e.kind ? '<span class="note">' + esc(e.kind) + " class</span>" : "—") + "</td>" +
+      '<td class="msg">' + esc(e.message) + "</td></tr>";
+  }).join("");
+  evFresh = new Set();   // flash once, not on every re-render
+
+  $("evempty").hidden = page.length > 0;
+  $("evempty").textContent = evAll.length ? "No events match these filters." : "No events yet.";
+  $("evrange").textContent = list.length
+    ? (first + 1) + "–" + (first + page.length) + " of " + list.length +
+      " · page " + (evPage + 1) + " of " + pages
+    : "";
+  $("evnewer").disabled = evPage === 0;
+  $("evolder").disabled = evPage >= pages - 1;
+}
+
+for (const id of ["evtype", "evsource", "evsev"]) {
+  $(id).addEventListener("change", () => { evPage = 0; renderEvents(); });
+}
+$("evnewer").addEventListener("click", () => { if (evPage > 0) { evPage--; renderEvents(); } });
+$("evolder").addEventListener("click", () => { evPage++; renderEvents(); });
+
+// Called per tick: fetch when the newest id has moved, and otherwise just
+// refresh the "ago" column, at most every few seconds.
+let evAgoAt = 0;
+function eventsOnTick(d) {
+  if (d.events_latest_id != null && d.events_latest_id !== evLatest) {
+    fetchEvents();
+  } else if (evAll.length && performance.now() - evAgoAt > 5000) {
+    evAgoAt = performance.now();
+    renderEvents();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// History charts. Everything is drawn here as SVG: this page is served by a
+// time server that may well have no route to a CDN, and a line with a min–max
+// wash, a crosshair and a tooltip is a few hundred lines, not a library.
+//
+// The data is /api/metrics: per series, buckets of [start, mean, min, max, n],
+// oldest first, the last still filling. One range for the whole page -- an
+// hour of minute averages or a day of half-hour ones -- chosen in the bar
+// under the header, so every chart on the page covers the same window.
+// ---------------------------------------------------------------------------
+const kSvgNs = "http://www.w3.org/2000/svg";
+const charts = {};
+let mRange = "hour", mData = null, mFetching = false, mTimer = 0, sourceOrder = [];
+try { if (localStorage.getItem("ubersdr-ntp.range") === "day") mRange = "day"; } catch (x) {}
+
+const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+const slot = (i) => cssVar("--s" + (i + 1));
+
+function svgEl(tag, attrs, parent) {
+  const e = document.createElementNS(kSvgNs, tag);
+  for (const k in attrs) e.setAttribute(k, attrs[k]);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+// Round tick values: 1, 2 or 5 times a power of ten, about `count` of them.
+function niceTicks(lo, hi, count) {
+  const span = hi - lo;
+  const raw = span / Math.max(1, count);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map((m) => m * mag).find((st) => span / st <= count) || 10 * mag;
+  const out = [];
+  for (let v = Math.ceil(lo / step) * step; v <= hi + step * 1e-9; v += step) {
+    out.push(Math.abs(v) < step * 1e-9 ? 0 : v);
+  }
+  return { ticks: out, step };
+}
+
+function fmtVal(v, unit, step) {
+  if (v == null || !isFinite(v)) return "—";
+  const a = Math.abs(v);
+  const p = step != null ? Math.max(0, Math.min(3, -Math.floor(Math.log10(step) + 1e-9))) :
+    a >= 100 ? 0 : a >= 1 ? 1 : 2;
+  return (v < 0 ? "−" : "") + a.toFixed(p) + (unit ? " " + unit : "");
+}
+
+const hhmm = (t) => { const d = new Date(t * 1000); return pad(d.getUTCHours()) + ":" + pad(d.getUTCMinutes()); };
+
+// One chart in one element. `opts`: height, unit, band (draw min–max),
+// floorZero (a quantity that cannot go below zero), signed (draw the zero
+// line and sign the tooltip). update() takes series of
+// {name, color, points} and the window.
+function makeChart(el, opts) {
+  const height = +el.dataset.height || opts.height || 120;
+  const svg = svgEl("svg", { height, role: "img", tabindex: "0" }, el);
+  const tip = document.createElement("div");
+  tip.className = "tip"; tip.hidden = true;
+  el.appendChild(tip);
+  let legend = null;
+  if (opts.legend) { legend = document.createElement("div"); legend.className = "legend"; el.appendChild(legend); }
+
+  let state = null, hoverIdx = null;
+
+  function render() {
+    if (!state) return;
+    const W = el.clientWidth;
+    if (!W) return;
+    const { series, x0, x1, width } = state;
+    const H = height, mL = 44, mR = 10, mT = 8, mB = 18;
+    const pw = Math.max(10, W - mL - mR), ph = H - mT - mB;
+    svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+    svg.setAttribute("width", W);
+    svg.textContent = "";
+
+    let lo = Infinity, hi = -Infinity;
+    for (const s of series) {
+      for (const p of s.points) {
+        lo = Math.min(lo, opts.band ? p[2] : p[1]);
+        hi = Math.max(hi, opts.band ? p[3] : p[1]);
+      }
+      // A scale borrowed from a neighbouring chart, so two can be compared.
+      if (s.bounds) { lo = Math.min(lo, s.bounds[0]); hi = Math.max(hi, s.bounds[1]); }
+    }
+    const empty = lo === Infinity;
+    if (empty) { lo = 0; hi = 1; }
+    if (opts.floorZero) lo = Math.min(0, lo);
+    const minSpan = opts.minSpan || 0.5;
+    if (hi - lo < minSpan) { const m = (hi + lo) / 2; lo = m - minSpan / 2; hi = m + minSpan / 2; if (opts.floorZero && lo < 0) { hi -= lo; lo = 0; } }
+    const pad8 = (hi - lo) * 0.08;
+    if (!(opts.floorZero && lo === 0)) lo -= pad8;
+    hi += pad8;
+    const { ticks, step } = niceTicks(lo, hi, ph < 80 ? 3 : 4);
+
+    const X = (t) => mL + (t - x0) / (x1 - x0) * pw;
+    const Y = (v) => mT + (1 - (v - lo) / (hi - lo)) * ph;
+
+    svgEl("rect", { class: "plotbg", x: mL, y: mT, width: pw, height: ph, fill: "none", rx: 2 }, svg);
+    for (const v of ticks) {
+      const y = Math.round(Y(v)) + 0.5;
+      svgEl("line", { class: v === 0 && opts.signed ? "zero" : "gridl", x1: mL, x2: mL + pw, y1: y, y2: y }, svg);
+      svgEl("text", { class: "tick", x: mL - 6, y: y + 3, "text-anchor": "end" }, svg).textContent = fmtVal(v, "", step);
+    }
+    // Time ticks on round boundaries: quarter hours across an hour, six hours
+    // across a day.
+    const xStep = width >= 1800 ? 6 * 3600 : 15 * 60;
+    for (let t = Math.ceil(x0 / xStep) * xStep; t <= x1; t += xStep) {
+      const x = X(t);
+      if (x < mL + 14 || x > mL + pw - 14) continue;
+      svgEl("text", { class: "tick", x, y: H - 4, "text-anchor": "middle" }, svg).textContent = hhmm(t);
+    }
+
+    if (empty) {
+      svgEl("text", { class: "empty-msg", x: mL + pw / 2, y: mT + ph / 2 + 4, "text-anchor": "middle" }, svg)
+        .textContent = state.emptyText || "collecting — the first average appears within the minute";
+    }
+
+    // Points sit at the middle of their bucket; a gap longer than one and a
+    // half buckets breaks the line rather than drawing across a time nothing
+    // was measured.
+    const mid = (p) => p[0] + width / 2;
+    for (const s of series) {
+      const segs = [];
+      let cur = [];
+      for (const p of s.points) {
+        if (cur.length && p[0] - cur[cur.length - 1][0] > width * 1.5) { segs.push(cur); cur = []; }
+        cur.push(p);
+      }
+      if (cur.length) segs.push(cur);
+      for (const seg of segs) {
+        if (opts.band && series.filter((x) => x.name).length === 1) {
+          const top = seg.map((p) => X(mid(p)).toFixed(1) + "," + Y(p[3]).toFixed(1));
+          const bot = seg.slice().reverse().map((p) => X(mid(p)).toFixed(1) + "," + Y(p[2]).toFixed(1));
+          if (seg.length > 1) {
+            svgEl("polygon", { points: top.concat(bot).join(" "), fill: s.color, "fill-opacity": 0.12, stroke: "none" }, svg);
+          }
+        }
+        if (seg.length === 1) {
+          svgEl("circle", { cx: X(mid(seg[0])), cy: Y(seg[0][1]), r: 2.5, fill: s.color }, svg);
+        } else {
+          svgEl("polyline", {
+            points: seg.map((p) => X(mid(p)).toFixed(1) + "," + Y(p[1]).toFixed(1)).join(" "),
+            fill: "none", stroke: s.color, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round",
+          }, svg);
+        }
+      }
+      const last = s.points[s.points.length - 1];
+      if (last) {
+        svgEl("circle", { cx: X(mid(last)), cy: Y(last[1]), r: 3.5, fill: s.color, stroke: cssVar("--panel"), "stroke-width": 2 }, svg);
+      }
+    }
+
+    // The crosshair snaps to a bucket that at least one series has.
+    const starts = [...new Set(series.flatMap((s) => s.points.map((p) => p[0])))].sort((a, b) => a - b);
+    state.starts = starts;
+    if (hoverIdx != null && starts.length) {
+      hoverIdx = Math.max(0, Math.min(starts.length - 1, hoverIdx));
+      const t = starts[hoverIdx], x = Math.round(X(t + width / 2)) + 0.5;
+      svgEl("line", { class: "xhair", x1: x, x2: x, y1: mT, y2: mT + ph }, svg);
+      const rows = [];
+      for (const s of series) {
+        const p = s.points.find((q) => q[0] === t);
+        if (!p) continue;
+        svgEl("circle", { cx: X(mid(p)), cy: Y(p[1]), r: 4, fill: s.color, stroke: cssVar("--panel"), "stroke-width": 2 }, svg);
+        rows.push({ s, p });
+      }
+      tip.textContent = "";
+      const head = document.createElement("div");
+      head.className = "t";
+      head.textContent = hhmm(t) + "–" + hhmm(t + width) + " UTC" + (t + width > state.now ? " · so far" : "");
+      tip.appendChild(head);
+      for (const { s, p } of rows) {
+        const r = document.createElement("div"); r.className = "r";
+        const k = document.createElement("span"); k.className = "k"; k.style.background = s.color;
+        const b = document.createElement("b"); b.textContent = (opts.signed && p[1] > 0 ? "+" : "") + fmtVal(p[1], opts.unit);
+        r.append(k, b);
+        const nm = document.createElement("span"); nm.className = "nm";
+        nm.textContent = (series.length > 1 ? s.name + " · " : "") +
+          (p[4] > 1 ? "range " + fmtVal(p[2], "") + " to " + fmtVal(p[3], "") : "1 sample");
+        r.appendChild(nm);
+        tip.appendChild(r);
+      }
+      tip.hidden = rows.length === 0;
+      const tw = tip.offsetWidth;
+      tip.style.left = (x + 12 + tw > W ? Math.max(0, x - 12 - tw) : x + 12) + "px";
+      tip.style.top = mT + "px";
+    } else {
+      tip.hidden = true;
+    }
+
+    // What the chart shows, for a screen reader: the newest value of each.
+    svg.setAttribute("aria-label", (opts.title || "history") + ": " + (empty ? "no data yet" :
+      series.filter((s) => s.name).map((s) => { const l = s.points[s.points.length - 1]; return (series.length > 1 ? s.name + " " : "") + (l ? fmtVal(l[1], opts.unit) : "no data"); }).join(", ")));
+
+    if (legend) {
+      legend.textContent = "";
+      for (const s of series) {
+        const l = s.points[s.points.length - 1];
+        const i = document.createElement("span"); i.className = "i";
+        const k = document.createElement("span"); k.className = "k"; k.style.background = s.color;
+        const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = s.name;
+        const b = document.createElement("b"); b.textContent = l ? (opts.signed && l[1] > 0 ? "+" : "") + fmtVal(l[1], opts.unit) : "—";
+        i.append(k, nm, b);
+        legend.appendChild(i);
+      }
+      if (state.omitted) {
+        const more = document.createElement("span"); more.className = "nm";
+        more.textContent = "+" + state.omitted + " more not charted";
+        legend.appendChild(more);
+      }
+    }
+  }
+
+  function idxAt(clientX) {
+    if (!state || !state.starts || !state.starts.length) return null;
+    const r = svg.getBoundingClientRect();
+    const mL = 44, pw = Math.max(10, r.width - mL - 10);
+    const t = state.x0 + (clientX - r.left - mL) / pw * (state.x1 - state.x0) - state.width / 2;
+    let best = 0;
+    for (let i = 1; i < state.starts.length; i++) {
+      if (Math.abs(state.starts[i] - t) < Math.abs(state.starts[best] - t)) best = i;
+    }
+    return best;
+  }
+  svg.addEventListener("pointermove", (e) => { const i = idxAt(e.clientX); if (i !== hoverIdx) { hoverIdx = i; render(); } });
+  svg.addEventListener("pointerleave", () => { hoverIdx = null; render(); });
+  svg.addEventListener("blur", () => { hoverIdx = null; render(); });
+  svg.addEventListener("keydown", (e) => {
+    if (!state || !state.starts || !state.starts.length) return;
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const n = state.starts.length;
+    hoverIdx = hoverIdx == null ? n - 1 : hoverIdx + (e.key === "ArrowLeft" ? -1 : 1);
+    render();
+  });
+  new ResizeObserver(() => render()).observe(el);
+
+  return {
+    update(next) {
+      // Keep the crosshair on the same bucket across a refresh.
+      const t = hoverIdx != null && state && state.starts ? state.starts[hoverIdx] : null;
+      state = next;
+      if (t != null) {
+        const starts = [...new Set(next.series.flatMap((s) => s.points.map((p) => p[0])))].sort((a, b) => a - b);
+        const i = starts.indexOf(t);
+        hoverIdx = i >= 0 ? i : null;
+      }
+      render();
+    },
+    render,
+    el,
+  };
+}
+
+function chart(id, opts) {
+  if (!charts[id]) charts[id] = makeChart($(id), opts);
+  return charts[id];
+}
+
+function renderMetrics() {
+  if (!mData) return;
+  const d = mData, width = d.bucket_seconds;
+  const x1 = Math.floor(d.now / width) * width + width;
+  const x0 = x1 - width * d.buckets;
+  const byId = {};
+  for (const s of d.series) byId[s.id] = s;
+  const one = (id, color) => byId[id] ? [{ name: byId[id].label, color, points: byId[id].points }] : [];
+  const frame = (series, extra) => Object.assign({ series, x0, x1, width, now: d.now }, extra || {});
+
+  tlState = { spans: d.serving || [], x0, x1, now: d.now, width };
+  renderTimeline();
+
+  chart("ch-offset", { unit: "ms", band: true, signed: true, title: "Clock offset" })
+    .update(frame(one("served.offset_ms", slot(0))));
+  chart("ch-disp", { unit: "ms", band: true, floorZero: true, title: "Root dispersion" })
+    .update(frame(one("served.dispersion_ms", slot(0))));
+
+  // Primary and secondary on one scale, so the two sides of the card can be
+  // compared by eye -- the gap between the lines is the difference in the
+  // middle.
+  const pSeries = one("class.primary_ms", slot(0)), sSeries = one("class.secondary_ms", slot(1));
+  const shared = pSeries.concat(sSeries);
+  const pc = chart("ch-primary", { unit: "ms", band: true, signed: true, title: "Primary median offset" });
+  const sc = chart("ch-secondary", { unit: "ms", band: true, signed: true, title: "Secondary median offset" });
+  // Scale sharing: pad each with the other's extremes as invisible bounds.
+  const bounds = (list) => {
+    let lo = Infinity, hi = -Infinity;
+    for (const s of list) for (const p of s.points) { lo = Math.min(lo, p[2]); hi = Math.max(hi, p[3]); }
+    return lo === Infinity ? null : [lo, hi];
+  };
+  const b = bounds(shared);
+  const withBounds = (list) => b && list.length
+    ? list.concat([{ name: "", color: "transparent", points: [], bounds: b }]) : list;
+  pc.update(frame(withBounds(pSeries)));
+  sc.update(frame(withBounds(sSeries)));
+  chart("ch-delta", { unit: "ms", band: true, signed: true, title: "Primary minus secondary" })
+    .update(frame(one("class.delta_ms", slot(6)), { emptyText: "needs both classes measured" }));
+
+  // Per source: one colour per source, in configuration order, so a receiver
+  // is the same colour on every chart. Past eight, the rest are named in the
+  // legend but not drawn, rather than drawn in a colour that means someone else.
+  const perSource = (group, metric) => {
+    // Configuration order, from the stream, rather than the order sources
+    // first produced a figure -- which differs run to run and would repaint.
+    const seen = new Set(d.series.filter((s) => s.group === group && s.source).map((s) => s.source));
+    const names = sourceOrder.filter((n) => seen.has(n)).concat([...seen].filter((n) => !sourceOrder.includes(n)));
+    const list = [];
+    names.forEach((n, i) => {
+      if (i >= 8) return;
+      const s = byId["source." + n + "." + metric];
+      if (s) list.push({ name: n, color: slot(i), points: s.points });
+    });
+    return frame(list, { omitted: Math.max(0, names.length - 8) });
+  };
+  chart("ch-radio-offset", { unit: "ms", signed: true, legend: true, title: "Radio offset" }).update(perSource("radio", "offset_ms"));
+  chart("ch-radio-resid", { unit: "ms", signed: true, legend: true, title: "Radio agreement" })
+    .update(Object.assign(perSource("radio", "residual_ms"), { emptyText: "needs two receivers locked" }));
+  chart("ch-radio-snr", { unit: "dB", legend: true, title: "Tick SNR", minSpan: 2 }).update(perSource("radio", "snr_db"));
+  chart("ch-ntp-offset", { unit: "ms", signed: true, legend: true, title: "NTP offset" }).update(perSource("ntp", "offset_ms"));
+  chart("ch-ntp-delay", { unit: "ms", floorZero: true, legend: true, title: "NTP round trip" }).update(perSource("ntp", "delay_ms"));
+}
+
+// The serving timeline: one horizontal bar, a segment per span of one class
+// serving, over the same window as the charts. The colours of primary and
+// secondary are the colours of their charts beneath; coasting and
+// unsynchronised take the page's warning and failure tones, and every state
+// is named in the legend and the tooltip rather than left to its colour.
+let lastClock = {};
+const tlStates = () => ({
+  primary:   { color: slot(0), label: "primary" + (lastClock.primary ? " (" + lastClock.primary + ")" : "") },
+  secondary: { color: slot(1), label: "secondary" + (lastClock.secondary ? " (" + lastClock.secondary + ")" : "") },
+  both:      { color: slot(2), label: "both classes" },
+  coasting:  { color: cssVar("--warn"), label: "coasting" },
+  none:      { color: cssVar("--bad"), label: "unsynchronised" },
+});
+
+function spanDur(sec) {
+  sec = Math.max(0, Math.round(sec));
+  if (sec < 60) return sec + "s";
+  const h = Math.floor(sec / 3600), m = Math.floor(sec % 3600 / 60);
+  return h ? h + "h" + (m ? " " + m + "m" : "") : m + "m" + (sec % 60 && m < 10 ? " " + sec % 60 + "s" : "");
+}
+const hhmmss = (t) => { const d = new Date(t * 1000); return hhmm(t) + ":" + pad(d.getUTCSeconds()); };
+
+let tlState = null, tlHover = null;
+function renderTimeline() {
+  const el = $("tl");
+  if (!el || !tlState) return;
+  const W = el.clientWidth;
+  if (!W) return;
+  const { spans, x0, x1, now, width } = tlState;
+  const states = tlStates();
+  const H = 44, barH = 22, mL = 0, pw = W;
+  let svg = el.querySelector("svg");
+  if (!svg) {
+    svg = svgEl("svg", { height: H, tabindex: "0", role: "img" }, el);
+    const tip = document.createElement("div"); tip.className = "tip"; tip.hidden = true; el.appendChild(tip);
+    svg.addEventListener("pointermove", (e) => {
+      const r = svg.getBoundingClientRect();
+      const t = tlState.x0 + (e.clientX - r.left) / r.width * (tlState.x1 - tlState.x0);
+      const i = tlState.segs.findIndex((g) => t >= g.a && t < g.b);
+      if (i !== tlHover) { tlHover = i >= 0 ? i : null; renderTimeline(); }
+    });
+    svg.addEventListener("pointerleave", () => { tlHover = null; renderTimeline(); });
+    svg.addEventListener("blur", () => { tlHover = null; renderTimeline(); });
+    svg.addEventListener("keydown", (e) => {
+      if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+      e.preventDefault();
+      const n = tlState.segs.length;
+      if (!n) return;
+      tlHover = tlHover == null ? n - 1 : Math.max(0, Math.min(n - 1, tlHover + (e.key === "ArrowLeft" ? -1 : 1)));
+      renderTimeline();
+    });
+    new ResizeObserver(renderTimeline).observe(el);
+  }
+  const tip = el.querySelector(".tip");
+  svg.setAttribute("viewBox", "0 0 " + W + " " + H);
+  svg.textContent = "";
+  const X = (t) => mL + (t - x0) / (x1 - x0) * pw;
+
+  // The track: what nothing was recorded for -- before the daemon started --
+  // stays the bare track, rather than being painted as any state.
+  svgEl("rect", { x: 0, y: 0, width: pw, height: barH, rx: 5, fill: cssVar("--grid") }, svg);
+
+  const end = Math.min(now, x1);
+  const segs = [];
+  spans.forEach((sp, i) => {
+    const a = Math.max(sp[0], x0), b = Math.min(i + 1 < spans.length ? spans[i + 1][0] : end, end);
+    if (b > a) segs.push({ a, b, state: sp[1], from: sp[0] });
+  });
+  tlState.segs = segs;
+
+  const totals = {};
+  segs.forEach((g, i) => {
+    totals[g.state] = (totals[g.state] || 0) + (g.b - g.a);
+    const st = states[g.state] || { color: cssVar("--muted"), label: g.state };
+    // A 2px surface gap between neighbours, taken out of the later segment;
+    // a sliver too narrow to lose it is kept whole, so a brief failover is
+    // never erased by the spacing.
+    let xa = X(g.a), xb = X(g.b);
+    if (i > 0 && xb - xa > 4) xa += 2;
+    const w = Math.max(1.5, xb - xa);
+    const r = svgEl("rect", { class: "seg-r" + (tlHover === i ? " on" : ""), x: xa, y: 0, width: w, height: barH, fill: st.color,
+                              rx: Math.min(5, w / 2) }, svg);
+    if (tlHover === i) r.setAttribute("stroke", cssVar("--ink")), r.setAttribute("stroke-width", 1.5);
+  });
+
+  const xStep = width >= 1800 ? 6 * 3600 : 15 * 60;
+  for (let t = Math.ceil(x0 / xStep) * xStep; t <= x1; t += xStep) {
+    const x = X(t);
+    if (x < 14 || x > pw - 14) continue;
+    svgEl("line", { class: "gridl", x1: Math.round(x) + 0.5, x2: Math.round(x) + 0.5, y1: barH + 2, y2: barH + 6 }, svg);
+    svgEl("text", { class: "tick", x, y: H - 4, "text-anchor": "middle" }, svg).textContent = hhmm(t);
+  }
+
+  if (tlHover != null && segs[tlHover]) {
+    const g = segs[tlHover], st = states[g.state] || { label: g.state, color: cssVar("--muted") };
+    tip.textContent = "";
+    const head = document.createElement("div"); head.className = "t";
+    const ongoing = g.b >= end - 1;
+    head.textContent = hhmmss(g.from) + (g.from < x0 ? " (before this window)" : "") + " → " +
+      (ongoing ? "now" : hhmmss(g.b)) + " UTC";
+    const row = document.createElement("div"); row.className = "r";
+    const k = document.createElement("span"); k.className = "sw"; k.style.background = st.color;
+    const b = document.createElement("b"); b.textContent = spanDur((ongoing ? now : g.b) - g.from);
+    const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = st.label + (ongoing ? " · ongoing" : "");
+    row.append(k, b, nm);
+    tip.append(head, row);
+    tip.hidden = false;
+    const xm = (X(g.a) + X(g.b)) / 2, tw = tip.offsetWidth;
+    tip.style.left = Math.max(0, Math.min(W - tw, xm - tw / 2)) + "px";
+    tip.style.top = (barH + 6) + "px";
+  } else {
+    tip.hidden = true;
+  }
+
+  // The legend carries the totals, so the proportions are readable without
+  // hovering, and names every state that appears.
+  const lg = $("tllegend");
+  lg.textContent = "";
+  for (const key of Object.keys(states)) {
+    if (!totals[key]) continue;
+    const i = document.createElement("span"); i.className = "i";
+    const k = document.createElement("span"); k.className = "sw"; k.style.background = states[key].color;
+    const nm = document.createElement("span"); nm.className = "nm"; nm.textContent = states[key].label;
+    const b = document.createElement("b"); b.textContent = spanDur(totals[key]);
+    i.append(k, nm, b);
+    lg.appendChild(i);
+  }
+  const changes = Math.max(0, spans.filter((sp) => sp[0] >= x0).length - (spans.length && spans[0][0] >= x0 ? 1 : 0));
+  $("tlnote").textContent = segs.length
+    ? changes + " changeover" + (changes === 1 ? "" : "s") + " in the last " + (width >= 1800 ? "24 hours" : "hour")
+    : "nothing recorded yet";
+  svg.setAttribute("aria-label", "Serving timeline: " +
+    Object.keys(totals).map((k2) => (states[k2] ? states[k2].label : k2) + " " + spanDur(totals[k2])).join(", "));
+}
+
+async function fetchMetrics() {
+  if (mFetching || document.hidden) return;
+  mFetching = true;
+  const range = mRange;
+  try {
+    const r = await fetch("/api/metrics?range=" + range, { cache: "no-store" });
+    const d = await r.json();
+    if (range === mRange) { mData = d; renderMetrics(); }
+  } catch (x) {
+  } finally {
+    mFetching = false;
+    for (const c of Object.values(charts)) c.el.classList.remove("loading");
+  }
+}
+
+function scheduleMetrics() {
+  clearInterval(mTimer);
+  // The newest bucket fills continuously, so an hour is refreshed often
+  // enough to watch it move; a day of half-hour buckets barely changes.
+  mTimer = setInterval(fetchMetrics, mRange === "hour" ? 10000 : 60000);
+}
+
+function setRange(r) {
+  mRange = r;
+  try { localStorage.setItem("ubersdr-ntp.range", r); } catch (x) {}
+  for (const b of document.querySelectorAll(".seg button")) b.setAttribute("aria-pressed", String(b.dataset.range === r));
+  $("rangenote").textContent = (r === "hour" ? "1-minute averages over the last hour"
+    : "30-minute averages over the last 24 hours") + " · kept in memory since the daemon started";
+  // Hold the old picture, dimmed, until the new one arrives: no blank flash.
+  for (const c of Object.values(charts)) c.el.classList.add("loading");
+  mFetching = false;
+  fetchMetrics();
+  scheduleMetrics();
+}
+for (const b of document.querySelectorAll(".seg button")) b.addEventListener("click", () => setRange(b.dataset.range));
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", renderMetrics);
+document.addEventListener("visibilitychange", () => { if (!document.hidden) fetchMetrics(); });
+
 // EventSource reconnects on its own only after an established stream drops.
 // If a reconnection attempt itself fails -- the network is down because the
 // machine was asleep, or has not come back yet on wake -- the browser marks it
@@ -894,7 +1711,17 @@ function connect() {
     retryDelay = 1000;
     showLink(true, "live");
   });
-  s.addEventListener("tick", (e) => { alive(); try { onTick(JSON.parse(e.data)); } catch (x) {} });
+  s.addEventListener("tick", (e) => {
+    alive();
+    let d;
+    try { d = JSON.parse(e.data); } catch (x) { return; }
+    try { onTick(d); } catch (x) {}
+    try { eventsOnTick(d); } catch (x) {}
+    try {
+      const order = (d.sources || []).map((x) => x.name);
+      if (order.join("\n") !== sourceOrder.join("\n")) { sourceOrder = order; renderMetrics(); }
+    } catch (x) {}
+  });
   s.addEventListener("status", (e) => { alive(); try { onStatus(JSON.parse(e.data)); } catch (x) {} });
   s.addEventListener("error", () => {
     if (s !== es) return;
@@ -920,4 +1747,5 @@ window.addEventListener("online", () => { wake(); restartMeasurement(); });
 
 connect();
 burst();
+setRange(mRange);
 </script>

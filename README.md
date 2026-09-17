@@ -55,10 +55,11 @@ deserves, never more.
 
 Three things that number is not:
 
-- **It is not exact, and about 3 ms of it is a known systematic.** Every source
-  shares the chain constant, so no arrangement of receivers can measure it and
-  only an absolute reference can; see [the delay model](#the-delay-model). It is
-  written down rather than tuned away.
+- **It is not exact, and part of it was a systematic since corrected.** Every
+  source shares the chain constant, so no arrangement of receivers can measure
+  it and only an absolute reference can. The NTP class later measured it about
+  1 ms too large, and it was lowered; see [the delay model](#the-delay-model).
+  The figures above predate that.
 - **It is one evening, one band, one client location.** HF propagation is not
   the same at 03:00 as at 23:00, and the same two receivers wandered ±11 ms
   against *each other* over this hour — which bounds how well the per-source
@@ -91,8 +92,9 @@ pleasure of running a clock off a shortwave broadcast.
 The residual uncertainty is concentrated in the constants every source shares,
 and they are the ones nothing in this arrangement can measure: the chain-delay
 constant, the codec delay, and the decoder's edge bias all cancel between
-receivers. The chain constant is known to be about 3 ms large and has never been
-validated against an off-air recording at the two rates used here.
+receivers. The chain constant has since been calibrated against the NTP class
+(see the delay model), but never against an off-air recording at the two rates
+used here.
 
 ## Build
 
@@ -156,6 +158,7 @@ daemon:
 ./build-native/ubersdr-ntp-clocktest     # offset/rate estimator, sample clock, Selector
 ./build-native/ubersdr-ntp-ntptest       # the NTP client, against a fake server
 ./build-native/ubersdr-ntp-configtest    # the configuration reader
+./build-native/ubersdr-ntp-eventtest     # the event log's transitions, and the metric history's bounds
 python3 tools/selftest.py ./build-native/ubersdr-ntp
 ```
 
@@ -314,7 +317,7 @@ audio stream measures:
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
 | Network | 5–100 ms | Measured, as half the round trip of a WebSocket ping down the audio connection itself |
 | Codec | 8 ms (Opus), 0 (PCM v4) | A measured constant |
-| UberSDR chain | 13.6 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. **Known to be about 3 ms too large** — see below |
+| UberSDR chain | 12.6 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. Calibrated against the NTP class — see below |
 | Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB) | A measured constant, from `tools/decodertest.cpp` |
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
 
@@ -344,27 +347,23 @@ the handshake does not get a vote.
 
 The HTTP figure is used only when a server never answers a ping at all.
 
-### The chain constant is about 3 ms too large
+### Calibrating the chain constant against NTP
 
-Measured over an evening against two receivers and a host disciplined to
-+0.15 ms, served time ran **+3.4 ms** (sd 1.7, n=122); an earlier session gave
-+5.4 ms. Something common to every source over-counts by a few milliseconds,
-and the chain constant is the loosest term in the budget, so it is the
-suspect.
+The terms every source shares cannot be measured by comparing sources: two
+receivers hearing the same transmitter cancel the chain delay, the codec delay
+and the decoder bias exactly, so they agree just as well whatever those are set
+to. Only a reference outside the radio can see them, and one evening against a
+host clock could not separate a fixed over-count from that night's ionosphere
+(served time ran +3.4 ms, then +5.4 ms, while the receivers wandered ±11 ms
+against each other).
 
-It has not been changed, for a reason worth stating. The terms every source
-shares cannot be measured by comparing sources: two receivers hearing the same
-transmitter cancel the chain delay, the codec delay and the decoder bias
-exactly, so they agree just as well whatever those are set to. Only an absolute
-reference can see the common mode, and over the same evening the two receivers
-wandered ±11 ms against *each other* — so a single evening cannot separate a
-fixed over-count from the ionosphere, and re-deriving the constant from one
-session would bake that night's propagation into a figure that claims to
-describe a buffer. Pinning it wants a run spanning day and night.
-
-Until then the bias is inside the dispersion the server advertises, which is
-the honest place for it: the answer is a few milliseconds high and says it
-could be sixteen out.
+The NTP class is that outside reference, measured continuously. With two
+receivers primary and `time.cloudflare.com` in standby, the page's *Difference*
+— radio minus NTP — held between **+0.8 and +1.5 ms for many hours**: the radio
+put UTC about 1 ms late. A per-path error does not hold that steady across hours
+and two receivers; a shared constant does. So the chain constant was lowered
+from 13.6 ms to **12.6 ms** (2026-09-17). After the change the Difference should
+sit near zero; if it settles somewhere else, that is the next correction.
 
 The part nothing in the stream can see is the delay inside the receiver —
 `radiod`'s demodulator and filters, its block framing, the server's handling —
@@ -525,7 +524,10 @@ Two sources cannot use any of this: their residuals come out equal and opposite
 whichever of them is wrong, which is not a defect to be worked around but what
 two measurements of one event can tell you. Three is where it starts to work.
 
-Set `ntp.min_sources: 2` if you want the agreement test to be load-bearing.
+Set `clock.min_radio_sources: 2` if you want the agreement test to be
+load-bearing: the radio class then counts as healthy only while at least two
+receivers are usable (locked, fresh and not refused), and with fewer it neither
+serves nor holds off a failover.
 
 ### What two sources do and do not independently verify
 
@@ -575,7 +577,8 @@ So one class is the **primary** and the other the **secondary**:
   "secondary": "standby",   // "always" | "standby" | "cold"
   "failover_after_seconds": 60,
   "failback_after_seconds": 300,
-  "min_secondary_sources": 1
+  "min_radio_sources": 1,  // receivers that must be usable for radio to be healthy
+  "min_ntp_sources": 1     // ...and upstreams, for NTP
 },
 "ntp_sources": [
   "time.cloudflare.com",
@@ -853,6 +856,58 @@ daemon uses, so set `http.listen` to `127.0.0.1` to keep it on this machine.
 | `/api/status` | Everything this daemon knows, pretty-printed |
 | `/api/sources` | Just the per-source array |
 | `/api/health` | 200 when synchronised, 503 when not, tiny either way |
+| `/api/eventlog` | The last 100 events worth knowing about, newest first, and the catalogue of event types |
+| `/api/metrics` | Recent history for the page's charts: `?range=hour` (1-minute averages) or `?range=day` (30-minute), and which class served when |
+
+### History
+
+The page draws a chart under the figures worth watching over time: the clock
+offset and root dispersion, each class's median offset and the difference
+between them, and per source its offset, its agreement with the rest of its
+class, and a figure of its own kind (a receiver's tick SNR, an upstream's round
+trip). A bar across the top of the primary-and-secondary card shows which class
+served the time, so a failover and the failback are a coloured stretch rather
+than two log lines. One switch covers every chart: the last hour at 1-minute
+averages, or the last 24 hours at 30-minute averages.
+
+Kept in memory and bounded: 60 plus 48 buckets per series, series only for the
+served figures and the configured sources, and only the *changes* of serving
+class, capped at 2000. A restart starts it again.
+
+`/api/metrics` serves one range at a time; `group=served,class,radio,ntp` narrows
+it. Each point is `[bucket start, mean, min, max, samples]`, oldest first, the
+last still filling; `serving` is `[start, state]` pairs, each lasting until the
+next, the first saying what held at the start of the window.
+
+### Events
+
+The status page says what *is*; the event log says what *happened*: a receiver
+locking or dropping out, a class of source becoming healthy or not, a failover
+and the failback, coasting, a refusal by the consensus, an upstream sending
+kiss-o'-death. The daemon keeps the newest hundred, in memory only, so a restart
+starts the list again with a `daemon_started` entry. The page shows them ten at
+a time, filterable by type, source and severity.
+
+`/api/eventlog` returns them with the type catalogue alongside, so a client can
+label and filter without knowing the vocabulary in advance:
+
+```jsonc
+{
+  "capacity": 100, "latest_id": 7,
+  "types": [ { "type": "failover", "label": "Failed over", "category": "class",
+               "severity": "warning", "description": "…" }, … ],
+  "events": [ { "id": 7, "utc": "2026-09-17T00:34:48Z", "unix": 1789605288.1,
+                "uptime_seconds": 10.3, "type": "failover", "category": "class",
+                "severity": "warning", "source": null, "kind": "ntp",
+                "message": "serving from the ntp sources: …" }, … ]
+}
+```
+
+Optional filters, combined as AND: `type=a,b`, `category=a,b`,
+`source=name`, `kind=radio|ntp`, `severity=` (that or worse: `info`, `notice`,
+`warning`, `error`), `since_id=n`, `limit=n`. Each one-second `tick` on
+`/api/events` carries `events_latest_id`, so a follower asks again only when it
+moves.
 
 Every source in `/api/status` carries a `kind` of `radio` or `ntp`, a
 `primary_class` flag, and `ready` / `not_ready_reason` — the one question both

@@ -20,8 +20,9 @@ real failure mode that a clean compile does not rule out:
     unsynchronised radio clock is worse off than one with no radio clock;
   * it does NOT answer mode 6 or mode 7, the control and private modes behind
     every ntpd reflection-amplification advisory;
-  * the HTTP service serves the page, /api/time, /api/status and /api/health,
-    with /api/health reporting 503 while unsynchronised;
+  * the HTTP service serves the page, /api/time, /api/status, /api/health,
+    /api/eventlog and /api/metrics, with /api/health reporting 503 while
+    unsynchronised;
   * the SSE stream connects and emits a tick within a couple of seconds;
   * more event streams than it has slots for are refused, and /api/health
     still answers while they are open;
@@ -428,6 +429,30 @@ def main():
 
         code, body, _ = http_get('/api/health')
         check('GET /api/health is 503 while unsynchronised', code == 503, 'HTTP %s' % code)
+
+        # The event log opens with the startup event, and carries the type
+        # catalogue a client filters by.
+        code, body, _ = http_get('/api/eventlog')
+        try:
+            j = json.loads(body)
+            ok = (code == 200 and j.get('capacity') == 100 and len(j.get('types', [])) > 10
+                  and any(e.get('type') == 'daemon_started' for e in j.get('events', [])))
+        except ValueError:
+            ok = False
+        check('GET /api/eventlog lists types and the daemon_started event', ok, body[:200])
+
+        # History: both ranges answer with their bucket width and a serving
+        # timeline, which has at least the state since startup.
+        for rng, width in (('hour', 60), ('day', 1800)):
+            code, body, _ = http_get('/api/metrics?range=' + rng)
+            try:
+                j = json.loads(body)
+                ok = (code == 200 and j.get('range') == rng and j.get('bucket_seconds') == width
+                      and isinstance(j.get('series'), list) and len(j.get('serving', [])) >= 1)
+            except ValueError:
+                ok = False
+            check('GET /api/metrics?range=%s answers with %d s buckets' % (rng, width), ok,
+                  body[:200])
 
         code, _, _ = http_get('/api/nothing-here')
         check('GET an unknown path is 404', code == 404, 'HTTP %s' % code)

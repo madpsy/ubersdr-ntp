@@ -17,6 +17,7 @@
 #include "Selector.h"
 #include "Source.h"
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -40,6 +41,9 @@ struct StatusInput {
     SecondaryMode secondaryMode = SecondaryMode::Standby;
     bool secondaryActive = true;
     std::string secondaryActiveReason;
+
+    // The newest event's id, 0 before the first. See Events.h.
+    std::uint64_t eventsLatestId = 0;
 };
 
 // The multi-line block for the log. No trailing newline; Log::block indents it.

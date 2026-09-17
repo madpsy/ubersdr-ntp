@@ -115,6 +115,23 @@ target_include_directories(ubersdr-ntp-configtest PRIVATE
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
 target_compile_options(ubersdr-ntp-configtest PRIVATE -Wall -Wextra)
 
+# Offline test of the event monitor: scripted sequences of snapshots and
+# combine results, checking which events come out and, as much, which do not.
+# Not installed.
+add_executable(ubersdr-ntp-eventtest
+    tools/eventtest.cpp
+    src/Events.cpp
+    src/Metrics.cpp
+    src/Config.cpp
+    src/SampleClock.cpp
+    src/Selector.cpp
+    src/Log.cpp)
+target_include_directories(ubersdr-ntp-eventtest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(ubersdr-ntp-eventtest PRIVATE Threads::Threads)
+target_compile_options(ubersdr-ntp-eventtest PRIVATE -Wall -Wextra)
+
 # ---------------------------------------------------------------------------
 # The page is a real file in src/web/ and is served from the binary. This is
 # the one line of build glue that costs; a 400-line page living as a string
@@ -151,8 +168,10 @@ add_custom_target(version_header
 add_executable(ubersdr-ntp
     src/main.cpp
     src/Config.cpp
+    src/Events.cpp
     src/HttpApi.cpp
     src/Log.cpp
+    src/Metrics.cpp
     src/NtpClient.cpp
     src/NtpServer.cpp
     src/OffsetEstimator.cpp
@@ -165,6 +184,7 @@ add_executable(ubersdr-ntp
 add_dependencies(ubersdr-ntp index_html version_header)
 add_dependencies(ubersdr-ntp-clocktest version_header)
 add_dependencies(ubersdr-ntp-configtest version_header)
+add_dependencies(ubersdr-ntp-eventtest version_header)
 add_dependencies(ubersdr-ntp-ntptest version_header)   # Selector.h reaches Config.h, which needs it
 
 target_include_directories(ubersdr-ntp PRIVATE

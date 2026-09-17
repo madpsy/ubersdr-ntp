@@ -291,6 +291,60 @@ void testValidation() {
     })");
     check("...and allowed when that class is the primary", swapped.ok, "%s", swapped.why());
 
+    // The kind-keyed spelling: min_radio_sources counts receivers whichever
+    // class is primary, and lands in the role-keyed figure the Selector reads.
+    const Loaded twoRadios = load(R"({
+      "clock": { "min_radio_sources": 2 },
+      "sources": [ { "url": "http://r.example", "carrier_hz": 10000000 },
+                   { "url": "http://r.example", "carrier_hz": 15000000 } ],
+      "ntp_sources": [ "a.example" ]
+    })");
+    check("min_radio_sources with radio primary sets the primary minimum",
+          twoRadios.ok && twoRadios.cfg.ntp.minSources == 2 &&
+              twoRadios.cfg.clock.minSecondarySources == 1,
+          "%s primary %d secondary %d", twoRadios.why(), twoRadios.cfg.ntp.minSources,
+          twoRadios.cfg.clock.minSecondarySources);
+
+    const Loaded radioSecondary = load(R"({
+      "clock": { "primary": "ntp", "min_radio_sources": 2 },
+      "sources": [ { "url": "http://r.example", "carrier_hz": 10000000 },
+                   { "url": "http://r.example", "carrier_hz": 15000000 } ],
+      "ntp_sources": [ "a.example" ]
+    })");
+    check("...and follows the radio when it is the secondary",
+          radioSecondary.ok && radioSecondary.cfg.ntp.minSources == 1 &&
+              radioSecondary.cfg.clock.minSecondarySources == 2,
+          "%s primary %d secondary %d", radioSecondary.why(),
+          radioSecondary.cfg.ntp.minSources, radioSecondary.cfg.clock.minSecondarySources);
+
+    const Loaded legacy = load(R"({
+      "clock": { "primary": "ntp", "min_secondary_sources": 2 },
+      "sources": [ { "url": "http://r.example", "carrier_hz": 10000000 },
+                   { "url": "http://r.example", "carrier_hz": 15000000 } ],
+      "ntp_sources": [ "a.example" ]
+    })");
+    check("the role-keyed spelling still resolves to the right kind",
+          legacy.ok && legacy.cfg.clock.minRadioSources == 2 && legacy.cfg.clock.minNtpSources == 1,
+          "%s radio %d ntp %d", legacy.why(), legacy.cfg.clock.minRadioSources,
+          legacy.cfg.clock.minNtpSources);
+
+    const Loaded both = load(R"({
+      "ntp": { "min_sources": 1 },
+      "clock": { "min_radio_sources": 2 },
+      "sources": [ { "url": "http://r.example", "carrier_hz": 10000000 },
+                   { "url": "http://r.example", "carrier_hz": 15000000 } ]
+    })");
+    check("one kind's minimum given two different ways is refused",
+          both.failedWith("min_radio_sources"), "%s", both.why());
+
+    const Loaded tooFewRadios = load(R"({
+      "clock": { "min_radio_sources": 3 },
+      "sources": [ { "url": "http://r.example", "carrier_hz": 10000000 },
+                   { "url": "http://r.example", "carrier_hz": 15000000 } ]
+    })");
+    check("min_radio_sources larger than the radio sources enabled is refused",
+          tooFewRadios.failedWith("clock.min_radio_sources is 3"), "%s", tooFewRadios.why());
+
     const Loaded rude = load(R"({
       "ntp_sources": [ { "server": "a.example", "poll_seconds": 1 } ],
       "sources": [ { "url": "http://r.example", "carrier_hz": 10000000 } ]

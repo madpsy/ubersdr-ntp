@@ -227,8 +227,8 @@ std::string renderStatusBlock(const StatusInput& in) {
         const ClassDelta& d = in.combined.classDelta;
         o << "\n       " << sourceKindName(in.primaryKind) << " minus "
           << sourceKindName(in.secondaryKind) << ": " << formatOffsetMs(d.averagedSec)
-          << " averaged (" << formatOffsetMs(d.instantSec) << " now)"
-          << ", over " << formatDuration(d.settledForSec)
+          << " (5-min average; " << formatOffsetMs(d.instantSec) << " now)"
+          << ", compared for " << formatDuration(d.settledForSec)
           << ", " << d.primarySources << " vs " << d.secondarySources << " source(s)";
         if (in.primaryKind == SourceKind::Radio) {
             o << "\n       "

@@ -34,15 +34,6 @@
     "coast_seconds": 3600,
     "coast_drift_ppm": 15.0,
 
-    // Sources that must agree before any time is served, WITHIN THE PRIMARY
-    // CLASS (see "clock" below; the secondary has its own figure). 1 suits a
-    // single-receiver install. 2 makes the agreement test load-bearing, which
-    // buys protection against one receiver producing a CONFIDENT misread — a
-    // real failure mode here, because a deep fade biases the same bits in
-    // every frame of the decoder's voter window and no metric inside one
-    // decoder can catch it. An independent receiver can.
-    "min_sources": 1,
-
     "answer_when_unsynchronised": true,
     "honour_leap_warning": true,
     // Responses per second per client, 0 to disable.
@@ -116,10 +107,19 @@
     "failover_after_seconds": 60,
     "failback_after_seconds": 300,
 
-    // Sources that must agree within the SECONDARY class before it may serve.
-    // ntp.min_sources governs the primary; an install with two receivers and
-    // one NTP server wants 2 and 1, and one number cannot be both.
-    "min_secondary_sources": 1
+    // How many sources of each KIND must be usable — locked, fresh, and not
+    // refused for disagreeing with the others — before that class counts as
+    // healthy. Below it the class does not serve, and if it is the primary
+    // the failover clock starts. Keyed by kind, not by role, so the figures
+    // stay with the receivers and the servers whichever one is primary.
+    //
+    // 1 suits a single-receiver install. 2 radio sources makes the agreement
+    // test load-bearing, which buys protection against one receiver producing
+    // a CONFIDENT misread — a real failure mode here, because a deep fade
+    // biases the same bits in every frame of the decoder's voter window and
+    // no metric inside one decoder can catch it. An independent receiver can.
+    "min_radio_sources": 1,
+    "min_ntp_sources": 1
   },
 
   // =====================================================================

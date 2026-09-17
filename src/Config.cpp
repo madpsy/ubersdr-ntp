@@ -179,6 +179,9 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         if (!getOpt(n, "coast_seconds", c.ntp.coastSeconds, err)) return false;
         if (!getOpt(n, "coast_drift_ppm", c.ntp.coastDriftPpm, err)) return false;
         if (!getOpt(n, "min_sources", c.ntp.minSources, err)) return false;
+        if (auto mit = n.find("min_sources"); mit != n.end() && !mit->is_null()) {
+            c.minSourcesGiven = true;
+        }
         if (!getOpt(n, "answer_when_unsynchronised", c.ntp.answerWhenUnsynchronised, err)) return false;
         if (!getOpt(n, "honour_leap_warning", c.ntp.honourLeapWarning, err)) return false;
         if (!getOpt(n, "rate_limit_per_client", c.ntp.rateLimitPerClient, err)) return false;
@@ -211,6 +214,11 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         if (!getOpt(k, "failover_after_seconds", c.clock.failoverAfterSec, err)) return false;
         if (!getOpt(k, "failback_after_seconds", c.clock.failbackAfterSec, err)) return false;
         if (!getOpt(k, "min_secondary_sources", c.clock.minSecondarySources, err)) return false;
+        if (auto mit = k.find("min_secondary_sources"); mit != k.end() && !mit->is_null()) {
+            c.minSecondarySourcesGiven = true;
+        }
+        if (!getOpt(k, "min_radio_sources", c.clock.minRadioSources, err)) return false;
+        if (!getOpt(k, "min_ntp_sources", c.clock.minNtpSources, err)) return false;
     }
 
     if (auto it = j.find("defaults"); it != j.end() && it->is_object()) {
@@ -320,6 +328,50 @@ bool Config::finalise(std::string& err) {
     if (!finiteAtLeast(clock.failoverAfterSec, 0.0, "clock.failover_after_seconds")) return false;
     if (!finiteAtLeast(clock.failbackAfterSec, 0.0, "clock.failback_after_seconds")) return false;
     if (clock.minSecondarySources < 1) clock.minSecondarySources = 1;
+
+    // The minimums, keyed by kind. clock.min_radio_sources and
+    // clock.min_ntp_sources are the spelling that means the same thing
+    // whichever class is primary; ntp.min_sources and
+    // clock.min_secondary_sources are the older role-keyed one, still read.
+    // Given both ways for one kind with different figures is refused rather
+    // than resolved by a precedence rule nobody would remember.
+    {
+        const bool radioPrimary = clock.primary == SourceKind::Radio;
+        auto resolve = [&](int& byKind, const char* kindKey, int byRole, bool roleGiven,
+                           const char* roleKey) {
+            if (byKind != 0) {
+                if (byKind < 1) {
+                    err = std::string("clock.") + kindKey + " is " + std::to_string(byKind) +
+                          "; it must be at least 1";
+                    return false;
+                }
+                if (roleGiven && byRole != byKind) {
+                    err = std::string("clock.") + kindKey + " is " + std::to_string(byKind) +
+                          " but " + roleKey + " is " + std::to_string(byRole) +
+                          ", and with clock.primary \"" + sourceKindName(clock.primary) +
+                          "\" both set the same figure; give one of them";
+                    return false;
+                }
+            } else {
+                byKind = byRole;
+            }
+            return true;
+        };
+        if (!resolve(clock.minRadioSources, "min_radio_sources",
+                     radioPrimary ? ntp.minSources : clock.minSecondarySources,
+                     radioPrimary ? minSourcesGiven : minSecondarySourcesGiven,
+                     radioPrimary ? "ntp.min_sources" : "clock.min_secondary_sources")) {
+            return false;
+        }
+        if (!resolve(clock.minNtpSources, "min_ntp_sources",
+                     radioPrimary ? clock.minSecondarySources : ntp.minSources,
+                     radioPrimary ? minSecondarySourcesGiven : minSourcesGiven,
+                     radioPrimary ? "clock.min_secondary_sources" : "ntp.min_sources")) {
+            return false;
+        }
+        ntp.minSources = radioPrimary ? clock.minRadioSources : clock.minNtpSources;
+        clock.minSecondarySources = radioPrimary ? clock.minNtpSources : clock.minRadioSources;
+    }
 
     std::set<std::string> names;
     int autoName = 0;
@@ -484,17 +536,25 @@ bool Config::finalise(std::string& err) {
                            " source is enabled; there is nothing to fall back to");
     }
 
-    // min_sources governs the primary class; a figure larger than the class can
-    // ever supply means it can never serve, which is a configuration that
-    // cannot work rather than one that works badly.
+    // A minimum larger than its class can ever supply means that class can
+    // never be healthy, which is a configuration that cannot work rather than
+    // one that works badly. Named by whichever key set it, so the message
+    // points at the line that needs changing.
+    auto minKey = [&](SourceKind k) -> std::string {
+        const bool primary = k == clock.primary;
+        const bool roleGiven = primary ? minSourcesGiven : minSecondarySourcesGiven;
+        const std::string roleKey = primary ? "ntp.min_sources" : "clock.min_secondary_sources";
+        const std::string kindKey = k == SourceKind::Radio ? "clock.min_radio_sources"
+                                                           : "clock.min_ntp_sources";
+        return roleGiven ? roleKey + " (the " + sourceKindName(k) + " minimum)" : kindKey;
+    };
     if (primaryEnabled > 0 && ntp.minSources > primaryEnabled) {
-        err = "ntp.min_sources is " + std::to_string(ntp.minSources) + " but only " +
-              std::to_string(primaryEnabled) + " " + primaryWord +
-              " source(s) are enabled, and min_sources governs the primary class";
+        err = minKey(clock.primary) + " is " + std::to_string(ntp.minSources) + " but only " +
+              std::to_string(primaryEnabled) + " " + primaryWord + " source(s) are enabled";
         return false;
     }
     if (secondaryEnabled > 0 && clock.minSecondarySources > secondaryEnabled) {
-        err = "clock.min_secondary_sources is " + std::to_string(clock.minSecondarySources) +
+        err = minKey(secondaryKind()) + " is " + std::to_string(clock.minSecondarySources) +
               " but only " + std::to_string(secondaryEnabled) + " " + secondaryWord +
               " source(s) are enabled";
         return false;

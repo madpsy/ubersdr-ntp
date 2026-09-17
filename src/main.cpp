@@ -27,8 +27,10 @@
 // JSON, as a one-event-per-second stream, and as a page.
 
 #include "Config.h"
+#include "Events.h"
 #include "HttpApi.h"
 #include "Log.h"
+#include "Metrics.h"
 #include "NtpClient.h"
 #include "NtpServer.h"
 #include "SampleClock.h"
@@ -42,6 +44,7 @@
 #include <ixwebsocket/IXNetSystem.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <csignal>
@@ -309,10 +312,10 @@ int main(int argc, char** argv) {
                  "back after %.0fs of one",
                  cfg.clock.failoverAfterSec, cfg.clock.failbackAfterSec);
     }
-    LOG_INFO(kTag, "ntp on port %d, coasting up to %.0fs at %.0f ppm, min_sources %d "
-             "(secondary %d)",
-             cfg.ntp.port, cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm, cfg.ntp.minSources,
-             cfg.clock.minSecondarySources);
+    LOG_INFO(kTag, "ntp on port %d, coasting up to %.0fs at %.0f ppm; healthy with at least "
+             "%d radio and %d ntp source(s)",
+             cfg.ntp.port, cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm,
+             cfg.clock.minRadioSources, cfg.clock.minNtpSources);
 
     if (checkOnly) {
         LOG_INFO(kTag, "configuration is valid (--check); exiting");
@@ -372,6 +375,23 @@ int main(int argc, char** argv) {
 
     NtpServer ntp(cfg.ntp, selector);
 
+    // The last hundred transitions worth knowing about, for the page. The
+    // monitor diffs each pass of the main loop below against the one before.
+    EventLog events;
+    EventMonitor eventMonitor(cfg, events);
+    // UTC now, from the served clock when there is one: an event log stamped
+    // by a host clock that is hours out would put a failover at the wrong
+    // time on the one page that exists to show a correct one.
+    auto eventUnix = [](const Combined& c) {
+        const double d = daemonNow();
+        return c.valid ? c.utcAt(d) : d - daemonMinusRealtime();
+    };
+    eventMonitor.started(kVersion, eventUnix(selector.current()));
+
+    // A day of the figures the page draws, bounded; sampled once a second.
+    MetricHistory metrics;
+    double lastMetricSecond = 0.0;
+
     auto statusInput = [&](void) -> StatusInput {
         StatusInput in;
         in.sources = snapshots();
@@ -386,10 +406,11 @@ int main(int argc, char** argv) {
         const Selector::Activation act = selector.activation();
         in.secondaryActive = act.secondaryActive;
         in.secondaryActiveReason = act.reason;
+        in.eventsLatestId = events.latestId();
         return in;
     };
 
-    HttpApi http(cfg.http, selector, statusInput);
+    HttpApi http(cfg.http, selector, statusInput, &events, &metrics);
     if (!http.start(err)) {
         // Not fatal: the status service is how you watch this, but NTP is what
         // it is for, and refusing to serve time because a status page could not
@@ -451,6 +472,20 @@ int main(int argc, char** argv) {
                 if (cfg.isPrimary(s->kind())) continue;
                 s->setActive(act.secondaryActive, act.reason);
             }
+        }
+
+        const double passUnix = eventUnix(c);
+        eventMonitor.observe(EventMonitor::Pass{snaps, c, selector.activation().secondaryActive,
+                                                passUnix, monotonicNow() - startedAt});
+        // Every pass, so a changeover is placed to the quarter second; only a
+        // change is stored.
+        metrics.setServing(passUnix, servingClassName(c.serving));
+        // Once per second rather than every pass: four samples a second of
+        // figures that change once a second would weight nothing differently
+        // and cost four times as much.
+        if (std::floor(passUnix) != lastMetricSecond) {
+            lastMetricSecond = std::floor(passUnix);
+            sampleMetrics(metrics, snaps, c, passUnix);
         }
 
         // A change in whether time is being served at all is worth a line of

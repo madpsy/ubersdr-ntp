@@ -251,6 +251,19 @@ struct ClockConfig {
     // two receivers and one NTP server wants 2 and 1, and one number cannot be
     // both.
     int minSecondarySources = 1;
+
+    // The same two figures keyed by KIND rather than by role: how many radio
+    // sources -- UberSDR receivers -- must be usable before the radio class
+    // counts as healthy, and how many upstreams before the NTP class does.
+    // The role-keyed pair above swaps meaning with clock.primary, so a
+    // "two receivers must agree" written as min_sources would silently become
+    // "two NTP servers must agree" when the primary was changed. These do not.
+    //
+    // 0 while unset. finalise() resolves each from whichever key was given and
+    // writes the result back into BOTH spellings, so everything downstream
+    // reads the role-keyed pair and neither needs to know which was written.
+    int minRadioSources = 0;
+    int minNtpSources = 0;
 };
 
 // The read-only status service: a JSON API and a small page that renders it.
@@ -300,6 +313,12 @@ struct Config {
     // been opened, and a warning written to a terminal nobody is watching is a
     // warning nobody sees. main() says them once the log exists.
     std::vector<std::string> warnings;
+
+    // Whether the role-keyed minimums were written in the file, as opposed to
+    // left at their defaults: finalise() needs to tell "not given" from
+    // "given as 1" to spot a clash with the kind-keyed spelling.
+    bool minSourcesGiven = false;
+    bool minSecondarySourcesGiven = false;
 
     // Loads and validates. Returns false with `err` set; never half-applies.
     static bool load(const std::string& path, Config& out, std::string& err);
