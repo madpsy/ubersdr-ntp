@@ -456,13 +456,29 @@ let samples = [], pollTimer = 0, burstLeft = 0, seq = 0, polling = false;
 // clock) it was heard, and the rate it moves at between estimates.
 let srvOffsetMs = null, srvAt = 0, srvRatePpm = 0;
 
-// The least-delayed sample, its offset carried forward across any change the
-// server has since made to its own estimate, and how far out it could be.
+// A sample's offset carried forward across any change the server has since
+// made to its own estimate.
 //
 // The served offset against the server's own clock moves steadily at that
 // clock's rate even when nothing changes, and the page's clock already runs at
 // the served rate, so only the part beyond that steady movement is a change to
 // carry forward.
+function carriedTheta(s) {
+  const drift = srvOffsetMs == null || s.srvOffset == null ? 0
+    : (srvOffsetMs - s.srvOffset) - srvRatePpm * 1e-6 * (srvAt - s.at);
+  return s.theta + drift;
+}
+
+// The least-delayed sample, how far out it could be, and how far out it
+// probably is.
+//
+// err is the bound: half the round trip, the most an asymmetric path could
+// leave, since no timestamp can tell which way the delay went. jitter is NTP's
+// peer jitter -- the RMS of the other samples' offsets about the chosen one --
+// and is the likely figure: each sample's path splits its delay differently,
+// so the scatter shows how much the split varies. What it cannot show is a
+// split that never varies, which is why err stays the bound. Null until there
+// is a second sample to compare.
 function bestEstimate(nowPerf) {
   let b = null, bErr = Infinity;
   for (const s of samples) {
@@ -470,9 +486,15 @@ function bestEstimate(nowPerf) {
     if (err < bErr) { bErr = err; b = s; }
   }
   if (!b) return null;
-  const drift = srvOffsetMs == null || b.srvOffset == null ? 0
-    : (srvOffsetMs - b.srvOffset) - srvRatePpm * 1e-6 * (srvAt - b.at);
-  return { theta: b.theta + drift, err: bErr, delay: b.delay };
+  const theta = carriedTheta(b);
+  let sq = 0, n = 0;
+  for (const s of samples) {
+    if (s === b) continue;
+    const d = carriedTheta(s) - theta;
+    sq += d * d; n++;
+  }
+  const jitter = n ? Math.sqrt(sq / n) : null;
+  return { theta, err: bErr, delay: b.delay, jitter };
 }
 
 async function timingFor(url) {
@@ -636,11 +658,17 @@ function paintClock(ts) {
       : "the computer or phone showing this page, not the server";
     $("devclock").title = "Your device's own clock, compared with the broadcast time above. " +
       "Nothing to do with the server: the times shown on this page do not use it.";
-    $("linknote").textContent = "browser latency " + ms(est.delay) + " round trip, corrected (±" +
-      ms(est.err) + ")";
+    // The likely figure can come out above the bound when the other samples
+    // were slower ones; the bound still holds, so it caps it.
+    const likely = est.jitter == null ? null : Math.min(est.jitter, est.err);
+    $("linknote").textContent = "browser latency " + ms(est.delay) + " round trip, corrected: " +
+      (likely == null ? "" : "likely within ±" + ms(likely) + ", ") + "at most ±" + ms(est.err);
     $("linknote").title = "The displayed time is advanced by half the measured round trip " +
-      "between this browser and the server. ± is the most an asymmetric path could leave, " +
-      "on top of the root dispersion.";
+      "between this browser and the server, which is exact only if the delay is the same " +
+      "both ways. No measurement can tell how the round trip splits, so \"at most\" is " +
+      "the worst case: all of it in one direction. \"Likely\" is the scatter between " +
+      "repeated measurements, which shows how much the split varies; a split that never " +
+      "varies would not show in it. Both are on top of the root dispersion.";
   } else {
     $("linknote").textContent = "measuring browser latency…";
     $("devpill").className = "pill dim";
