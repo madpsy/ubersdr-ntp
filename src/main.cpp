@@ -483,6 +483,17 @@ int main(int argc, char** argv) {
         // Once per second rather than every pass: four samples a second of
         // figures that change once a second would weight nothing differently
         // and cost four times as much.
+        // Decoded times refused as jumps, each once, as it happened: a bucket's
+        // count is how many, its range how far out they were. Kept apart from
+        // the once-a-second sampling, which would count one refusal a second
+        // for as long as a snapshot remembered it.
+        for (auto& s : sources) {
+            for (double jump : s->takeRejectedJumps()) {
+                metrics.add({"source." + s->name() + ".rejected_s", s->name() + " refused time",
+                             "s", "radio", s->name()},
+                            passUnix, jump);
+            }
+        }
         if (std::floor(passUnix) != lastMetricSecond) {
             lastMetricSecond = std::floor(passUnix);
             sampleMetrics(metrics, snaps, c, passUnix);

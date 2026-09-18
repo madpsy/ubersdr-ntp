@@ -281,6 +281,9 @@ tr.fresh td { animation:fresh 4s ease-out; }
       <div><div class="trendhead"><span class="label">Tick SNR</span>
         <span class="note">while the tick is heard</span></div>
         <div class="chart" id="ch-radio-snr" data-height="150"></div></div>
+      <div><div class="trendhead"><span class="label">Refused times</span>
+        <span class="note">decodes that jumped from the receiver's own history</span></div>
+        <div class="chart" id="ch-radio-rejected" data-height="150"></div></div>
     </div>
   </div>
 
@@ -351,6 +354,14 @@ const ms = (v, p = 1) => (v == null || !isFinite(v)) ? "—" : v.toFixed(p) + " 
 // column and a hyphen does not line up.
 const signed = (v) => (v == null || !isFinite(v))
   ? "—" : (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1) + " ms";
+// A jump in time, as the daemon says it: "-4 min", "+4 h 0 min", "-1.00 s".
+function jumpText(sec) {
+  const sign = sec < 0 ? "−" : "+", a = Math.abs(sec);
+  if (a < 90) return sign + a.toFixed(2) + " s";
+  if (a < 5400) return sign + (a / 60).toFixed(0) + " min";
+  if (a < 172800) return sign + Math.floor(a / 3600) + " h " + Math.floor((a % 3600) / 60) + " min";
+  return sign + (a / 86400).toFixed(1) + " days";
+}
 function dur(s) {
   if (s == null || !isFinite(s) || s >= 1e8) return "never";
   if (s < 90) return s.toFixed(0) + "s";
@@ -1003,6 +1014,12 @@ function onStatus(d) {
         ? esc(dec.last_decoded_utc) + " at quality " + dec.last_quality + "%, " +
           dur(dec.last_decode_age_seconds) + " ago"
         : "none yet"],
+      ["Time check", (dec.time_check ? "<b>" + esc(dec.time_check) + "</b>" : "every decode agrees with its own history") +
+        (dec.time_rejections
+          ? '<br><span class="note">' + dec.time_rejections + " refused as jumps since start, newest " +
+            esc(dec.last_rejected_utc) + " (" + jumpText(dec.last_rejected_jump_seconds) + ")" +
+            (dec.time_adoptions ? "; " + dec.time_adoptions + " taken after holding" : "") + "</span>"
+          : "")],
       ["Offset", t.have_offset
         ? signed(t.offset_ms) + " ± " + ms(t.dispersion_ms) + " — raw " + signed(t.raw_offset_ms) +
           ", jitter " + ms(t.jitter_ms) + ", " + t.samples + " samples, newest " +
@@ -1352,7 +1369,8 @@ function makeChart(el, opts) {
         r.append(k, b);
         const nm = document.createElement("span"); nm.className = "nm";
         nm.textContent = (series.length > 1 ? s.name + " · " : "") +
-          (p[4] > 1 ? "range " + fmtVal(p[2], "") + " to " + fmtVal(p[3], "") : "1 sample");
+          (opts.tipText ? opts.tipText(p) :
+            p[4] > 1 ? "range " + fmtVal(p[2], "") + " to " + fmtVal(p[3], "") : "1 sample");
         r.appendChild(nm);
         tip.appendChild(r);
       }
@@ -1492,6 +1510,17 @@ function renderMetrics() {
   chart("ch-radio-resid", { unit: "ms", signed: true, legend: true, title: "Radio agreement" })
     .update(Object.assign(perSource("radio", "residual_ms"), { emptyText: "needs two receivers locked" }));
   chart("ch-radio-snr", { unit: "dB", legend: true, title: "Tick SNR", minSpan: 2 }).update(perSource("radio", "snr_db"));
+  // Refused decoded times: how many in each bucket, which is what says whether
+  // it is a rarity or a habit. How far out they were -- minutes, hours -- is
+  // in the tooltip, and each run of them is in the event log.
+  const rejected = perSource("radio", "rejected_s");
+  rejected.series = rejected.series.map((x) => Object.assign({}, x, {
+    points: x.points.map((p) => [p[0], p[4], p[4], p[4], p[4], p[2], p[3]]),
+  }));
+  chart("ch-radio-rejected", {
+    floorZero: true, legend: true, title: "Refused decoded times", minSpan: 2,
+    tipText: (p) => p[5] === p[6] ? "off by " + jumpText(p[5]) : "off by " + jumpText(p[5]) + " to " + jumpText(p[6]),
+  }).update(Object.assign(rejected, { emptyText: "none refused in this window" }));
   chart("ch-ntp-offset", { unit: "ms", signed: true, legend: true, title: "NTP offset" }).update(perSource("ntp", "offset_ms"));
   chart("ch-ntp-delay", { unit: "ms", floorZero: true, legend: true, title: "NTP round trip" }).update(perSource("ntp", "delay_ms"));
 }

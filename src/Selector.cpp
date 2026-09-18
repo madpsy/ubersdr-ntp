@@ -583,20 +583,75 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         });
 
         int open = 0, best = 0;
-        double bestAt = 0.0;
         for (const Edge& e : edges) {
             open += e.delta;
-            if (e.delta > 0 && open > best) { best = open; bestAt = e.at; }
+            if (e.delta > 0) best = std::max(best, open);
+        }
+
+        // Every stretch where that many overlap. Usually one; more than one
+        // is a tie -- two receivers that do not overlap at all, each a
+        // "majority" of one -- and then there is no majority, only a choice.
+        // It used to fall to whichever sorted first, which is to say to the
+        // LOWER offset: on 2026-09-17 that was a receiver four hours out.
+        struct Region { double lo, hi; };
+        std::vector<Region> regions;
+        open = 0;
+        for (std::size_t i = 0; i < edges.size(); ++i) {
+            open += edges[i].delta;
+            if (edges[i].delta > 0 && open == best) {
+                regions.push_back({edges[i].at, i + 1 < edges.size() ? edges[i + 1].at : edges[i].at});
+            }
+        }
+        auto inRegion = [](const Candidate& k, const Region& r) {
+            return r.lo >= k.offset - k.dist && r.lo <= k.offset + k.dist;
+        };
+
+        // Broken on the served time first: time does not jump, so of two sets
+        // that each claim it, the one continuous with what has been served is
+        // kept. With nothing served yet there is nothing to be continuous
+        // with, and the better-measured set is kept -- by the same weight the
+        // combine below gives them.
+        std::size_t pick = 0;
+        std::string tieWhy;
+        if (regions.size() > 1) {
+            if (m_haveLast) {
+                const double ref = m_lastGoodOffset + m_lastGoodRate * (now - m_lastGoodAt);
+                auto away = [&](const Region& r) {
+                    return ref < r.lo ? r.lo - ref : ref > r.hi ? ref - r.hi : 0.0;
+                };
+                for (std::size_t i = 1; i < regions.size(); ++i) {
+                    if (away(regions[i]) < away(regions[pick])) pick = i;
+                }
+                tieWhy = "the set kept is the one continuous with the served time";
+            } else {
+                auto score = [&](const Region& r) {
+                    double w = 0.0;
+                    for (const Candidate& k : cand) {
+                        if (inRegion(k, r)) w += k.weight / (k.quality * k.quality);
+                    }
+                    return w;
+                };
+                for (std::size_t i = 1; i < regions.size(); ++i) {
+                    if (score(regions[i]) > score(regions[pick])) pick = i;
+                }
+                tieWhy = "nothing served yet, so the better-measured set is kept";
+            }
         }
 
         for (const Candidate& k : cand) {
-            if (bestAt >= k.offset - k.dist && bestAt <= k.offset + k.dist) survivors.push_back(k);
+            if (inRegion(k, regions[pick])) survivors.push_back(k);
             else {
+                bool tied = false;
+                for (const Region& r : regions) tied |= inRegion(k, r);
                 c.rejectedNames.push_back(k.s->name);
                 c.notUsedReasons[k.s->name] =
-                    format("outside the majority: %+.1f ms ± %.1f ms does not overlap "
-                           "the interval %d source(s) agree on",
-                           k.offset * 1000.0, k.dist * 1000.0, best);
+                    tied
+                        ? format("no majority: %+.1f ms ± %.1f ms does not overlap the other "
+                                 "%d source(s), and as many agree with it as with them; %s",
+                                 k.offset * 1000.0, k.dist * 1000.0, best, tieWhy.c_str())
+                        : format("outside the majority: %+.1f ms ± %.1f ms does not overlap "
+                                 "the interval %d source(s) agree on",
+                                 k.offset * 1000.0, k.dist * 1000.0, best);
             }
         }
     }

@@ -394,6 +394,39 @@ void testMetricHistory() {
 
 } // namespace
 
+void testTimeRefusal() {
+    std::printf("\nA run of refused decoded times is one event, and taking one is another\n");
+    Harness h(makeConfig());
+    auto r = radio("r1");
+    r.ready = true;
+    const Combined c = serving(ServingClass::Primary, 1, 0);
+    h.step({r}, c);
+    r.timeCheck = "refused decoded 2026-09-17T14:00:00Z: -4 h 0 min from its own history";
+    r.timeRejections = 1;
+    r.lastRejectedJumpSec = -14400.0;
+    r.lastRejectedUtc = "2026-09-17T14:00:00Z";
+    auto ev = h.step({r}, c);
+    check("a refused decoded time is recorded", has(ev, "time_refused:r1"), "%s", join(ev).c_str());
+    int more = 0;
+    for (int i = 0; i < 5; ++i) {
+        r.timeRejections += 1;
+        for (const auto& e : h.step({r}, c)) more += e == "time_refused:r1";
+    }
+    check("...once for the run, not once a reading", more == 0, "%d more", more);
+    r.timeCheck.clear();
+    h.step({r}, c);
+    r.timeCheck = "refused decoded 2026-09-17T07:04:00Z: -4 min from its own history";
+    r.timeRejections += 1;
+    ev = h.step({r}, c);
+    check("a later run is recorded again", has(ev, "time_refused:r1"), "%s", join(ev).c_str());
+    r.timeCheck.clear();
+    r.timeAdoptions = 1;
+    ev = h.step({r}, c);
+    check("a time taken after holding is recorded", has(ev, "time_adopted:r1"), "%s", join(ev).c_str());
+    ev = h.step({r}, c);
+    check("...once", !has(ev, "time_adopted:r1"), "%s", join(ev).c_str());
+}
+
 int main() {
     std::printf("ubersdr-ntp event monitor test\n");
     testQuietStartup();
@@ -402,6 +435,7 @@ int main() {
     testCoastAndUnsync();
     testLinkFailuresAreNotRepeated();
     testRefusal();
+    testTimeRefusal();
     testColdStandby();
     testCapacity();
     testMetricHistory();

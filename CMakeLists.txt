@@ -70,6 +70,7 @@ target_compile_options(ubersdr-ntp-decodertest PRIVATE -Wall -Wextra)
 # selector extrapolating and coasting along the measured rate. Not installed.
 add_executable(ubersdr-ntp-clocktest
     tools/clocktest.cpp
+    src/TimeContinuity.cpp
     src/Config.cpp
     src/OffsetEstimator.cpp
     src/SampleClock.cpp
@@ -179,6 +180,7 @@ add_executable(ubersdr-ntp
     src/SampleClock.cpp
     src/Selector.cpp
     src/Source.cpp
+    src/TimeContinuity.cpp
     src/Status.cpp
     "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc")
 add_dependencies(ubersdr-ntp index_html version_header)

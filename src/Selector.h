@@ -23,6 +23,11 @@
 //      discarded rather than averaged in. This is the step that makes two
 //      sources worth more than twice one.
 //
+//      Two sets that tie -- typically two receivers that do not overlap at
+//      all -- are not a majority, and the tie is broken on continuity with the
+//      served time, or with nothing served yet on how well each set is
+//      measured. Never on which offset happens to sort first.
+//
 //   3. COMBINE. Weight the survivors by 1/uncertainty^2 and by the configured
 //      weight. A source claiming 8 ms then counts for sixteen times one claiming
 //      32 ms, which is the right ratio when the claim is honest and the reason

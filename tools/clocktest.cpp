@@ -15,12 +15,18 @@
 //   3. Selector compares sources measured at different instants at one
 //      instant, averages their rates, and coasts along the rate when the
 //      radio goes quiet instead of freezing the offset.
+//   4. TimeContinuity refuses a decoded time that jumps from the source's own
+//      history -- the misread BCD bit that put a receiver four minutes, and
+//      another four hours, out on 2026-09-17 -- takes a first time only once
+//      it has agreed with itself, and replaces a history that was wrong once
+//      the new time has held, so nothing it decides can stick for ever.
 //
 // Exit status 0 when every check passes.
 
 #include "OffsetEstimator.h"
 #include "SampleClock.h"
 #include "Selector.h"
+#include "TimeContinuity.h"
 
 #include <algorithm>
 #include <cmath>
@@ -817,6 +823,189 @@ void testSelector() {
 
 } // namespace
 
+// A receiver decoding once a minute. Truth is a crystal 12 ppm off UTC; each
+// reading is truth plus a couple of milliseconds of edge scatter, and a misread
+// adds whatever the bad bit was worth. Every admitted reading refreshes the
+// history the way the source's filter does.
+struct ContinuityRig {
+    TimeContinuity tc;
+    double t = 1000.0;               // daemon clock
+    double base = -1.07;             // UTC minus daemon at t = 0
+    double rate = -12e-6;
+    std::mt19937_64 rng{7};
+    std::normal_distribution<double> scatter{0.0, 0.002};
+
+    double truth(double at) const { return base + rate * at; }
+    TimeContinuity::Verdict reading(double misreadSec = 0.0, bool leapWindow = false) {
+        const double implied = truth(t) + scatter(rng) + misreadSec;
+        const TimeContinuity::Verdict v = tc.judge(implied, t, leapWindow);
+        if (v.admitted()) tc.noteFiltered(truth(t), rate, t);
+        return v;
+    }
+    void minute() { t += 60.0; }
+};
+
+const char* outcomeName(TimeContinuity::Outcome o) {
+    using O = TimeContinuity::Outcome;
+    switch (o) {
+        case O::Accepted: return "accepted";
+        case O::FirstConfirmed: return "first confirmed";
+        case O::Confirming: return "confirming";
+        case O::Refused: return "refused";
+        case O::Adopted: return "adopted";
+        case O::LeapSecond: return "leap second";
+    }
+    return "?";
+}
+
+void testTieBreak() {
+    std::printf("\nSelector: two receivers that do not overlap at all\n");
+    constexpr double now = 5000.0;
+    auto at = [&](const std::string& n, double off, double wd) {
+        SourceSnapshot s = snapshotAt(n, now - 1.0, off, 0.0, now);
+        s.offsetRateMeasured = false;
+        s.offsetRateUncertainty = 0.0;
+        s.weightDispersionSec = wd;
+        return s;
+    };
+    // The 2026-09-17 case: one right, one four hours out, and the wrong one
+    // sorting first. With nothing served yet, the better-measured is kept,
+    // whichever order they come in.
+    for (int order = 0; order < 2; ++order) {
+        Selector sel(3600.0, 15.0, 1);
+        std::vector<SourceSnapshot> v = {at("wrong", -14400.0, 0.006), at("right", 0.25, 0.002)};
+        if (order) std::swap(v[0], v[1]);
+        const Combined c = sel.combine(v, now);
+        check(order ? "...and in the other order" : "no history: the better-measured one is kept, not the lower",
+              c.used == 1 && c.usedNames[0] == "right", "used %s",
+              c.usedNames.empty() ? "none" : c.usedNames[0].c_str());
+    }
+    // Serving from one, a second appears that does not overlap it and is
+    // better measured: the served time does not jump to it.
+    for (int order = 0; order < 2; ++order) {
+        Selector sel(3600.0, 15.0, 1);
+        sel.combine({at("serving", 0.25, 0.004)}, now - 10.0);
+        std::vector<SourceSnapshot> v = {at("serving", 0.25, 0.004), at("newcomer", -240.0, 0.001)};
+        if (order) std::swap(v[0], v[1]);
+        const Combined c = sel.combine(v, now);
+        check(order ? "...and in the other order" : "with a served time, the continuous one is kept, however well the other measures",
+              c.used == 1 && c.usedNames[0] == "serving" && std::abs(c.offsetSec - 0.25) < 1e-6,
+              "used %s, offset %+.3f s", c.usedNames.empty() ? "none" : c.usedNames[0].c_str(),
+              c.offsetSec);
+        const auto why = c.notUsedReasons.find("newcomer");
+        check("...and the other is told why", why != c.notUsedReasons.end() &&
+              why->second.find("continuous with the served time") != std::string::npos,
+              "%s", why == c.notUsedReasons.end() ? "(no reason)" : why->second.c_str());
+    }
+}
+
+void testTimeContinuity() {
+    std::printf("\ncontinuity of decoded times\n");
+    using O = TimeContinuity::Outcome;
+
+    {
+        ContinuityRig r;
+        const auto a = r.reading(); r.minute();
+        const auto b = r.reading(); r.minute();
+        const auto c = r.reading();
+        check("the first time is not used on one reading", a.outcome == O::Confirming, "%s", outcomeName(a.outcome));
+        check("...nor on two a minute apart", b.outcome == O::Confirming, "%s", outcomeName(b.outcome));
+        check("...but is on three over two minutes", c.outcome == O::FirstConfirmed, "%s", outcomeName(c.outcome));
+    }
+    {
+        ContinuityRig r;
+        const auto a = r.reading(-240.0); r.minute();
+        const auto b = r.reading(); r.minute();
+        const auto c = r.reading(); r.minute();
+        const bool noHistoryYet = !r.tc.haveHistory();
+        const auto d = r.reading(); r.minute();
+        const auto e = r.reading(-240.0);
+        check("a misread first time is not taken", a.outcome == O::Confirming && noHistoryYet &&
+              b.outcome == O::Confirming && c.outcome == O::Confirming);
+        check("...the correct one after it is, once it has agreed three times", d.outcome == O::FirstConfirmed,
+              "%s", outcomeName(d.outcome));
+        check("...and the misread is then refused against it", e.outcome == O::Refused, "%+.1f s", e.jumpSec);
+    }
+
+    auto locked = [] {
+        ContinuityRig r;
+        for (int i = 0; i < 10; ++i) { r.reading(); r.minute(); }
+        return r;
+    };
+    {
+        // 2026-09-17 07:00: -240 s on K3FEF.
+        ContinuityRig r = locked();
+        const auto bad = r.reading(-240.0); r.minute();
+        const auto good = r.reading();
+        check("a four-minute misread is refused", bad.outcome == O::Refused, "%+.3f s", bad.jumpSec);
+        check("...by what it jumped, to the second", std::abs(bad.jumpSec + 240.0) < 0.01);
+        check("...and the next good decode is taken", good.outcome == O::Accepted, "%s", outcomeName(good.outcome));
+    }
+    {
+        // 2026-09-17 18:00: -14 400 s on K3GMQ, for a few minutes.
+        ContinuityRig r = locked();
+        bool allRefused = true;
+        for (int i = 0; i < 3; ++i) { allRefused &= r.reading(-14400.0).outcome == O::Refused; r.minute(); }
+        const auto good = r.reading();
+        check("a four-hour misread held for three minutes is refused throughout", allRefused);
+        check("...and the time carries on where it was", good.outcome == O::Accepted, "%+.3f s", good.jumpSec);
+    }
+    {
+        ContinuityRig r = locked();
+        const auto v = r.reading(-1.0);
+        check("a one-second misread is refused", v.outcome == O::Refused, "%+.3f s", v.jumpSec);
+        ContinuityRig q = locked();
+        const auto w = q.reading(0.3);
+        check("300 ms is not a jump (the consensus's job, not this)", w.outcome == O::Accepted);
+    }
+    {
+        // A misread that comes and goes never adds up to an adoption.
+        ContinuityRig r = locked();
+        bool adopted = false;
+        for (int i = 0; i < 40; ++i) {
+            const auto v = r.reading(i % 3 == 2 ? 0.0 : -240.0);
+            adopted |= v.outcome == O::Adopted;
+            r.minute();
+        }
+        check("an intermittent misread, 40 min of it, is never taken", !adopted);
+    }
+    {
+        // The history was the wrong one: a step that stays (the machine was
+        // suspended with the daemon clock stopped, say) is taken after ten
+        // minutes, not before, and not never.
+        ContinuityRig r = locked();
+        r.base += 37.0;
+        double adoptedAfter = -1.0;
+        const double start = r.t;
+        for (int i = 0; i < 20 && adoptedAfter < 0.0; ++i) {
+            if (r.reading().outcome == O::Adopted) adoptedAfter = r.t - start;
+            r.minute();
+        }
+        check("a real step that stays is taken after 10 min", adoptedAfter >= 600.0 && adoptedAfter <= 660.0,
+              "after %.0f s", adoptedAfter);
+        const auto next = r.reading();
+        check("...and is the history from then on", next.outcome == O::Accepted, "%+.3f s", next.jumpSec);
+    }
+    {
+        // Back after a day with no decodes: the crystal has moved a second,
+        // along the rate the history knows.
+        ContinuityRig r = locked();
+        r.t += 86400.0;
+        const auto v = r.reading();
+        check("a day away, the crystal's drift is not a jump", v.outcome == O::Accepted, "%+.3f s", v.jumpSec);
+    }
+    {
+        ContinuityRig r = locked();
+        r.base -= 1.0;
+        const auto v = r.reading(0.0, true);
+        check("an announced leap second is taken at once", v.outcome == O::LeapSecond, "%s", outcomeName(v.outcome));
+        ContinuityRig q = locked();
+        q.base -= 1.0;
+        const auto w = q.reading(0.0, false);
+        check("...and the same second anywhere else is not", w.outcome == O::Refused, "%s", outcomeName(w.outcome));
+    }
+}
+
 int main() {
     std::printf("ubersdr-ntp clock test\n");
     testDrift();
@@ -831,6 +1020,8 @@ int main() {
     testNoOscillation();
     testRefusalIsWithinAClass();
     testColdActivation();
+    testTieBreak();
+    testTimeContinuity();
     std::printf("\n%d ok, %d failed\n", g_ok, g_failed);
     return g_failed ? 1 : 0;
 }

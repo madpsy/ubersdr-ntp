@@ -35,6 +35,7 @@
 #include "OpusV4Header.h"
 #include "Propagation.h"
 #include "SampleClock.h"
+#include "TimeContinuity.h"
 #include "clock/WwvDecoder.h"
 #include "clock/WwvbDecoder.h"
 
@@ -46,6 +47,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <vector>
 
 struct OpusDecoder;
 
@@ -67,6 +69,7 @@ public:
     const std::string& name() const override { return m_cfg.name; }
     SourceKind kind() const override { return SourceKind::Radio; }
     SourceSnapshot snapshot() const override;
+    std::vector<double> takeRejectedJumps() override;
 
     // Drop the connection and acquire from nothing, at the Selector's word
     // that this source has disagreed with the others for too long. Safe from
@@ -113,6 +116,8 @@ private:
     void onClockFrame(const clockdec::ClockFrameInfo& f);
     void onClockTime(const clockdec::ClockTimeInfo& t);
 
+    // Whether a decoded time may anchor this source (TimeContinuity.h).
+    bool admitDecodedTime(double impliedOffsetSec, double atDaemon, long long decodedMs); // caller holds m_mu
     void addOffsetSample(double offsetSec, double atDaemon);   // caller holds m_mu
     void recomputeOffset();     // caller holds m_mu
     void updateDelayModel();    // caller holds m_mu
@@ -212,6 +217,15 @@ private:
     double m_anchorSetAt = 0.0;
 
     OffsetEstimator m_offsets;      // under m_mu
+
+    // The continuity check on decoded times (TimeContinuity.h), with this
+    // source's own filtered offset as its history. Deliberately NOT reset by a
+    // reconnect, a decoder restart or a re-acquisition -- which is where a
+    // misread lock is most likely -- because it describes UTC against the
+    // daemon clock, not the stream. Under m_mu.
+    TimeContinuity m_continuity;
+    std::vector<double> m_rejectedJumps;   // under m_mu, drained by takeRejectedJumps
+    double m_leapWarnAt = -1e18;          // daemon clock: last frame with the warning believed
     std::deque<double> m_rttProbes;
     std::deque<double> m_wsRttProbes;
 };

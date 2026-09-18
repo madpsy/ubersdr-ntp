@@ -405,6 +405,53 @@ index, and every second edge after it is exactly one second later. So the anchor
 is extended forwards and each second edge yields an independent measurement of
 the same offset: sixty a minute instead of one, from the same voted timestamp.
 
+### Time does not jump
+
+A time code is a few dozen bits, and a bit can be misread. A fade that biases
+the weight-4 bit of the minutes, or of the hours, produces a frame that passes
+every check the decoder can make and votes clean, yet is four minutes, or four
+hours, out. Both have happened live: on 2026-09-17 one receiver decoded a time
+240 s early and, that evening, the other 14 400 s early. With two receivers the
+consensus cannot tell which of two is wrong, so the served time followed each
+one. The decoder's plausibility bound (a day either side of the host clock) is
+far too wide to catch it, and the host clock is set from this daemon anyway.
+
+So each receiver checks every decoded time against **its own history**, and no
+other source is consulted. Its filtered offset is taken against the daemon clock,
+the raw oscillator (below), and that offset only moves at a crystal's rate. So,
+carried forward along its measured rate, it predicts where the next decode
+must land to a fraction of a second.
+
+- A decode more than 0.5 s from that prediction is **refused**. Allowance is
+  added for 50 ppm of drift since the last good offset. Every real effect is
+  milliseconds; the smallest misread is a whole second. The anchor it would
+  have replaced keeps extending, so the receiver goes on measuring the time it
+  already had.
+- The **first** time after the daemon starts has no history. It is used only once
+  three readings of it over two minutes agree, so a misread at the moment of
+  locking cannot become the history everything later is judged against.
+- A history that is itself wrong must not stick for ever. This can happen when a
+  bad first time slipped through, or when the machine was suspended with the
+  daemon clock stopped. A new time that holds in every reading for **10
+  minutes**, with none agreeing with the old history in between, replaces it.
+  A misread comes and goes; a real step stays.
+- An announced leap second (exactly one second, in the first hours of a month,
+  after a warning) goes straight through.
+
+The history survives a reconnect, a decoder restart and a re-acquisition. Those
+are exactly when a misread lock is most likely, and the history describes UTC,
+not the stream.
+
+The selector respects the same rule. When the sources split into sets that do
+not overlap and none is a majority (two receivers disagreeing), it keeps the set
+closest to the time it is already serving. At startup, with nothing served yet,
+it keeps the better-measured set. It used to keep whichever set had the lower
+offset, and on 2026-09-17 that was the one four hours out.
+
+A refusal says why on the status page and in the source's
+details. It makes one `time_refused` event per run of refusals, and a point on
+the *Refused times* chart, so a receiver that does this every night stands out.
+
 ### Its own clock
 
 The radio decides what time it is, but only at each broadcast second, and late.
@@ -865,7 +912,9 @@ The page draws a chart under the figures worth watching over time: the clock
 offset and root dispersion, each class's median offset and the difference
 between them, and per source its offset, its agreement with the rest of its
 class, and a figure of its own kind (a receiver's tick SNR, an upstream's round
-trip). A bar across the top of the primary-and-secondary card shows which class
+trip). For receivers there is also the number of decoded times
+[refused as jumps](#time-does-not-jump) in each bucket, with how far out they
+were in the tooltip. A bar across the top of the primary-and-secondary card shows which class
 served the time, so a failover and the failback are a coloured stretch rather
 than two log lines. One switch covers every chart: the last hour at 1-minute
 averages, or the last 24 hours at 30-minute averages.

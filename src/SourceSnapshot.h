@@ -174,6 +174,16 @@ struct SourceSnapshot {
     bool leapPending = false;
     int dut1Tenths = 0;
 
+    // The continuity check on decoded times (Source.cpp, admitDecodedTime):
+    // UTC does not jump, so a decoded time that does has been misread. Empty
+    // while every decode agrees with the source's own history; otherwise what
+    // the check is holding out and until when, in words for the status page.
+    std::string timeCheck;
+    std::uint64_t timeRejections = 0;   // decoded times refused, ever
+    double lastRejectedJumpSec = 0.0;   // ...the newest, against the history
+    std::string lastRejectedUtc;        // ...and the time it claimed
+    int timeAdoptions = 0;              // a new time held long enough to take over
+
     // timing
     bool haveOffset = false;
     // UTC minus the DAEMON clock (SampleClock.h) at offsetAtSec, delay model

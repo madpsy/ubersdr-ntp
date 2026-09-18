@@ -470,6 +470,12 @@ std::string renderStatusBlock(const StatusInput& in) {
               << " at quality " << s.lastQuality << "%, "
               << formatDuration(s.lastTimeAgeSec) << " ago";
         }
+        if (!s.timeCheck.empty()) o << "\n             TIME CHECK: " << s.timeCheck;
+        if (s.timeRejections) {
+            o << "\n             " << s.timeRejections << " decoded time(s) refused as jumps, newest "
+              << s.lastRejectedUtc << " (" << jumpText(s.lastRejectedJumpSec) << ")";
+            if (s.timeAdoptions) o << "; " << s.timeAdoptions << " taken after holding";
+        }
         if (s.dut1Tenths) o << "\n             DUT1 " << f2(s.dut1Tenths / 10.0, 1) << " s";
         if (s.leapPending) o << "\n             LEAP SECOND PENDING (broadcast warning bit set)";
         o << '\n';
@@ -696,6 +702,16 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
         dec["last_quality"] = s.lastQuality;
         dec["last_decoded_utc"] = s.lastDecodedUtc;
         dec["last_decode_age_seconds"] = s.lastTimeAgeSec;
+        dec["time_check"] = s.timeCheck;
+        dec["time_rejections"] = s.timeRejections;
+        dec["time_adoptions"] = s.timeAdoptions;
+        if (s.timeRejections) {
+            dec["last_rejected_utc"] = s.lastRejectedUtc;
+            dec["last_rejected_jump_seconds"] = s.lastRejectedJumpSec;
+        } else {
+            dec["last_rejected_utc"] = nullptr;
+            dec["last_rejected_jump_seconds"] = nullptr;
+        }
         dec["leap_pending"] = s.leapPending;
         dec["dut1_seconds"] = s.dut1Tenths / 10.0;
         o["decoder"] = std::move(dec);

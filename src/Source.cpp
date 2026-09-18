@@ -1521,6 +1521,7 @@ void Source::onClockFrame(const clockdec::ClockFrameInfo& f) {
     constexpr int kLeapConfirmFrames = 3;
     m_leapFrames = f.leapPending ? std::min(m_leapFrames + 1, kLeapConfirmFrames) : 0;
     m_snap.leapPending = m_leapFrames >= kLeapConfirmFrames;
+    if (m_snap.leapPending) m_leapWarnAt = daemonNow();
 }
 
 namespace {
@@ -1537,6 +1538,13 @@ long long leapBoundaryAfter(long long ms) {
 
 void Source::onClockTime(const clockdec::ClockTimeInfo& t) {
     if (t.year2 < 0 || t.doy < 1 || t.hour < 0 || t.minute < 0) return;
+
+    // When the edge this timestamp names was observed here, for the continuity
+    // check below. Without it the check cannot run -- and no offset could be
+    // formed from the anchor yet either -- so the anchor waits for the next
+    // minute rather than going in unchecked.
+    double edgeHostSec = 0.0;
+    if (!m_clock.hostTimeAt(t.lastEdgeSample, edgeHostSec)) return;
 
     // Composed exactly as the reference front end does: the voted frame's
     // second 0, plus whole seconds to the edge this timestamp is anchored to.
@@ -1563,6 +1571,12 @@ void Source::onClockTime(const clockdec::ClockTimeInfo& t) {
         return;
     }
 
+    // UTC does not jump. What this decode says the offset is, against what the
+    // source's own history says it must be.
+    const double impliedOffset =
+        static_cast<double>(decodedMs) / 1000.0 - edgeHostSec + m_snap.delaySec;
+    if (!admitDecodedTime(impliedOffset, edgeHostSec, decodedMs)) return;
+
     m_anchorEdgeSample = t.lastEdgeSample;
     m_anchorUtcMs = decodedMs;
     m_haveAnchor = true;
@@ -1571,6 +1585,81 @@ void Source::onClockTime(const clockdec::ClockTimeInfo& t) {
 
     m_snap.lastQuality = std::clamp(static_cast<int>(std::lround(t.quality * 100.0)), 0, 100);
     m_snap.lastDecodedUtc = iso8601(decodedMs);
+}
+
+// Whether a decoded time may anchor this source. The decision is
+// TimeContinuity's; this says it -- to the log, the status page and the chart.
+bool Source::admitDecodedTime(double impliedOffsetSec, double atDaemon, long long decodedMs) {
+    using O = TimeContinuity::Outcome;
+    const bool leapWindow = isLastDayOfMonth(decodedMs - 2LL * 3600 * 1000) &&
+                            !isLastDayOfMonth(decodedMs) && atDaemon - m_leapWarnAt < 86400.0;
+    const bool wasRefusing = m_snap.timeCheck.rfind("refused", 0) == 0;
+    const TimeContinuity::Verdict v = m_continuity.judge(impliedOffsetSec, atDaemon, leapWindow);
+    const std::string when = iso8601(decodedMs);
+
+    // A refusal is recorded whether or not the time goes on to be taken: it
+    // was a jump either way, and the chart is of jumps.
+    if (v.outcome == O::Refused || v.outcome == O::Adopted) {
+        ++m_snap.timeRejections;
+        m_snap.lastRejectedJumpSec = v.jumpSec;
+        m_snap.lastRejectedUtc = when;
+        if (m_rejectedJumps.size() < 256) m_rejectedJumps.push_back(v.jumpSec);
+    }
+    if (v.discardFiltered()) m_offsets.clear();
+
+    switch (v.outcome) {
+    case O::Accepted:
+        if (wasRefusing) {
+            LOG_INFO(m_cfg.name.c_str(), "decoded %s agrees with its own history again",
+                     when.c_str());
+        }
+        m_snap.timeCheck.clear();
+        return true;
+    case O::FirstConfirmed:
+        LOG_INFO(m_cfg.name.c_str(), "decoded time %s confirmed by %d readings over %.0f s; "
+                 "using it", when.c_str(), v.readings, v.spanSec);
+        m_snap.timeCheck.clear();
+        return true;
+    case O::LeapSecond:
+        LOG_WARN(m_cfg.name.c_str(), "decoded %s is %s from its history after an announced "
+                 "leap second; taking it", when.c_str(), jumpText(v.jumpSec).c_str());
+        m_snap.timeCheck.clear();
+        return true;
+    case O::Adopted:
+        LOG_WARN(m_cfg.name.c_str(), "decoded time has held %s from its old history for %.0f min "
+                 "over %d readings; taking it as the time and discarding the old history",
+                 jumpText(v.jumpSec).c_str(), v.spanSec / 60.0, v.readings);
+        ++m_snap.timeAdoptions;
+        m_snap.timeCheck.clear();
+        return true;
+    case O::Confirming:
+        m_snap.timeCheck = "confirming the first decoded time: " + std::to_string(v.readings) +
+                           " reading(s) of " + when + " agree, " +
+                           std::to_string(TimeContinuity::kFirstReadings) + " over 2 min needed";
+        return false;
+    case O::Refused: {
+        if (v.readings == 1) {
+            LOG_WARN(m_cfg.name.c_str(), "decoded %s, %s from where its own history puts it; "
+                     "refusing it (time does not jump)", when.c_str(), jumpText(v.jumpSec).c_str());
+        }
+        const int minutesLeft = static_cast<int>(
+            std::ceil(std::max(0.0, TimeContinuity::kAdoptSpanSec - v.spanSec) / 60.0));
+        m_snap.timeCheck = "refused decoded " + when + ": " + jumpText(v.jumpSec) +
+                           " from its own history, and time does not jump; taken only if it "
+                           "holds" + (minutesLeft > 0 ? " for " + std::to_string(minutesLeft) +
+                                                            " more min"
+                                                      : std::string(" one more reading"));
+        return false;
+    }
+    }
+    return false;
+}
+
+std::vector<double> Source::takeRejectedJumps() {
+    std::lock_guard<std::mutex> lk(m_mu);
+    std::vector<double> out;
+    out.swap(m_rejectedJumps);
+    return out;
 }
 
 void Source::onClockSecond(const clockdec::ClockSecondInfo& i) {
@@ -1702,6 +1791,10 @@ void Source::recomputeOffset() {
     // Fewer than a handful of measurements is not a filtered value, whatever
     // its spread happens to be.
     m_snap.haveOffset = e.valid && m_snap.clockState == "locked";
+
+    // The history the next decoded time is judged against. Only a filtered
+    // value: a lone first reading is not yet a history.
+    if (e.valid) m_continuity.noteFiltered(e.offsetSec, e.rateMeasured ? e.rate : 0.0, e.atSec);
 }
 
 void Source::recordWsRtt(double rttSec) {
@@ -1890,7 +1983,11 @@ SourceSnapshot Source::snapshot() const {
     s.kind = SourceKind::Radio;
     s.active = m_active.load();
     s.activeReason = m_activeReason;
-    s.ready = s.enabled && s.active && s.clockState == "locked";
+    // A locked decoder whose decoded time the continuity check is holding out,
+    // with no earlier anchor still extending, has nothing to offer -- and
+    // "still filtering" would hide that it is refusing a jump.
+    const bool heldOut = !m_snap.timeCheck.empty() && !m_haveAnchor;
+    s.ready = s.enabled && s.active && s.clockState == "locked" && !heldOut;
     if (!s.enabled) {
         s.notReadyReason = "disabled in the configuration";
     } else if (!s.active) {
@@ -1908,6 +2005,8 @@ SourceSnapshot Source::snapshot() const {
           : s.framesInWindow < 2           ? "voting: " + std::to_string(s.framesInWindow) + " of " +
                                              std::to_string(s.windowSize) + " frames agree so far"
                                            : "decoder not locked yet";
+    } else if (heldOut) {
+        s.notReadyReason = m_snap.timeCheck;
     } else {
         s.notReadyReason.clear();
     }

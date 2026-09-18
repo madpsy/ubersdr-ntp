@@ -30,6 +30,7 @@
 #include "SourceSnapshot.h"
 
 #include <string>
+#include <vector>
 
 namespace ubersdr_ntp {
 
@@ -60,6 +61,13 @@ public:
     // Selector calls it on every pass.
     virtual void setActive(bool on, const std::string& why) = 0;
     virtual bool active() const = 0;
+
+    // The decoded times refused since the last call, as how far each was from
+    // what the source's own history says the time is, in seconds -- and then
+    // forgotten, so the caller sees each one once. For the history chart: a
+    // refusal that happens once a month is a curiosity, one that happens
+    // every night is a receiver worth looking at. Only a radio source has any.
+    virtual std::vector<double> takeRejectedJumps() { return {}; }
 };
 
 } // namespace ubersdr_ntp

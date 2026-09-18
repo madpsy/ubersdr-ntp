@@ -72,6 +72,8 @@ enum class EventType {
     LinkUp,
     LinkDown,
     StationChanged,
+    TimeRefused,
+    TimeAdopted,
 
     // One upstream NTP server.
     UpstreamChanged,
@@ -150,6 +152,8 @@ private:
         bool linkFailReported = false;
         std::string station;
         bool refused = false;
+        bool rejectingTime = false;     // inside a run of refused decoded times
+        int timeAdoptions = 0;
         std::string kiss;
         int stratum = 0;
         std::string refid;

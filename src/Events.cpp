@@ -1,5 +1,6 @@
 #include "Events.h"
 
+#include "CivilTime.h"
 #include "Log.h"
 
 #include <algorithm>
@@ -116,6 +117,13 @@ const std::vector<EventTypeInfo>& eventTypes() {
         {EventType::StationChanged, "station_changed", "Station identified", "radio", S::Info,
          "The decoder decided which transmitter it is hearing (WWV, WWVH or WWVB), or "
          "changed its mind."},
+        {EventType::TimeRefused, "time_refused", "Decoded time refused", "radio", S::Warning,
+         "A receiver decoded a time whole seconds or more from where its own history puts it "
+         "-- a misread bit in the time code, since UTC does not jump -- and the decode was "
+         "not used."},
+        {EventType::TimeAdopted, "time_adopted", "New decoded time taken", "radio", S::Warning,
+         "A decoded time that contradicted a receiver's history held for long enough that "
+         "the history was taken to be the wrong one, and replaced."},
 
         {EventType::UpstreamChanged, "upstream_changed", "Upstream reference changed", "ntp",
          S::Info,
@@ -273,6 +281,22 @@ void EventMonitor::observe(const Pass& p) {
             // "unknown" does not overwrite a decided station, so a decoder
             // restart that re-decides the same one is not news.
             if (s.station != "unknown") st.station = s.station;
+
+            // Decoded times refused as jumps: once when a run of them starts,
+            // not once a minute for as long as it lasts.
+            const bool rejecting = s.timeCheck.rfind("refused", 0) == 0;
+            if (rejecting && !st.rejectingTime) {
+                ev(EventType::TimeRefused,
+                   "decoded " + s.lastRejectedUtc + ", " + jumpText(s.lastRejectedJumpSec) +
+                       " from its own history; refused");
+            }
+            st.rejectingTime = rejecting;
+            if (s.timeAdoptions > st.timeAdoptions) {
+                ev(EventType::TimeAdopted,
+                   "a decoded time " + jumpText(s.lastRejectedJumpSec) +
+                       " from its old history held long enough to replace it");
+            }
+            st.timeAdoptions = s.timeAdoptions;
         } else {
             if (!s.ntp.kissCode.empty() && s.ntp.kissCode != st.kiss) {
                 ev(EventType::KissOfDeath,

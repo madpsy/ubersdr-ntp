@@ -10,6 +10,7 @@
 
 #include "clock/TimeFrameVoter.h"
 
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <string>
@@ -53,6 +54,19 @@ inline long long floorMod(long long a, long long b) { return a - floorDiv(a, b) 
 inline long long utcMsFromFields(int year2, int doy, int hour, int minute) {
     const long long days = daysFromCivil(2000 + year2, 1, 1) + (doy - 1);
     return (days * 86400LL + hour * 3600LL + minute * 60LL) * 1000LL;
+}
+
+// A jump in time as people say it: "-4 min", "+4 h 0 min", "-1.00 s".
+inline std::string jumpText(double sec) {
+    const char sign = sec < 0 ? '-' : '+';
+    const double a = std::abs(sec);
+    char buf[64];
+    if (a < 90.0) std::snprintf(buf, sizeof buf, "%c%.2f s", sign, a);
+    else if (a < 5400.0) std::snprintf(buf, sizeof buf, "%c%.0f min", sign, a / 60.0);
+    else if (a < 172800.0) std::snprintf(buf, sizeof buf, "%c%.0f h %.0f min", sign,
+                                         std::floor(a / 3600.0), std::floor(std::fmod(a, 3600.0) / 60.0));
+    else std::snprintf(buf, sizeof buf, "%c%.1f days", sign, a / 86400.0);
+    return buf;
 }
 
 inline std::string iso8601(long long ms) {
