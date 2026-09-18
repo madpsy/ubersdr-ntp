@@ -35,11 +35,16 @@ h1 span { color:var(--muted); font-weight:400; }
 .linknote { margin-top:10px; }
 /* The viewer's own clock, set apart from the two times above so it cannot be
    read as the server's: it is a statement about the machine in front of them. */
+/* Its basis is a minimum, not its one-line width: a flex item's default basis
+   is its max-content, so the long note alone pushed the whole section onto a
+   row of its own. Given a small basis it takes whatever the row has left
+   beside Local time, and wraps its own text to fit. */
 .devclock { align-self:stretch; display:flex; flex-direction:column; justify-content:flex-end;
-  padding-left:22px; border-left:1px solid var(--line); }
+  flex:1 1 220px; min-width:0; padding-left:22px; border-left:1px solid var(--line); }
 .devfig { margin-top:8px; }
 .devfig .pill { font:600 clamp(18px,4.2vw,26px)/1.2 var(--mono); padding:4px 14px; border-radius:10px;
-  text-transform:none; letter-spacing:-.01em; font-variant-numeric:tabular-nums; }
+  text-transform:none; letter-spacing:-.01em; font-variant-numeric:tabular-nums;
+  white-space:normal; max-width:100%; }
 @media (max-width:560px) { .devclock { padding-left:0; border-left:0; } }
 .tickdot { width:9px; height:9px; border-radius:50%; background:var(--ok);
   transition:opacity .12s; opacity:.25; margin-bottom:14px; }
@@ -641,13 +646,21 @@ function paintClock(ts) {
     // viewer's machine, not the server, and worth saying loudly -- a phone or
     // laptop half a second out is common and is exactly what someone opening
     // a time server's page wants to find out.
-    const device = Date.now() - (performance.now() + est.theta);
+    //
+    // Date.now() is whole milliseconds, truncated, so it is read from the middle
+    // of its millisecond and that half is part of the error.
+    const device = Date.now() + 0.5 - (performance.now() + est.theta);
     const a = Math.abs(device);
-    // Anything inside the measurement's own error bound cannot be told from
-    // correct, so it is not called fast or slow.
-    const within = Math.max(1, est.err);
+    // The headline is the likely error of the measurement, not its bound: the
+    // bound is the worst an asymmetric path could do and is usually far above
+    // what it does. Anything inside it is not called fast or slow. Until there
+    // is a second sample to give a likely figure, the bound is all there is.
+    // The likely figure can come out above the bound when the other samples
+    // were slower ones; the bound still holds, so it caps it.
+    const likely = est.jitter == null ? null : Math.min(est.jitter, est.err);
+    const within = 0.5 + (likely == null ? est.err : likely);
     const devText = a <= within
-      ? "correct to within " + within.toFixed(0) + " ms"
+      ? "correct to within " + within.toFixed(within < 1 ? 1 : 0) + " ms"
       : (a < 1000 ? a.toFixed(0) + " ms" : a < 60000 ? (a / 1000).toFixed(1) + " s" : dur(a / 1000)) +
         (device > 0 ? " fast" : " slow");
     const devTone = a <= Math.max(20, within) ? "ok" : a < 500 ? "warn" : "bad";
@@ -656,11 +669,9 @@ function paintClock(ts) {
     $("devnote").textContent = devTone === "ok"
       ? "the computer or phone showing this page"
       : "the computer or phone showing this page, not the server";
-    $("devclock").title = "Your device's own clock, compared with the broadcast time above. " +
+    $("devclock").title = "Your device's own clock, compared with the broadcast time above, " +
+      "to the likely error of the measurement (at most ±" + ms(est.err) + "; see below). " +
       "Nothing to do with the server: the times shown on this page do not use it.";
-    // The likely figure can come out above the bound when the other samples
-    // were slower ones; the bound still holds, so it caps it.
-    const likely = est.jitter == null ? null : Math.min(est.jitter, est.err);
     $("linknote").textContent = "browser latency " + ms(est.delay) + " round trip, corrected: " +
       (likely == null ? "" : "likely within ±" + ms(likely) + ", ") + "at most ±" + ms(est.err);
     $("linknote").title = "The displayed time is advanced by half the measured round trip " +
