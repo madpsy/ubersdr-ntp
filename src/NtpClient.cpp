@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <arpa/inet.h>
+#include <arpa/nameser.h>
 #include <cerrno>
 #include <cmath>
 #include <cstring>
@@ -14,6 +15,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <random>
+#include <resolv.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -43,12 +45,51 @@ constexpr double kReplyTimeoutSec = 5.0;
 constexpr int kBurstCount = 6;
 constexpr double kBurstSpacingSec = 2.0;
 
-// Names are resolved again this often, and sooner after a run of timeouts. A
-// pool name is several addresses and the set moves; an address that has stopped
-// answering is the case where re-resolving is most likely to help and least
-// likely to cost anything.
+// Names are resolved again when their DNS TTL runs out, and never less often
+// than this, and sooner after a run of timeouts. A pool name is several
+// addresses and the set moves; an address that has stopped answering is the
+// case where re-resolving is most likely to help and least likely to cost
+// anything. The hour is also what is used when the resolver will not say what
+// the TTL is -- a name from /etc/hosts, or a lookup that failed on the second
+// query after succeeding on the first.
 constexpr double kReresolveSec = 3600.0;
 constexpr int kReresolveAfterTimeouts = 4;
+
+// A TTL shorter than this is taken as this. Zero means "do not cache", and
+// honouring it literally would put a DNS query in front of every packet of the
+// opening burst; half a minute is still far inside any TTL a name's owner means
+// to be moved within.
+constexpr double kMinResolveSec = 30.0;
+
+// After a lookup fails with a working address in hand, how long before trying
+// again. The address is kept meanwhile: a resolver outage is not a reason to
+// stop polling a server that answers.
+constexpr double kResolveRetrySec = 60.0;
+
+// A poll that came back with nothing usable -- no reply, or a reply dropped as
+// a queueing spike -- is tried again this soon, up to kMaxQuickRetries times in
+// a row, instead of a whole poll interval later. Without it one lost UDP packet
+// costs a minute of silence, and the Selector reads silence as staleness. Not
+// done while the server has asked for a slower poll, and not for a server that
+// has answered nothing in eight polls: a dead server gets its interval, not
+// three packets per interval.
+constexpr double kQuickRetrySec = 2.0;
+constexpr int kMaxQuickRetries = 2;
+
+// How far a sample's round trip may exceed the best in the register, as a
+// multiple of the clean half's own spread above that best. See filterAdd.
+constexpr double kSpikeSpreadFactor = 3.0;
+
+// The slow sample that makes this many in a row is taken rather than dropped:
+// a path whose round trip has gone up and stayed up has changed, and the
+// register's best is then a memory of the old one; see filterAdd. Three is one
+// poll and its two quick retries.
+constexpr int kSpikeRunLimit = kMaxQuickRetries + 1;
+
+// The Selector refuses a source whose newest measurement is older than this
+// many poll intervals (and never less than its own three minutes). Four: the
+// quick retries cover a lost packet, and this covers the poll after that.
+constexpr double kMaxAgePolls = 4.0;
 
 // Below this, excess round-trip delay is not worth rejecting a sample over:
 // half a millisecond of possible bias is far inside everything else in this
@@ -184,6 +225,46 @@ std::string addressText(const struct sockaddr* sa, socklen_t len, bool withPort 
     return (v6 ? "[" + std::string(host) + "]" : std::string(host)) + ":" + serv;
 }
 
+// True if `host` is a numeric address rather than a name: there is nothing to
+// look up, and no TTL to obey.
+bool isAddressLiteral(const std::string& host) {
+    struct in_addr a4{};
+    struct in6_addr a6{};
+    return ::inet_pton(AF_INET, host.c_str(), &a4) == 1 ||
+           ::inet_pton(AF_INET6, host.c_str(), &a6) == 1;
+}
+
+// How long DNS says the answer for `host` may be kept, in seconds, or -1 if it
+// will not say.
+//
+// getaddrinfo(3) resolves the name but throws the TTL away, so this asks the
+// resolver again for the same record type directly. The smallest TTL in the
+// answer section is the one that counts: a CNAME chain expires when its
+// shortest link does. A second query costs one round trip to a resolver that
+// has just cached the answer, once per TTL.
+int dnsTtl(const std::string& host, int family) {
+    struct __res_state st;
+    std::memset(&st, 0, sizeof st);
+    if (res_ninit(&st) != 0) return -1;
+    std::uint8_t answer[4096];
+    const int n = res_nsearch(&st, host.c_str(), ns_c_in,
+                              family == AF_INET6 ? ns_t_aaaa : ns_t_a,
+                              answer, sizeof answer);
+    int ttl = -1;
+    ns_msg msg;
+    if (n > 0 && ns_initparse(answer, n, &msg) == 0) {
+        const int count = ns_msg_count(msg, ns_s_an);
+        for (int i = 0; i < count; ++i) {
+            ns_rr rr;
+            if (ns_parserr(&msg, ns_s_an, i, &rr) != 0) break;
+            const int t = static_cast<int>(ns_rr_ttl(rr));
+            if (ttl < 0 || t < ttl) ttl = t;
+        }
+    }
+    res_nclose(&st);
+    return ttl;
+}
+
 } // namespace
 
 std::vector<std::uint32_t> localIpv4Addresses() {
@@ -204,6 +285,7 @@ std::vector<std::uint32_t> localIpv4Addresses() {
 NtpPeer::NtpPeer(NtpSourceConfig cfg, std::vector<std::uint32_t> localAddrs)
     : m_cfg(std::move(cfg)),
       m_localAddrs(std::move(localAddrs)),
+      m_literal(isAddressLiteral(m_cfg.server)),
       m_offsets(OffsetTuning::forPollInterval(m_cfg.pollSeconds)) {
     m_snap.name = m_cfg.name;
     m_snap.kind = SourceKind::Ntp;
@@ -324,12 +406,17 @@ void NtpPeer::run() {
             m_burstLeft = kBurstCount;
         }
 
-        // A peer that has been quiet for a while may have been moved. Cheap to
-        // check, and the case it catches -- one address of a pool going away --
-        // is the common one.
+        // Look the name up again when its TTL has run out, or when the peer
+        // has gone quiet and may have been moved. Cheap to check, and the case
+        // it catches -- one address of a pool going away -- is the common one.
+        // The socket stays open through this: if the name still includes the
+        // address in use nothing changes, and if the lookup fails the address
+        // that was working is kept.
         if (m_fd >= 0 && (m_consecutiveTimeouts >= kReresolveAfterTimeouts ||
-                          monotonicNow() - m_resolvedAt > kReresolveSec)) {
-            closeSocket();
+                          monotonicNow() >= m_resolveDueAt)) {
+            std::string err;
+            connectPeer(err);
+            m_consecutiveTimeouts = 0;
         }
 
         std::string err;
@@ -383,10 +470,20 @@ void NtpPeer::run() {
         }
 
         double wait;
+        std::uint8_t reach;
+        {
+            std::lock_guard<std::mutex> lk(m_mu);
+            reach = m_snap.ntp.reach;
+        }
         if (m_burstLeft > 0) {
             --m_burstLeft;
             wait = kBurstSpacingSec;
+        } else if (m_retryable && m_backoffPollSec <= 0.0 && reach != 0 &&
+                   m_quickRetries < kMaxQuickRetries) {
+            ++m_quickRetries;
+            wait = kQuickRetrySec;
         } else {
+            m_quickRetries = 0;
             wait = m_backoffPollSec > 0.0 ? m_backoffPollSec : m_cfg.pollSeconds;
         }
         {
@@ -407,6 +504,12 @@ void NtpPeer::run() {
 
 bool NtpPeer::ensureSocket(std::string& err) {
     if (m_fd >= 0) return true;
+    return connectPeer(err);
+}
+
+bool NtpPeer::connectPeer(std::string& err) {
+    const char* tag = m_cfg.name.c_str();
+    const double now = monotonicNow();
 
     struct addrinfo hints{};
     hints.ai_family = AF_UNSPEC;
@@ -418,34 +521,87 @@ bool NtpPeer::ensureSocket(std::string& err) {
     const int rc = getaddrinfo(m_cfg.server.c_str(), port.c_str(), &hints, &res);
     if (rc != 0 || !res) {
         err = std::string("cannot resolve ") + m_cfg.server + ": " + gai_strerror(rc);
+        if (res) freeaddrinfo(res);
+        m_resolveDueAt = now + kResolveRetrySec;
+        if (m_fd >= 0 && !m_resolveFailing) {
+            LOG_WARN(tag, "%s; keeping %s and trying again every %.0fs", err.c_str(),
+                     m_resolvedText.c_str(), kResolveRetrySec);
+        }
+        m_resolveFailing = true;
         return false;
     }
+    if (m_resolveFailing && m_fd >= 0) LOG_INFO(tag, "%s resolves again", m_cfg.server.c_str());
+    m_resolveFailing = false;
 
-    // The first address that a socket can be made for. connect(2) on a UDP
-    // socket rather than sendto: it fixes the peer so a reply from anywhere
-    // else is dropped by the kernel before this code sees it, it picks the
-    // source address once instead of per packet, and it is what makes ICMP
-    // port-unreachable visible as an error on the next call rather than as a
-    // silent timeout.
+    // The address already in use, if the answer still includes it. A pool
+    // name's answers come back in a different order each time; following the
+    // order would change servers on every lookup and throw the filter away
+    // each time for nothing.
+    int family = AF_UNSPEC;
+    bool kept = false;
+    if (m_fd >= 0) {
+        for (struct addrinfo* a = res; a; a = a->ai_next) {
+            if (addressText(a->ai_addr, a->ai_addrlen) == m_resolvedText) {
+                kept = true;
+                family = a->ai_family;
+                break;
+            }
+        }
+    }
+
+    // Otherwise the first address that a socket can be made for. connect(2)
+    // on a UDP socket rather than sendto: it fixes the peer so a reply from
+    // anywhere else is dropped by the kernel before this code sees it, it
+    // picks the source address once instead of per packet, and it is what
+    // makes ICMP port-unreachable visible as an error on the next call rather
+    // than as a silent timeout.
     int fd = -1;
     std::string text, host;
-    for (struct addrinfo* a = res; a; a = a->ai_next) {
-        fd = ::socket(a->ai_family, SOCK_DGRAM, a->ai_protocol);
-        if (fd < 0) continue;
-        if (::connect(fd, a->ai_addr, a->ai_addrlen) != 0) {
-            ::close(fd);
-            fd = -1;
-            continue;
+    if (!kept) {
+        for (struct addrinfo* a = res; a; a = a->ai_next) {
+            fd = ::socket(a->ai_family, SOCK_DGRAM, a->ai_protocol);
+            if (fd < 0) continue;
+            if (::connect(fd, a->ai_addr, a->ai_addrlen) != 0) {
+                ::close(fd);
+                fd = -1;
+                continue;
+            }
+            text = addressText(a->ai_addr, a->ai_addrlen);
+            host = addressText(a->ai_addr, a->ai_addrlen, false);
+            family = a->ai_family;
+            break;
         }
-        text = addressText(a->ai_addr, a->ai_addrlen);
-        host = addressText(a->ai_addr, a->ai_addrlen, false);
-        break;
     }
     freeaddrinfo(res);
 
-    if (fd < 0) {
+    if (!kept && fd < 0) {
         err = std::string("cannot reach ") + m_cfg.server + ": " + std::strerror(errno);
-        return false;
+        m_resolveDueAt = now + kResolveRetrySec;
+        return false;   // an open socket, if there is one, is kept
+    }
+
+    // When to look again. The TTL of the answer, within [kMinResolveSec,
+    // kReresolveSec]; the hour when there is no TTL to be had. An address
+    // literal was never looked up and has nothing to expire, so only a run of
+    // timeouts brings it back here.
+    int ttl = -1;
+    double lookAgain = kReresolveSec;
+    if (m_literal) {
+        lookAgain = 1e18;
+    } else {
+        ttl = dnsTtl(m_cfg.server, family);
+        if (ttl >= 0) lookAgain = std::clamp(static_cast<double>(ttl), kMinResolveSec, kReresolveSec);
+    }
+    m_resolveDueAt = now + lookAgain;
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        m_snap.ntp.dnsTtlSec = ttl;
+    }
+
+    if (kept) {
+        LOG_DEBUG(tag, "%s still resolves to %s (TTL %d s)", m_cfg.server.c_str(),
+                  m_resolvedText.c_str(), ttl);
+        return true;
     }
 
     // Kernel receive timestamps, for the same reason the server asks for them:
@@ -457,8 +613,11 @@ bool NtpPeer::ensureSocket(std::string& err) {
     ::setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof one);
 #endif
 
+    const bool moved = m_fd >= 0;
+    const std::string from = m_resolvedText;
+    closeSocket();
     m_fd = fd;
-    m_resolvedAt = monotonicNow();
+    m_resolvedAt = now;
     m_resolvedText = text;
     m_consecutiveTimeouts = 0;
     {
@@ -466,8 +625,23 @@ bool NtpPeer::ensureSocket(std::string& err) {
         m_snap.ntp.address = text;
         m_snap.ntp.addressHost = host;
         m_snap.ntp.addressRefid = refidForPeer(fd);
+        if (moved) {
+            // A different server is a different path, and the register's best
+            // round trip belongs to the old one: gating the new server's
+            // samples against it would drop every one of them if the new path
+            // is longer. The offset history is kept -- it is the same UTC, and
+            // the estimator absorbs a step between servers as it would any
+            // other.
+            for (Sample& f : m_filter) f = Sample{};
+            m_spikeRun = 0;
+        }
     }
-    LOG_DEBUG(m_cfg.name.c_str(), "resolved to %s", text.c_str());
+    if (moved) {
+        LOG_INFO(tag, "%s now resolves to %s, not %s: moving to it (TTL %d s)",
+                 m_cfg.server.c_str(), text.c_str(), from.c_str(), ttl);
+    } else {
+        LOG_DEBUG(tag, "resolved to %s (TTL %d s)", text.c_str(), ttl);
+    }
     return true;
 }
 
@@ -487,6 +661,7 @@ void NtpPeer::dropTiming(const char* why) {
 }
 
 bool NtpPeer::pollOnce(std::string& err) {
+    m_retryable = false;
     if (!ensureSocket(err)) return false;
 
     std::uint8_t out[kPacketSize];
@@ -530,6 +705,7 @@ bool NtpPeer::pollOnce(std::string& err) {
         const double remain = deadline - monotonicNow();
         if (remain <= 0.0) {
             ++m_consecutiveTimeouts;
+            m_retryable = true;
             err = "no reply within " + std::to_string(static_cast<int>(kReplyTimeoutSec)) + "s";
             return false;
         }
@@ -820,13 +996,44 @@ void NtpPeer::filterAdd(const Sample& s) {
     // one, which is what the median and the rate fit downstream want: enough
     // independent readings to be robust, with the ones that are known to be
     // biased left out rather than averaged in.
-    const Sample& fresh = m_filter[0];
-    const double excessBias = (fresh.delaySec - best->delaySec) / 2.0;
-    const double tolerance = std::max(kSpikeBiasFloorSec, best->delaySec / 2.0);
-    if (excessBias > tolerance) {
-        ++m_snap.ntp.spikes;
-        return;
+    //
+    // "Small" also widens with how much the path's CLEAN round trips move. An
+    // anycast server's delay scatters from reply to reply with nothing queued
+    // at all, and one lucky fast reply then sits in the register for eight
+    // polls making every ordinary one look like a spike -- measured live
+    // against time.cloudflare.com, that starved the estimator until the
+    // Selector dropped the peer as stale. The spread is taken from the lower
+    // quartile of the register rather than its median, so a path where half
+    // the replies really are queued (every other one, in the test) does not
+    // widen the gate enough to let them through.
+    std::vector<double> delays;
+    for (const Sample& f : m_filter) {
+        if (f.valid) delays.push_back(f.delaySec);
     }
+    std::sort(delays.begin(), delays.end());
+    const double cleanSpread = delays[delays.size() / 4] - best->delaySec;
+
+    const Sample& fresh = m_filter[0];
+    const double excess = fresh.delaySec - best->delaySec;
+    const double allowed = std::max({2.0 * kSpikeBiasFloorSec, best->delaySec,
+                                     kSpikeSpreadFactor * cleanSpread});
+    if (excess > allowed) {
+        // A run of them is not queueing but a path that has changed -- a
+        // route that got longer, or an anycast server that moved -- and the
+        // register's best is then a memory of the old one that would refuse
+        // everything for eight polls. The kSpikeRunLimit-th in a row is taken;
+        // the level's median still stands against it if it was a spike after
+        // all.
+        if (++m_spikeRun < kSpikeRunLimit) {
+            ++m_snap.ntp.spikes;
+            m_retryable = true;
+            return;
+        }
+        LOG_DEBUG(m_cfg.name.c_str(),
+                  "taking a sample %.1f ms slower than the best: %d slow in a row",
+                  excess * 1000.0, m_spikeRun);
+    }
+    m_spikeRun = 0;
     if (fresh.seq > m_handedOn) {
         m_handedOn = fresh.seq;
         m_offsets.add(fresh.atSec, fresh.offsetSec);
@@ -848,6 +1055,10 @@ void NtpPeer::recompute() {
     m_snap.rateTermSec = e.rateTermSec;
     m_snap.jitterSec = e.jitterSec;
     m_snap.offsetAgeSec = m_offsets.empty() ? 1e9 : now - m_offsets.newestAt();
+    // One sample a poll, so the staleness the Selector allows is counted in
+    // polls; its three-minute default is under three of them at 64 s. Against
+    // the interval in force, which a RATE backoff stretches.
+    m_snap.maxOffsetAgeSec = std::max(180.0, kMaxAgePolls * m_snap.ntp.pollSec);
 
     // The one-way delay this peer's offset already has taken out of it, for the
     // status report's delay column. Half the round trip is not a measurement of
@@ -889,6 +1100,8 @@ SourceSnapshot NtpPeer::snapshot() const {
     SourceSnapshot s = m_snap;
     const double now = monotonicNow();
     s.linkAgeSec = now - m_resolvedAt;
+    s.ntp.nextResolveInSec = m_literal || m_resolveDueAt <= 0.0 ? -1.0
+                                                               : std::max(0.0, m_resolveDueAt - now);
     if (s.ntp.received > 0) {
         // lastReplyAgeSec is stored as 0 at the moment of the reply and aged
         // here, so a snapshot taken between polls reports the age now rather

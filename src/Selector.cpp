@@ -16,7 +16,8 @@ namespace {
 // A source's measurements must be no older than this to be a candidate. Three
 // minutes is three missed WWV frames: long enough to ride out a fade that the
 // decoder itself holds a lock through, short enough that a dead source is not
-// still voting ten minutes later.
+// still voting ten minutes later. The default only: a source that measures
+// less often than once a second sets its own (SourceSnapshot::maxOffsetAgeSec).
 constexpr double kCandidateMaxAgeSec = 180.0;
 
 // The time constant of a source's running disagreement with the consensus.
@@ -179,9 +180,10 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         std::string why;
         if (!s.ready) {
             why = s.notReadyReason.empty() ? "not ready" : s.notReadyReason;
-        } else if (s.offsetAgeSec > kCandidateMaxAgeSec) {
-            why = format("newest measurement is %.0f s old (limit %.0f s)",
-                         s.offsetAgeSec, kCandidateMaxAgeSec);
+        } else if (s.offsetAgeSec > (s.maxOffsetAgeSec > 0.0 ? s.maxOffsetAgeSec
+                                                            : kCandidateMaxAgeSec)) {
+            why = format("newest measurement is %.0f s old (limit %.0f s)", s.offsetAgeSec,
+                         s.maxOffsetAgeSec > 0.0 ? s.maxOffsetAgeSec : kCandidateMaxAgeSec);
         } else if (!s.haveOffset) {
             why = format("still filtering: %d offset sample(s) so far", s.offsetSamples);
         } else if (s.dispersionSec <= 0.0) {

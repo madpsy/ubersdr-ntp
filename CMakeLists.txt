@@ -99,7 +99,7 @@ add_executable(ubersdr-ntp-ntptest
 target_include_directories(ubersdr-ntp-ntptest PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${CMAKE_CURRENT_BINARY_DIR}/generated")
-target_link_libraries(ubersdr-ntp-ntptest PRIVATE Threads::Threads)
+target_link_libraries(ubersdr-ntp-ntptest PRIVATE Threads::Threads resolv)
 target_compile_options(ubersdr-ntp-ntptest PRIVATE -Wall -Wextra)
 
 # Offline test of the configuration reader: per-source passwords and other
@@ -199,7 +199,11 @@ target_link_libraries(ubersdr-ntp PRIVATE
     ixwebsocket_vendored
     PkgConfig::OPUS
     PkgConfig::CURL
-    Threads::Threads)
+    Threads::Threads
+    # res_nsearch and ns_parserr, for the DNS TTL of an upstream NTP server's
+    # name (NtpClient.cpp). In libc itself from glibc 2.34; the library is
+    # still there, empty, for what links against it.
+    resolv)
 target_compile_options(ubersdr-ntp PRIVATE -Wall -Wextra)
 
 # libstdc++ and libgcc statically, for the same reason ubersdr-clock builds in

@@ -685,6 +685,21 @@ same reason: each is an independent candidate, so the agreement test that
 catches one receiver misdecoding also catches one NTP server that has gone
 wrong. A bare string is a hostname; `HOST:PORT` and `[v6addr]:PORT` also work.
 
+A hostname is looked up again whenever its DNS TTL runs out (at least every 30
+seconds' worth of TTL, and at most an hour apart). The address in use is kept
+while the name still includes it, so a pool that answers in a different order
+each time does not bounce the peer between servers. If a lookup fails, the
+working address is kept and the lookup is retried every minute. An address
+literal is never looked up.
+
+A peer that is polled every 64 seconds produces one sample per poll, so a
+lost packet or a slow reply costs more than it does for a receiver. A lost or
+slow reply is retried two seconds later, up to twice. A reply is only dropped
+as a queueing spike when its round trip is well outside what the path
+normally does, and the third slow reply in a row is kept, because by then the
+path itself has got slower. The Selector also allows an NTP peer's newest
+sample to be four polls old rather than the radio sources' three minutes.
+
 ### The three secondary modes
 
 They differ in two independent things — whether the secondary is **connected**,
@@ -1009,8 +1024,9 @@ Every source in `/api/status` carries a `kind` of `radio` or `ntp`, a
 `primary_class` flag, and `ready` / `not_ready_reason` — the one question both
 kinds answer, and the one the Selector asks. An upstream peer adds an `ntp`
 object with its stratum, refid, reach register, round trip, filter jitter, root
-distance against the configured limit, and the counts of polls sent, answered,
-refused and dropped as delay spikes.
+distance against the configured limit, the counts of polls sent, answered,
+refused and dropped as delay spikes, and `dns_ttl_seconds` /
+`next_resolve_seconds` for a server given by name (-1 for an address).
 
 `served.stratum` and `served.root_delay_ms` say where the time actually came
 from, and a `clock` object carries the arrangement and the headline figure:

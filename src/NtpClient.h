@@ -48,6 +48,27 @@
 // the register is small enough that the bias it could carry does not matter,
 // and the rest are dropped as queueing spikes. See filterAdd.
 //
+// A spike is not a fault in the path, though, and a peer that only drops them
+// can starve: the best round trip stays in the register for eight polls, so one
+// unusually fast reply makes every ordinary one look queued for the next eight
+// minutes, and an anycast server like time.cloudflare.com, whose round trip
+// moves from reply to reply, will do that routinely. So the gate widens with
+// the spread of the register's clean half, a run of spikes is taken as the path
+// having changed rather than as more spikes, and a dropped or lost reply is
+// followed a couple of seconds later by another try rather than a whole poll.
+//
+// NAMES
+//
+// A server given by name is looked up again when the answer's DNS TTL runs
+// out, capped at an hour. An anycast or pool name is several machines and the
+// set moves; the TTL is how long the name's owner says the answer holds, and
+// keeping an address past it is how a client ends up polling a server that has
+// been taken out of rotation. The address in use is kept if the new answer
+// still includes it -- a pool's answers come back in a different order every
+// time, and hopping between members on every lookup would reset the filter for
+// nothing. A lookup that fails keeps the address that works. An address
+// literal has no TTL and is never looked up.
+//
 // SPOOFING
 //
 // The transmit timestamp this sends is sixty-four random bits, not the clock,
@@ -120,7 +141,11 @@ private:
     // says why, in words meant for the status page.
     bool pollOnce(std::string& err);
 
-    bool ensureSocket(std::string& err);   // resolve and connect(2) the UDP socket
+    bool ensureSocket(std::string& err);   // connect if not connected
+    // Resolve the name and connect(2) the UDP socket to one of its addresses,
+    // keeping the current one if the answer still includes it, and set when to
+    // look again from the answer's TTL. On failure an open socket is kept.
+    bool connectPeer(std::string& err);
     void closeSocket();
     void dropTiming(const char* why);      // caller must NOT hold m_mu
 
@@ -148,8 +173,18 @@ private:
 
     int m_fd = -1;                  // polling thread only
     std::string m_resolvedText;     // ...and what it resolved to, for the log
-    double m_resolvedAt = 0.0;
+    double m_resolvedAt = 0.0;      // when the socket was connected
+    double m_resolveDueAt = 0.0;    // monotonic time the name is looked up again
+    bool m_literal = false;         // the server is an address, not a name
+    bool m_resolveFailing = false;  // the last lookup failed (log once a run)
     int m_consecutiveTimeouts = 0;
+
+    // Quick retries: after a lost reply or a spike the next poll comes a
+    // couple of seconds later instead of a whole interval, a few times in a
+    // row at most. m_retryable is set by pollOnce/filterAdd for the poll just
+    // made.
+    bool m_retryable = false;
+    int m_quickRetries = 0;
 
     // How long the burst still has to run. Counted down rather than timed, so a
     // burst interrupted by an unreachable server resumes rather than expires.
@@ -172,6 +207,7 @@ private:
     Sample m_filter[kFilterSize];
     std::uint64_t m_seq = 0;
     std::uint64_t m_handedOn = 0;   // seq of the newest sample given to the estimator
+    int m_spikeRun = 0;             // consecutive samples dropped as spikes
 
     OffsetEstimator m_offsets;
 };

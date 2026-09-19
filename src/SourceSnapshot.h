@@ -43,6 +43,13 @@ struct NtpPeerInfo {
     std::string addressHost;     // ...and without it, which is what a refid is
     int port = 123;
 
+    // How long the name's answer may be kept, as DNS said when it was last
+    // looked up, and how long until it is looked up again. -1 when the server
+    // is an address literal (there is nothing to look up) or the resolver
+    // gave no TTL (the hourly fallback is used). See NtpPeer::connectPeer.
+    int dnsTtlSec = -1;
+    double nextResolveInSec = -1.0;
+
     // Straight from the last accepted reply.
     int stratum = 0;
     std::string refid;           // four ASCII characters, or a dotted quad
@@ -211,6 +218,11 @@ struct SourceSnapshot {
     // believe. This is the part that actually distinguishes them.
     double weightDispersionSec = 0.0;
     double offsetAgeSec = 1e9;
+    // The oldest offsetAgeSec the Selector will still take, or 0 for its own
+    // default. A radio source measures every second and leaves this alone; an
+    // NTP peer measures once a poll, and a limit that is under three polls
+    // would drop it for two lost packets. See NtpPeer::recompute.
+    double maxOffsetAgeSec = 0.0;
     int offsetSamples = 0;
 
     // delay model

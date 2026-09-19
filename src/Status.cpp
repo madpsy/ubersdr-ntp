@@ -355,6 +355,7 @@ std::string renderStatusBlock(const StatusInput& in) {
             // itself, and "1.2.3.4:123 -> 1.2.3.4:123" is noise.
             if (!n.address.empty() && n.address != n.server + ":" + std::to_string(n.port)) {
                 o << "  -> " << n.address;
+                if (n.dnsTtlSec >= 0) o << " (DNS TTL " << n.dnsTtlSec << " s)";
             }
             o << "  [" << sourceKindName(s.kind)
               << (s.primaryClass ? ", primary]" : ", secondary]") << '\n';
@@ -835,6 +836,9 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
         p["received"] = n.received;
         p["rejected"] = n.rejected;
         p["spikes"] = n.spikes;
+        // -1: an address literal, or a resolver that gave no TTL.
+        p["dns_ttl_seconds"] = n.dnsTtlSec;
+        p["next_resolve_seconds"] = n.nextResolveInSec;
         p["max_root_distance_ms"] = n.maxRootDistanceSec * 1000.0;
         p["max_stratum"] = n.maxStratum;
         p["configured_poll_seconds"] = n.configuredPollSec;

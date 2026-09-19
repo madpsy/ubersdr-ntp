@@ -120,6 +120,13 @@ public:
         // computed offset by half the hold -- which is exactly what the
         // minimum-delay filter exists to throw away.
         double alternateHoldSec = 0.0;
+
+        // Hold EVERY reply this long, the same way: a path that has got
+        // longer, rather than one that is queueing now and then.
+        double holdSec = 0.0;
+
+        // Swallow this many requests, then answer again: lost packets.
+        int dropCount = 0;
     };
 
     bool start() {
@@ -174,8 +181,13 @@ private:
                                          reinterpret_cast<struct sockaddr*>(&from), &flen);
             if (n < 48) continue;
 
-            const Policy p = get();
+            Policy p = get();
             if (!p.reply) continue;
+            if (p.dropCount > 0) {
+                std::lock_guard<std::mutex> lk(m_mu);
+                --m_policy.dropCount;
+                continue;
+            }
 
             // The server's own clock: the daemon clock plus the error the test
             // chose. In-process, so both sides read the same oscillator and the
@@ -215,14 +227,15 @@ private:
 
             const bool hold = p.alternateHoldSec > 0.0 && alternate;
             alternate = !alternate;
+            const double holdFor = hold ? p.alternateHoldSec : p.holdSec;
 
             wrTime(out + 40, daemonNow() + p.clockOffsetSec);
-            if (hold) {
+            if (holdFor > 0.0) {
                 // Stamped, then held. The client's t4 moves out and t3 does
                 // not, so this sample's offset is wrong by half the hold and
                 // its delay is longer by the whole of it -- which is what the
                 // filter sorts on.
-                std::this_thread::sleep_for(std::chrono::duration<double>(p.alternateHoldSec));
+                std::this_thread::sleep_for(std::chrono::duration<double>(holdFor));
             }
             ::sendto(m_fd, out, sizeof out, 0,
                      reinterpret_cast<struct sockaddr*>(&from), flen);
@@ -588,6 +601,118 @@ void testColdStandby() {
     srv.stop();
 }
 
+
+void testPathGetsLonger() {
+    std::printf("\nWhen every reply becomes 30 ms slower and stays that way\n");
+
+    FakeServer srv;
+    if (!srv.start()) { check("the fake server starts", false); return; }
+    FakeServer::Policy p;
+    p.clockOffsetSec = 0.050;
+    srv.set(p);
+
+    NtpPeer peer(peerConfig("longer", srv.port()), localIpv4Addresses());
+    peer.start();
+    SourceSnapshot s = waitFor(peer, [](const SourceSnapshot& x) {
+        return x.ready && x.ntp.sent >= 7;          // the burst is over
+    });
+    check("the peer becomes ready on the fast path", s.ready, "%s", s.notReadyReason.c_str());
+
+    // Every reply from here on is slower than the loopback best still sitting
+    // in the register. Gating on that best alone drops them all for eight
+    // samples, and the estimator starves.
+    const std::uint64_t spikesBefore = s.ntp.spikes;
+    const std::uint64_t sentBefore = s.ntp.sent;
+    p.holdSec = 0.030;
+    srv.set(p);
+    const double from = monotonicNow();
+    // lastReplyAgeSec is the live age of the newest sample handed on, so this
+    // waits for one taken after the change.
+    s = waitFor(peer, [&](const SourceSnapshot& x) {
+        return x.ntp.lastReplyAgeSec < monotonicNow() - from;
+    }, 40.0);
+    const double took = monotonicNow() - from - s.ntp.lastReplyAgeSec;
+    check("the first slow replies are dropped as spikes", s.ntp.spikes == spikesBefore + 2,
+          "%llu dropped", (unsigned long long)(s.ntp.spikes - spikesBefore));
+    check("...but the third in a row is taken as the new path, within one poll",
+          took > 0.0 && took < 8.0 + 2.0 * 2.0 + 1.5, "taken %.1f s after the change", took);
+    check("the dropped ones were retried seconds apart, not a poll apart",
+          s.ntp.sent == sentBefore + 3, "%llu sent", (unsigned long long)(s.ntp.sent - sentBefore));
+    check("the Selector's staleness limit is counted in polls",
+          s.maxOffsetAgeSec >= 4.0 * s.ntp.pollSec, "%.0f s at a %.0f s poll",
+          s.maxOffsetAgeSec, s.ntp.pollSec);
+
+    peer.stop();
+    srv.stop();
+}
+
+void testQuickRetryAfterLoss() {
+    std::printf("\nWhen one reply is lost\n");
+
+    FakeServer srv;
+    if (!srv.start()) { check("the fake server starts", false); return; }
+    FakeServer::Policy p;
+    srv.set(p);
+
+    NtpPeer peer(peerConfig("lossy", srv.port()), localIpv4Addresses());
+    peer.start();
+    SourceSnapshot s = waitFor(peer, [](const SourceSnapshot& x) {
+        return x.ready && x.ntp.sent >= 7;          // the burst is over
+    });
+    check("the peer becomes ready", s.ready, "%s", s.notReadyReason.c_str());
+
+    p.dropCount = 1;
+    srv.set(p);
+    const std::uint64_t sent0 = s.ntp.sent;
+    // The lost one: sent at the next poll, given up on five seconds later.
+    s = waitFor(peer, [&](const SourceSnapshot& x) { return x.ntp.sent > sent0; }, 12.0);
+    const double lostAt = monotonicNow();
+    s = waitFor(peer, [&](const SourceSnapshot& x) { return x.ntp.sent > sent0 + 1; }, 20.0);
+    const double gap = monotonicNow() - lostAt;
+    check("the next try comes seconds after the timeout, not a poll interval",
+          s.ntp.sent > sent0 + 1 && gap < 5.0 + 2.0 + 1.5, "%.1f s after sending the lost one", gap);
+    check("...and the peer stays usable through it", s.ready, "%s", s.notReadyReason.c_str());
+
+    peer.stop();
+    srv.stop();
+}
+
+void testResolution() {
+    std::printf("\nResolving the server: an address, then a name\n");
+
+    FakeServer srv;
+    if (!srv.start()) { check("the fake server starts", false); return; }
+    srv.set(FakeServer::Policy{});
+
+    {
+        NtpPeer peer(peerConfig("literal", srv.port()), localIpv4Addresses());
+        peer.start();
+        const SourceSnapshot s = waitFor(peer, answered);
+        check("an address literal is polled", s.ntp.received > 0);
+        check("...and has no TTL and is never looked up again",
+              s.ntp.dnsTtlSec == -1 && s.ntp.nextResolveInSec < 0.0,
+              "ttl %d, next %.0f s", s.ntp.dnsTtlSec, s.ntp.nextResolveInSec);
+        peer.stop();
+    }
+    {
+        NtpSourceConfig c = peerConfig("named", srv.port());
+        c.server = "localhost";
+        NtpPeer peer(c, localIpv4Addresses());
+        peer.start();
+        const SourceSnapshot s = waitFor(peer, answered);
+        check("a name is resolved and polled", s.ntp.received > 0, "%s",
+              s.ntp.lastRejectReason.c_str());
+        // localhost may come from /etc/hosts (no TTL: the hourly fallback) or
+        // from a local resolver (its TTL, floored at 30 s). Either way the
+        // next lookup is scheduled, and never more than an hour away.
+        check("...and is scheduled to be looked up again within the hour",
+              s.ntp.nextResolveInSec > 0.0 && s.ntp.nextResolveInSec <= 3600.0,
+              "in %.0f s (TTL %d s)", s.ntp.nextResolveInSec, s.ntp.dnsTtlSec);
+        peer.stop();
+    }
+    srv.stop();
+}
+
 } // namespace
 
 int main() {
@@ -597,6 +722,9 @@ int main() {
 
     testMeasuresOffset();
     testMinimumDelayFilter();
+    testPathGetsLonger();
+    testQuickRetryAfterLoss();
+    testResolution();
     testRefusesForgedReply();
     testRefusesBadServers();
     testLoopDetection();
