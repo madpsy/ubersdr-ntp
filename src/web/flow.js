@@ -659,7 +659,7 @@ const css = `
 .fl-m { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px 10px; margin-top:8px; }
 .fl-m div { min-width:0; }
 .fl-m i { display:block; font-style:normal; font-size:9px; text-transform:uppercase; letter-spacing:.08em;
-  color:#6f7ca6; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  color:#aab5d8; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .fl-m b { display:block; font:600 12.5px/1.3 var(--mono); font-variant-numeric:tabular-nums; color:#eef2ff;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .fl-m b.fl-warn { color:#fbbf24; } .fl-m b.fl-bad { color:#fb7185; }
@@ -675,10 +675,6 @@ const css = `
 .fl-k-core { --c:#22d3ee; padding:14px 14px 13px; border:1px solid transparent; isolation:isolate;
   background:linear-gradient(180deg,#141d38,#0d1429) padding-box,
              linear-gradient(135deg,#38bdf8,#a78bfa 55%,#34d399) border-box; }
-.fl-k-core::before { content:""; position:absolute; inset:-18px; z-index:-1; border-radius:28px; opacity:.35;
-  background:conic-gradient(from var(--fl-a,0deg),#38bdf8,#a78bfa,#34d399,#38bdf8); filter:blur(22px);
-  animation:fl-spin 9s linear infinite; }
-.fl-k-core.is-down::before { background:#fb7185; animation:none; opacity:.25; }
 @property --fl-a { syntax:"<angle>"; inherits:false; initial-value:0deg; }
 @keyframes fl-spin { to { --fl-a:360deg; } }
 .fl-k-core .fl-title { font-size:15px; background:linear-gradient(90deg,#7dd3fc,#c4b5fd);
@@ -735,7 +731,7 @@ const css = `
 .fl-link.is-serving .fl-line { stroke-width:2.4; opacity:.85; }
 .fl-link.is-serving .fl-flow { stroke-width:2.6; stroke-dasharray:3 8; animation-duration:.6s; }
 .fl-from { display:flex; flex-wrap:wrap; align-items:center; gap:5px; margin-top:9px; }
-.fl-from i { font-style:normal; font-size:9px; text-transform:uppercase; letter-spacing:.08em; color:#6f7ca6; margin-right:2px; }
+.fl-from i { font-style:normal; font-size:9px; text-transform:uppercase; letter-spacing:.08em; color:#aab5d8; margin-right:2px; }
 .fl-from span { font:600 11px/1 var(--mono); padding:4px 7px; border-radius:6px; color:#e0f2fe;
   background:linear-gradient(90deg,rgba(56,189,248,.28),rgba(167,139,250,.28)); border:1px solid rgba(125,211,252,.35); }
 .fl-from em { font-style:normal; color:#fb7185; font-size:12px; }
@@ -758,7 +754,7 @@ const css = `
 .fl-compact .fl-kf b { display:block; font:600 11px/1.25 var(--mono); letter-spacing:-.03em; font-variant-numeric:tabular-nums; color:#eef2ff;
   white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
 .fl-compact .fl-kf b.fl-warn { color:#fbbf24; } .fl-compact .fl-kf b.fl-bad { color:#fb7185; }
-.fl-compact .fl-kf i { display:block; font-style:normal; font-size:9px; color:#7c89b3; white-space:nowrap;
+.fl-compact .fl-kf i { display:block; font-style:normal; font-size:9px; color:#aab5d8; white-space:nowrap;
   overflow:hidden; text-overflow:ellipsis; }
 .fl-compact .fl-grid .fl-badge { top:-7px; right:6px; font-size:7px; padding:3px 5px 3px 11px; letter-spacing:.08em; }
 .fl-compact .fl-grid .fl-badge::before { left:4px; width:4px; height:4px; margin-top:-2px; }
@@ -768,7 +764,6 @@ const css = `
 .fl-compact .fl-grid .fl-k-core .fl-dot { top:9px; right:9px; }
 .fl-compact .fl-grid .fl-k-core .fl-title { font-size:10.5px; }
 .fl-compact .fl-grid .fl-k-core .fl-kf { text-align:center; }
-.fl-compact .fl-grid .fl-k-core::before { inset:-10px; filter:blur(14px); }
 .fl-compact .fl-grid .fl-node.fl-sel { outline:1.5px solid color-mix(in srgb,var(--c) 70%,transparent); outline-offset:2px; }
 .fl-compact .fl-chip { display:none; }
 .fl-compact .fl-scroll { overflow:visible; }
@@ -778,7 +773,7 @@ const css = `
 .fl-compact .fl-detail::after { content:"tap a box above for its detail"; display:block; margin-top:8px;
   font-size:10px; color:#6f7ca6; text-align:right; }
 @media (prefers-reduced-motion: reduce) {
-  .fl-flow, .fl-k-core::before, .is-live .fl-dot, .fl-ring .p, .fl-node.is-serving, .fl-badge::before { animation:none; }
+  .fl-flow, .is-live .fl-dot, .fl-ring .p, .fl-node.is-serving, .fl-badge::before { animation:none; }
   .fl-ring .p { stroke-dashoffset:0; }
 }
 `;
