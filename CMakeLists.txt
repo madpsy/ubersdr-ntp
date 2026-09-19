@@ -146,6 +146,7 @@ add_custom_command(
             "${CMAKE_CURRENT_SOURCE_DIR}/src/web/index.html"
             "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc"
     DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/src/web/index.html"
+            "${CMAKE_CURRENT_SOURCE_DIR}/src/web/flow.js"
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed-html.py"
     COMMENT "Embedding src/web/index.html"
     VERBATIM)

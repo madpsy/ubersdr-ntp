@@ -236,6 +236,9 @@ tr.fresh td { animation:fresh 4s ease-out; }
     </div>
   </div>
 
+  <!-- The signal path, drawn by flow.js from the same stream as the rest. -->
+  <div class="card" id="flowcard"></div>
+
   <div class="card" id="classcard" hidden>
     <div class="label" style="margin-bottom:12px">Primary and secondary</div>
     <div class="timeline">
@@ -347,6 +350,7 @@ tr.fresh td { animation:fresh 4s ease-out; }
   </div>
 </div>
 
+<script src="flow.js"></script>
 <script>
 "use strict";
 const $ = (id) => document.getElementById(id);
@@ -672,6 +676,7 @@ function paintClock(ts) {
     $("devclock").title = "Your device's own clock, compared with the broadcast time above, " +
       "to the likely error of the measurement (at most ±" + ms(est.err) + "; see below). " +
       "Nothing to do with the server: the times shown on this page do not use it.";
+    try { Flow.browser({ rtt: est.delay, err: est.err, likely, device, within }); } catch (x) {}
     $("linknote").textContent = "browser latency " + ms(est.delay) + " round trip, corrected: " +
       (likely == null ? "" : "likely within ±" + ms(likely) + ", ") + "at most ±" + ms(est.err);
     $("linknote").title = "The displayed time is advanced by half the measured round trip " +
@@ -1780,6 +1785,7 @@ const kStaleMs = 10000, kRetryMaxMs = 30000;
 function showLink(ok, text) {
   $("linkpill").className = "pill " + (ok ? "ok" : "bad");
   $("linkpill").textContent = text;
+  try { Flow.link(ok); } catch (x) {}
 }
 
 function drop() {
@@ -1812,12 +1818,19 @@ function connect() {
     try { d = JSON.parse(e.data); } catch (x) { return; }
     try { onTick(d); } catch (x) {}
     try { eventsOnTick(d); } catch (x) {}
+    try { Flow.tick(d); } catch (x) {}
     try {
       const order = (d.sources || []).map((x) => x.name);
       if (order.join("\n") !== sourceOrder.join("\n")) { sourceOrder = order; renderMetrics(); }
     } catch (x) {}
   });
-  s.addEventListener("status", (e) => { alive(); try { onStatus(JSON.parse(e.data)); } catch (x) {} });
+  s.addEventListener("status", (e) => {
+    alive();
+    let d;
+    try { d = JSON.parse(e.data); } catch (x) { return; }
+    try { onStatus(d); } catch (x) {}
+    try { Flow.status(d); } catch (x) {}
+  });
   s.addEventListener("error", () => {
     if (s !== es) return;
     // Still CONNECTING: the browser is retrying by itself. CLOSED: it has
