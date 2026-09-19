@@ -382,6 +382,35 @@ void testValidation() {
 
 } // namespace
 
+void testMqttBlock() {
+    std::printf("\nmqtt\n");
+    const char* src = R"("sources": [{ "name": "a", "url": "http://x", "carrier_hz": 10000000 }])";
+
+    ::unsetenv("UBERSDR_INGEST_URL");
+    Loaded r = load(std::string("{") + src + "}");
+    check("on by default, at the receiver's container name and port",
+          r.ok && r.cfg.mqtt.enabled && r.cfg.mqtt.ingestUrl == "http://ubersdr:6926",
+          "%s", r.ok ? r.cfg.mqtt.ingestUrl.c_str() : r.why());
+
+    r = load(std::string("{") + src + R"(, "mqtt": { "ingest_url": "http://10.0.0.5:7000/" }})");
+    check("an explicit URL is read, its trailing slash dropped",
+          r.ok && r.cfg.mqtt.ingestUrl == "http://10.0.0.5:7000",
+          "%s", r.ok ? r.cfg.mqtt.ingestUrl.c_str() : r.why());
+
+    r = load(std::string("{") + src + R"(, "mqtt": { "ingest_url": "https://ubersdr:6926" }})");
+    check("anything but http:// is refused", r.failedWith("mqtt.ingest_url"), "%s", r.why());
+
+    r = load(std::string("{") + src + R"(, "mqtt": { "enabled": false, "ingest_url": "nonsense" }})");
+    check("...unless MQTT is off", r.ok && !r.cfg.mqtt.enabled, "%s", r.why());
+
+    ::setenv("UBERSDR_INGEST_URL", "http://ingest.example:6926", 1);
+    r = load(std::string("{") + src + R"(, "mqtt": { "ingest_url": "http://10.0.0.5:7000" }})");
+    ::unsetenv("UBERSDR_INGEST_URL");
+    check("UBERSDR_INGEST_URL overrides the file",
+          r.ok && r.cfg.mqtt.ingestUrl == "http://ingest.example:6926",
+          "%s", r.ok ? r.cfg.mqtt.ingestUrl.c_str() : r.why());
+}
+
 int main() {
     std::printf("ubersdr-ntp configuration test\n");
 
@@ -397,6 +426,7 @@ int main() {
     testNtpSources();
     testClockBlock();
     testValidation();
+    testMqttBlock();
 
     // Tidy up: the files hold made-up passwords, but leaving a trail of
     // configuration files in /tmp on every build is untidy either way.

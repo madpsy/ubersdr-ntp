@@ -30,6 +30,8 @@
 #include "Selector.h"
 #include "SourceSnapshot.h"
 
+#include "../third_party/json.hpp"
+
 #include <cstdint>
 #include <deque>
 #include <map>
@@ -107,6 +109,9 @@ struct Event {
     std::string message;
 };
 
+// One event as /api/eventlog and the MQTT events topic both render it.
+nlohmann::json eventJson(const Event& e);
+
 class EventLog {
 public:
     static constexpr std::size_t kCapacity = 100;
@@ -119,10 +124,15 @@ public:
     std::uint64_t latestId() const;
     std::uint64_t totalRecorded() const { return latestId(); }
 
+    // How many of each type since startup, every type present, by name. Not
+    // bounded by the capacity: a failover a week ago still counts.
+    std::map<std::string, std::uint64_t> countsByType() const;
+
 private:
     mutable std::mutex m_mu;
     std::deque<Event> m_events;
     std::uint64_t m_nextId = 1;
+    std::map<EventType, std::uint64_t> m_counts;
 };
 
 class EventMonitor {

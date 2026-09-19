@@ -142,11 +142,29 @@ const EventTypeInfo& eventTypeInfo(EventType t) {
     return eventTypes().front();
 }
 
+nlohmann::json eventJson(const Event& e) {
+    const EventTypeInfo& info = eventTypeInfo(e.type);
+    nlohmann::json o;
+    o["id"] = e.id;
+    o["unix"] = e.unix;
+    o["utc"] = iso8601(static_cast<long long>(std::llround(e.unix * 1000.0)));
+    o["uptime_seconds"] = e.uptimeSec;
+    o["type"] = info.name;
+    o["label"] = info.label;
+    o["category"] = info.category;
+    o["severity"] = eventSeverityName(info.severity);
+    o["source"] = e.source.empty() ? nlohmann::json(nullptr) : nlohmann::json(e.source);
+    o["kind"] = e.haveKind ? nlohmann::json(sourceKindName(e.kind)) : nlohmann::json(nullptr);
+    o["message"] = e.message;
+    return o;
+}
+
 // --- EventLog ---------------------------------------------------------------
 
 void EventLog::add(Event e) {
     std::lock_guard<std::mutex> lk(m_mu);
     e.id = m_nextId++;
+    ++m_counts[e.type];
     m_events.push_back(std::move(e));
     while (m_events.size() > kCapacity) m_events.pop_front();
 }
@@ -159,6 +177,14 @@ std::vector<Event> EventLog::all() const {
 std::uint64_t EventLog::latestId() const {
     std::lock_guard<std::mutex> lk(m_mu);
     return m_nextId - 1;
+}
+
+std::map<std::string, std::uint64_t> EventLog::countsByType() const {
+    std::map<std::string, std::uint64_t> out;
+    for (const EventTypeInfo& t : eventTypes()) out[t.name] = 0;
+    std::lock_guard<std::mutex> lk(m_mu);
+    for (const auto& kv : m_counts) out[eventTypeInfo(kv.first).name] = kv.second;
+    return out;
 }
 
 // --- EventMonitor -----------------------------------------------------------

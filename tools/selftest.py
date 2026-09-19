@@ -32,6 +32,11 @@ real failure mode that a clean compile does not rule out:
     synchronises from that upstream and the reply says so honestly: one stratum
     below it, the upstream's address as the reference id, and a root delay that
     is no longer zero;
+  * it publishes to MQTT through a fake of UberSDR's addon ingest port that
+    applies the receiver's own validation: every Home Assistant entity is
+    declared and accepted, the retained summary follows synchronisation within
+    seconds, each source has its topic and events theirs -- and an ingest port
+    that refuses it (403) gets asked and nothing else;
   * it refuses to be written to -- a POST is answered 405, not 404;
   * it shuts down on SIGTERM without having to be killed.
 
@@ -40,6 +45,7 @@ Usage: selftest.py /path/to/ubersdr-ntp
 
 import json
 import os
+import re
 import signal
 import socket
 import struct
@@ -191,6 +197,176 @@ class FakeUpstream(object):
         self.sock.close()
 
 
+class FakeIngest(object):
+    """UberSDR's addon ingest port, as far as an addon can see it.
+
+    Answers /health, /discovery and /publish/{sub_topic}, records every request,
+    and applies the receiver's own validation (mqtt_addon_ingest.go and
+    mqtt_addon_ha.go in ka9q_ubersdr): a sub-topic or declaration the real port
+    would refuse is refused here too, with the same 400, and counted -- so a
+    publisher that passes here passes there. `forbid` answers 403 to everything,
+    as the port does to a machine that is not an installed addon.
+    """
+
+    SUB_TOPIC = re.compile(r'^[a-z0-9][a-z0-9_-]*(/[a-z0-9][a-z0-9_-]*)*$')
+    ENTITY_KEY = re.compile(r'^[a-z0-9][a-z0-9_-]{0,31}$')
+    ICON = re.compile(r'^mdi:[a-z0-9-]{1,40}$')
+    DEVICE_CLASSES = set('''apparent_power aqi atmospheric_pressure battery carbon_dioxide
+        carbon_monoxide current data_rate data_size date distance duration energy
+        energy_storage enum frequency gas humidity illuminance irradiance moisture monetary
+        nitrogen_dioxide nitrogen_monoxide nitrous_oxide ozone ph pm1 pm10 pm25 power
+        power_factor precipitation precipitation_intensity pressure reactive_power
+        signal_strength sound_pressure speed sulphur_dioxide temperature timestamp
+        volatile_organic_compounds voltage volume volume_flow_rate volume_storage water weight
+        wind_speed battery_charging cold connectivity door garage_door heat light lock motion
+        moving occupancy opening plug presence problem running safety smoke sound tamper
+        update vibration window'''.split())
+    FIELDS = {'sub_topic', 'entity_key', 'component', 'name', 'value_template',
+              'unit_of_measurement', 'device_class', 'state_class', 'icon', 'entity_category',
+              'payload_on', 'payload_off', 'json_attributes_template', 'addon_version',
+              'addon_model'}
+
+    @classmethod
+    def sub_topic_error(cls, sub):
+        if len(sub) > 64 or sub.count('/') > 3 or not cls.SUB_TOPIC.match(sub):
+            return 'invalid sub-topic %r' % sub
+        if sub == 'status':
+            return 'status is reserved'
+        return None
+
+    @classmethod
+    def declaration_error(cls, d):
+        extra = set(d) - cls.FIELDS
+        if extra:
+            return 'fields the port would drop: %s' % sorted(extra)
+        err = cls.sub_topic_error(d.get('sub_topic', ''))
+        if err:
+            return err
+        if 'entity_key' in d and not cls.ENTITY_KEY.match(d['entity_key']):
+            return 'bad entity_key %r' % d['entity_key']
+        comp = d.get('component', 'sensor')
+        if comp not in ('sensor', 'binary_sensor'):
+            return 'bad component %r' % comp
+        limits = {'name': 64, 'value_template': 256, 'json_attributes_template': 256,
+                  'unit_of_measurement': 16, 'payload_on': 32, 'payload_off': 32,
+                  'addon_version': 32, 'addon_model': 64}
+        if not d.get('name', '').strip():
+            return 'name is required'
+        for k, n in limits.items():
+            v = d.get(k, '')
+            if len(v) > n:
+                return '%s longer than %d: %d' % (k, n, len(v))
+            if any(ord(ch) < 0x20 or ord(ch) == 0x7f for ch in v):
+                return '%s has control characters' % k
+        if 'device_class' in d and d['device_class'] not in cls.DEVICE_CLASSES:
+            return 'unknown device_class %r' % d['device_class']
+        if 'state_class' in d:
+            if d['state_class'] not in ('measurement', 'total', 'total_increasing'):
+                return 'bad state_class %r' % d['state_class']
+            if comp != 'sensor':
+                return 'state_class on a %s' % comp
+        if 'entity_category' in d and d['entity_category'] != 'diagnostic':
+            return 'bad entity_category %r' % d['entity_category']
+        if 'icon' in d and not cls.ICON.match(d['icon']):
+            return 'bad icon %r' % d['icon']
+        if comp != 'binary_sensor' and ('payload_on' in d or 'payload_off' in d):
+            return 'payload_on/off on a sensor'
+        return None
+
+    def __init__(self, forbid=False, broker_down=False):
+        import http.server
+        self.forbid = forbid
+        # The receiver is up but its broker is not: publishes are answered 503
+        # and must be tried again, not lost.
+        self.broker_down = broker_down
+        self.refused_503 = 0
+        self.lock = threading.Lock()
+        self.health = 0
+        self.declared = []        # accepted declarations
+        self.published = []       # (time, sub_topic, retain, payload) accepted
+        self.rejected = []        # (what, why)
+        outer = self
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def reply(self, code, obj):
+                body = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header('Content-Type', 'application/json')
+                self.send_header('Content-Length', str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def do_GET(self):
+                if outer.forbid:
+                    with outer.lock:
+                        outer.health += 1
+                    return self.reply(403, {'error': 'forbidden'})
+                if self.path != '/health':
+                    return self.reply(404, {})
+                with outer.lock:
+                    outer.health += 1
+                self.reply(200, {'addon': 'ntp', 'mqtt_connected': True, 'ha_discovery': True,
+                                 'max_payload_bytes': 65536, 'rate_limit': 120, 'max_qos': 1,
+                                 'retain_allowed': True, 'max_entities': 20,
+                                 'offline_after_sec': 300})
+
+            def do_POST(self):
+                n = int(self.headers.get('Content-Length', '0'))
+                raw = self.rfile.read(n)
+                if outer.forbid:
+                    with outer.lock:
+                        outer.rejected.append((self.path, 'posted while forbidden'))
+                    return self.reply(403, {})
+                try:
+                    payload = json.loads(raw.decode('utf-8'))
+                except ValueError as e:
+                    with outer.lock:
+                        outer.rejected.append((self.path, 'not JSON: %s' % e))
+                    return self.reply(400, {})
+                path, _, query = self.path.partition('?')
+                if path == '/discovery':
+                    err = FakeIngest.declaration_error(payload)
+                    with outer.lock:
+                        if err:
+                            outer.rejected.append(('declare', err))
+                        else:
+                            outer.declared.append(payload)
+                    return self.reply(400 if err else 200, {'status': 'declared'})
+                if path.startswith('/publish/'):
+                    sub = path[len('/publish/'):]
+                    if outer.broker_down:
+                        with outer.lock:
+                            outer.refused_503 += 1
+                        return self.reply(503, {})
+                    err = FakeIngest.sub_topic_error(sub)
+                    if not err and len(raw) > 65536:
+                        err = 'payload too large'
+                    with outer.lock:
+                        if err:
+                            outer.rejected.append((sub, err))
+                        else:
+                            outer.published.append((time.time(), sub, 'retain=true' in query,
+                                                    payload))
+                    return self.reply(400 if err else 200, {'status': 'published'})
+                self.reply(404, {})
+
+        self.server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+        self.url = 'http://127.0.0.1:%d' % self.server.server_address[1]
+        self._thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def topics(self, prefix):
+        with self.lock:
+            return [p for p in self.published if p[1] == prefix or p[1].startswith(prefix + '/')]
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
 def http_get(path, timeout=3.0, port=None):
     url = 'http://127.0.0.1:%d%s' % (port or HTTP_PORT, path)
     try:
@@ -301,6 +477,11 @@ def main():
         'http': {'enabled': True, 'listen': '127.0.0.1', 'port': HTTP_PORT},
         'log': {'level': 'warn', 'status_interval_seconds': 0},
     }
+    # An ingest port that does not recognise this machine, as a receiver
+    # answers one that is not an installed addon: it must ask, be told no, and
+    # publish nothing.
+    forbidding = FakeIngest(forbid=True)
+    cfg['mqtt'] = {'ingest_url': forbidding.url}
     fd, path = tempfile.mkstemp(suffix='.json', prefix='ubersdr-ntp-selftest-')
     with os.fdopen(fd, 'w') as f:
         json.dump(cfg, f)
@@ -501,6 +682,10 @@ def main():
             for st in streams:
                 st.close()
 
+        check('MQTT: asks an ingest port that refuses it, and publishes nothing',
+              forbidding.health >= 1 and not forbidding.rejected,
+              'health=%d, %s' % (forbidding.health, forbidding.rejected[:2]))
+
         # --- shutdown --------------------------------------------------------
         proc.send_signal(signal.SIGTERM)
         try:
@@ -515,10 +700,14 @@ def main():
         if proc.poll() is None:
             proc.kill()
             proc.wait()
+        forbidding.close()
         try:
             os.unlink(path)
         except OSError:
             pass
+    # The rest run with the default endpoint, which resolves to nothing here:
+    # the dormant path, which must not hold up startup or shutdown.
+    del cfg['mqtt']
 
     # --- answer_when_unsynchronised: false ---------------------------------
     #
@@ -639,7 +828,9 @@ def main():
     # being zero because there is now an NTP path above it. Serving stratum 1
     # off a pool server would be a lie a client would act on.
     upstream = FakeUpstream(offset_sec=0.400, stratum=2)
+    ingest = FakeIngest(broker_down=True)
     cfg4 = {
+        'mqtt': {'ingest_url': ingest.url},
         'ntp': {'port': free_port(socket.SOCK_DGRAM), 'listen': ['127.0.0.1'],
                 'min_sources': 1},
         'http': {'enabled': True, 'port': free_port(socket.SOCK_STREAM),
@@ -647,17 +838,25 @@ def main():
         'clock': {'primary': 'ntp', 'secondary': 'cold'},
         'ntp_sources': [{'name': 'fake', 'server': '127.0.0.1', 'port': upstream.port,
                          'poll_seconds': 8, 'iburst': True}],
+        # Never connected -- the secondary is cold -- but still a source with a
+        # name that has to be folded into a topic segment.
+        'sources': [{'name': 'Local 10 MHz', 'url': 'http://127.0.0.1:1',
+                     'carrier_hz': 10000000}],
         'log': {'level': 'info'},
     }
     fd4, path4 = tempfile.mkstemp(suffix='.json', prefix='ubersdr-ntp-selftest-')
     with os.fdopen(fd4, 'w') as f:
         json.dump(cfg4, f)
+    started4 = time.time()
     proc4 = subprocess.Popen([binary, '--config', path4],
                              stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     try:
+        # The receiver's broker comes up a moment after the daemon does, so
+        # the startup events meet a 503 first and have to be sent again.
+        threading.Timer(2.0, lambda: setattr(ingest, 'broker_down', False)).start()
+
         # iburst is six polls two seconds apart and the estimator wants four
         # samples, so this is about eight seconds; allow plenty.
-        deadline = time.time() + 40
         served = None
         while time.time() < deadline and proc4.poll() is None:
             r = ntp_query(cfg4['ntp']['port'], timeout=1.0)
@@ -709,6 +908,119 @@ def main():
                   off is not None and abs(off - 400.0) < 20.0,
                   '%s ms' % off)
 
+        # --- MQTT, through the fake ingest port ---------------------------
+        #
+        # Everything is checked against the receiver's own rules by the fake:
+        # a sub-topic or declaration it would refuse is recorded as rejected.
+        # The synchronisation above is an event, and an event brings the
+        # retained summary forward, so a synchronised summary should follow it
+        # within seconds rather than at the next 30 s tick -- allowing for the
+        # 15 s the 503 above holds everything back.
+        deadline = time.time() + 30
+        summary = None
+        while time.time() < deadline:
+            for _, _, _, body in reversed(ingest.topics('summary')):
+                if body.get('served', {}).get('synchronised'):
+                    summary = body
+                    break
+            if summary:
+                break
+            time.sleep(0.5)
+        check('MQTT: probes the ingest port and declares every entity',
+              ingest.health >= 1 and len(ingest.declared) >= 15,
+              'health=%d, declared=%d' % (ingest.health, len(ingest.declared)))
+        keys = [d.get('entity_key') for d in ingest.declared]
+        check('MQTT: entity keys are unique and all read the summary',
+              len(set(keys)) == len(keys) and all(d['sub_topic'] == 'summary' for d in ingest.declared),
+              repr(keys))
+        check('MQTT: nothing it sent would be refused by the receiver',
+              not ingest.rejected, repr(ingest.rejected[:3]))
+        check('MQTT: a synchronised summary follows the synchronisation',
+              summary is not None,
+              '%d summaries, none synchronised' % len(ingest.topics('summary')))
+        if summary:
+            check('MQTT: the summary carries the clock, the NTP server and each source',
+                  summary.get('clock', {}).get('primary') == 'ntp'
+                  and 'requests' in summary.get('ntp', {})
+                  and summary.get('sources', {}).get('fake', {}).get('state') == 'live'
+                  and summary.get('counts', {}).get('ntp_ready') == 1
+                  and summary.get('started_utc', '').endswith('Z'),
+                  json.dumps({k: summary.get(k) for k in ('sources', 'counts')})[:200])
+            # A template reading a field the payload lacks is an entity stuck
+            # at "unknown" forever, and nothing on either side says why. In a
+            # conditional one only the condition must always be there: the
+            # branch it guards is not evaluated when the field is absent.
+            missing = set()
+            for d in ingest.declared:
+                text = ''
+                for t in (d.get('value_template', ''), d.get('json_attributes_template', '')):
+                    text += ' ' + (t.split(' if ', 1)[1] if ' if ' in t else t)
+                for path in re.findall(r'value_json((?:\.\w+)+)', text):
+                    node = summary
+                    for part in path.lstrip('.').split('.'):
+                        if not isinstance(node, dict) or part not in node:
+                            missing.add(path)
+                            break
+                        node = node[part]
+            check('MQTT: every template names a field the summary has', not missing,
+                  repr(sorted(missing)))
+            check('MQTT: the summary carries event counts, stream clients and class medians',
+                  summary.get('events', {}).get('counts', {}).get('synchronised', 0) >= 1
+                  and summary.get('http', {}).get('stream_clients') == 0
+                  and summary.get('clock', {}).get('primary_median_ms') is not None,
+                  json.dumps({k: summary.get(k) for k in ('events', 'http')})[:200])
+
+        # Coverage, checked rather than assumed: every field /api/status has
+        # is in the summary (bar the source array) or on a source's topic.
+        def paths(node, prefix=''):
+            out = set()
+            if isinstance(node, dict):
+                for k, v in node.items():
+                    out.add(prefix + k)
+                    out |= paths(v, prefix + k + '.')
+            return out
+        code, body, _ = http_get('/api/status', port=cfg4['http']['port'])
+        status = json.loads(body) if code == 200 else {}
+        latest_summary = ingest.topics('summary')[-1][3] if ingest.topics('summary') else {}
+        missing = paths({k: v for k, v in status.items() if k != 'sources'}) - paths(latest_summary)
+        check('MQTT: the summary has every field of /api/status', status and not missing,
+              repr(sorted(missing)[:8]))
+        missing = set()
+        for entry in status.get('sources', []):
+            topic = [b for _, sub, _, b in ingest.topics('source') if b.get('name') == entry['name']]
+            missing |= paths(entry) - paths(topic[-1] if topic else {})
+        check('MQTT: each source topic has every field /api/status has for it', not missing,
+              repr(sorted(missing)[:8]))
+
+        src = [b for _, sub, _, b in ingest.topics('source')]
+        check('MQTT: each source has its full record on source/<name>',
+              any(b.get('name') == 'fake' and b.get('ntp', {}).get('stratum') == 2 for b in src)
+              and {sub for _, sub, _, _ in ingest.topics('source')} ==
+              {'source/fake', 'source/local-10-mhz'},
+              repr([sub for _, sub, _, _ in ingest.topics('source')][:4]))
+        with ingest.lock:
+            retained_ok = all(ret == (sub != 'events') for _, sub, ret, _ in ingest.published)
+        check('MQTT: state is retained and events are not', retained_ok)
+        types = [b.get('type') for _, _, _, b in ingest.topics('events')]
+        check('MQTT: events are published as they happen, startup included',
+              'daemon_started' in types and 'synchronised' in types, repr(types))
+        # Every event, once, in order -- the startup ones included, although
+        # the broker refused them the first time.
+        code, body, _ = http_get('/api/eventlog', port=cfg4['http']['port'])
+        logged = sorted(e['id'] for e in json.loads(body).get('events', [])) if code == 200 else []
+        time.sleep(1.5)
+        ids = [b.get('id') for _, _, _, b in ingest.topics('events')]
+        check('MQTT: every logged event is published exactly once, in order, after a 503',
+              ingest.refused_503 > 0 and logged and ids[:len(logged)] == logged
+              and len(ids) == len(set(ids)) and ids == sorted(ids),
+              '503s=%d logged=%s published=%s' % (ingest.refused_503, logged, ids))
+        check('MQTT: an event carries its label as well as its type',
+              all(b.get('label') for _, _, _, b in ingest.topics('events')))
+        with ingest.lock:
+            total = len(ingest.published) + len(ingest.declared)
+        check('MQTT: well inside the receiver rate limit', total < 60,
+              '%d requests in the first %.0f s' % (total, time.time() - started4))
+
         proc4.send_signal(signal.SIGTERM)
         proc4.wait(timeout=10)
     except subprocess.TimeoutExpired:
@@ -719,6 +1031,7 @@ def main():
             proc4.kill()
             proc4.wait()
         upstream.close()
+        ingest.close()
         try:
             os.unlink(path4)
         except OSError:

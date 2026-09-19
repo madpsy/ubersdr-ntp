@@ -174,6 +174,7 @@ add_executable(ubersdr-ntp
     src/HttpApi.cpp
     src/Log.cpp
     src/Metrics.cpp
+    src/Mqtt.cpp
     src/NtpClient.cpp
     src/NtpServer.cpp
     src/OffsetEstimator.cpp

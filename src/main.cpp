@@ -31,6 +31,7 @@
 #include "HttpApi.h"
 #include "Log.h"
 #include "Metrics.h"
+#include "Mqtt.h"
 #include "NtpClient.h"
 #include "NtpServer.h"
 #include "SampleClock.h"
@@ -392,6 +393,9 @@ int main(int argc, char** argv) {
     MetricHistory metrics;
     double lastMetricSecond = 0.0;
 
+    // Set once the HTTP service exists, which is after the provider it is
+    // handed; read only through the provider, never before then.
+    const HttpApi* httpApi = nullptr;
     auto statusInput = [&](void) -> StatusInput {
         StatusInput in;
         in.sources = snapshots();
@@ -407,10 +411,13 @@ int main(int argc, char** argv) {
         in.secondaryActive = act.secondaryActive;
         in.secondaryActiveReason = act.reason;
         in.eventsLatestId = events.latestId();
+        in.eventCounts = events.countsByType();
+        in.httpStreamClients = httpApi && cfg.http.enabled ? httpApi->streamClients() : -1;
         return in;
     };
 
     HttpApi http(cfg.http, selector, statusInput, &events, &metrics);
+    httpApi = &http;
     if (!http.start(err)) {
         // Not fatal: the status service is how you watch this, but NTP is what
         // it is for, and refusing to serve time because a status page could not
@@ -426,6 +433,11 @@ int main(int argc, char** argv) {
     }
 
     for (auto& s : sources) s->start();
+
+    // MQTT through the receiver's addon ingest port. Dormant, and quiet about
+    // it, wherever there is no such port; see Mqtt.h.
+    MqttPublisher mqtt(cfg.mqtt, statusInput, events);
+    mqtt.start();
 
     // --- the main loop is the status reporter -------------------------------
     //
@@ -535,6 +547,7 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO(kTag, "shutting down");
+    mqtt.stop();
     for (auto& s : sources) s->stop();
     ntp.stop();
     http.stop();

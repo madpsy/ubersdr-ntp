@@ -17,7 +17,10 @@
 #include "Selector.h"
 #include "Source.h"
 
+#include "../third_party/json.hpp"
+
 #include <cstdint>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -42,8 +45,14 @@ struct StatusInput {
     bool secondaryActive = true;
     std::string secondaryActiveReason;
 
-    // The newest event's id, 0 before the first. See Events.h.
+    // The newest event's id, 0 before the first, and how many of each type
+    // there have been since startup. See Events.h.
     std::uint64_t eventsLatestId = 0;
+    std::map<std::string, std::uint64_t> eventCounts;
+
+    // Status pages and other followers holding /api/events open; -1 with the
+    // HTTP service off.
+    int httpStreamClients = -1;
 };
 
 // The multi-line block for the log. No trailing newline; Log::block indents it.
@@ -71,6 +80,12 @@ std::string renderStatusLine(const StatusInput& in);
 // as often as by programs, and a few hundred bytes of whitespace is nothing
 // against how much easier it is to read in a terminal.
 std::string renderStatusJson(const StatusInput& in, bool pretty);
+
+// The same document unrendered, and one source's entry in it: the MQTT
+// publisher sends the parts on topics of their own, and building them here
+// keeps them identical to what /api/status says.
+nlohmann::json statusJson(const StatusInput& in);
+nlohmann::json sourceJson(const SourceSnapshot& s, const Combined& combined);
 
 // Human-readable formatters, shared so the log and the page agree on how a
 // duration or an offset reads.

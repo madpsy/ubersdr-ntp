@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <fstream>
 #include <set>
 #include <sstream>
@@ -197,6 +198,12 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         if (!getOpt(h, "port", c.http.port, err)) return false;
     }
 
+    if (auto it = j.find("mqtt"); it != j.end() && it->is_object()) {
+        const json& m = *it;
+        if (!getOpt(m, "enabled", c.mqtt.enabled, err)) return false;
+        if (!getOpt(m, "ingest_url", c.mqtt.ingestUrl, err)) return false;
+    }
+
     if (auto it = j.find("clock"); it != j.end() && it->is_object()) {
         const json& k = *it;
         std::string v;
@@ -279,6 +286,15 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
 }
 
 bool Config::finalise(std::string& err) {
+    // The environment wins, as it does for the receiver's other addons: a
+    // container is configured by its compose file, not by editing a file
+    // inside it. Here rather than in load() so a run with no file gets it too.
+    if (const char* v = std::getenv("UBERSDR_INGEST_URL"); v && *v) mqtt.ingestUrl = v;
+    while (!mqtt.ingestUrl.empty() && mqtt.ingestUrl.back() == '/') mqtt.ingestUrl.pop_back();
+    if (mqtt.enabled && mqtt.ingestUrl.rfind("http://", 0) != 0) {
+        err = "mqtt.ingest_url must be an http:// URL (got \"" + mqtt.ingestUrl + "\")";
+        return false;
+    }
     if (ntp.port < 1 || ntp.port > 65535) {
         err = "ntp.port " + std::to_string(ntp.port) + " out of range";
         return false;

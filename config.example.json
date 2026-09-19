@@ -53,6 +53,22 @@
   },
 
   // =====================================================================
+  // MQTT
+  //
+  // Published through the UberSDR receiver's own MQTT connection, by way of
+  // its addon ingest port, and into Home Assistant if the receiver has
+  // discovery on. Nothing to set: with no port to reach, or one that does not
+  // recognise this machine as an installed addon, it stays dormant and asks
+  // again every 30 s. The URL is only for a receiver container not called
+  // "ubersdr", or a port moved from 6926; UBERSDR_INGEST_URL in the
+  // environment overrides it. See "MQTT and Home Assistant" in the README.
+  // =====================================================================
+  "mqtt": {
+    "enabled": true,
+    "ingest_url": "http://ubersdr:6926"
+  },
+
+  // =====================================================================
   // THE TWO CLASSES OF SOURCE
   //
   // There are two kinds of reference here: the radio sources below, and

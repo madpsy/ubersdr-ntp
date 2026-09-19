@@ -5,6 +5,7 @@
 
 #include "../third_party/json.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -534,7 +535,7 @@ std::string renderStatusBlock(const StatusInput& in) {
     return out;
 }
 
-std::string renderStatusJson(const StatusInput& in, bool pretty) {
+json statusJson(const StatusInput& in) {
     json j;
     j["version"] = in.version;
     j["uptime_seconds"] = in.uptimeSec;
@@ -602,6 +603,23 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
             cd["secondary_sources"] = d.secondarySources;
         }
         k["class_delta"] = std::move(cd);
+
+        // Each class's median offset over its ready sources, as the status
+        // page's primary-and-secondary card and /api/metrics have it; null for
+        // a class with nothing ready.
+        std::vector<double> primary, secondary;
+        for (const SourceSnapshot& s : in.sources) {
+            if (!s.ready || !s.haveOffset) continue;
+            (s.primaryClass ? primary : secondary).push_back(s.hostOffsetSec * 1000.0);
+        }
+        auto median = [](std::vector<double> v) -> json {
+            if (v.empty()) return nullptr;
+            std::sort(v.begin(), v.end());
+            const std::size_t m = v.size() / 2;
+            return v.size() % 2 ? v[m] : (v[m - 1] + v[m]) / 2.0;
+        };
+        k["primary_median_ms"] = median(std::move(primary));
+        k["secondary_median_ms"] = median(std::move(secondary));
         j["clock"] = std::move(k);
     }
     served["age_seconds"] = in.combined.ageSec;
@@ -629,184 +647,204 @@ std::string renderStatusJson(const StatusInput& in, bool pretty) {
     ntp["send_errors"] = in.ntp.sendErrors;
     j["ntp"] = std::move(ntp);
 
+    j["events"] = {{"latest_id", in.eventsLatestId}, {"counts", in.eventCounts}};
+    j["http"] = {{"stream_clients", in.httpStreamClients >= 0 ? json(in.httpStreamClients)
+                                                              : json(nullptr)}};
+
     json arr = json::array();
-    for (const SourceSnapshot& s : in.sources) {
-        json o;
-        o["name"] = s.name;
-        o["kind"] = sourceKindName(s.kind);
-        o["primary_class"] = s.primaryClass;
-        o["url"] = s.url;
-        o["enabled"] = s.enabled;
-        o["active"] = s.active;
-        o["active_reason"] = s.activeReason;
-        // The one question both kinds answer, and the one the Selector asks.
-        o["ready"] = s.ready;
-        o["not_ready_reason"] = s.notReadyReason;
-        o["receiver_name"] = s.receiverName;
-        o["carrier_hz"] = s.carrierHz;
-        o["dial_hz"] = s.dialHz;
-        o["format"] = formatName(s.format);
-        o["weight"] = s.weight;
-        {
-            const auto used = std::find(in.combined.usedNames.begin(), in.combined.usedNames.end(),
-                                        s.name) != in.combined.usedNames.end();
-            const auto why = in.combined.notUsedReasons.find(s.name);
-            o["in_use"] = used;
-            o["not_used_reason"] = why != in.combined.notUsedReasons.end()
-                                       ? json(why->second) : json(nullptr);
-        }
-
-        json link;
-        link["state"] = linkStateName(s.link);
-        link["detail"] = s.linkDetail;
-        link["age_seconds"] = s.linkAgeSec;
-        link["last_audio_age_seconds"] = s.lastAudioAgeSec;
-        link["packets"] = s.packets;
-        link["audio_bytes"] = s.audioBytes;
-        link["decode_errors"] = s.decodeErrors;
-        link["connect_attempts"] = s.connectAttempts;
-        link["reacquisitions"] = s.reacquisitions;
-        link["http_rtt_ms"] = s.httpRttMs;
-        o["link"] = std::move(link);
-
-        json audio;
-        audio["sample_rate"] = s.sampleRate;
-        audio["baseband_power_dbfs"] = s.basebandPowerDb;
-        audio["noise_dbfs"] = s.noiseDb;
-        if (s.basebandPowerDb > -998.0 && s.noiseDb > -998.0)
-            audio["snr_db"] = s.basebandPowerDb - s.noiseDb;
-        o["audio"] = std::move(audio);
-
-        json dec;
-        dec["state"] = s.clockState;
-        dec["station"] = s.station;
-        dec["stage"] = funnelStage(s);
-        dec["tone_snr_db"] = s.toneSnrDb;
-        dec["tone_detected"] = s.toneDetected;
-        // Which station the tick is really from: + leans WWV, - leans WWVH.
-        dec["tick_band_ratio_db"] = std::isfinite(s.tickBandRatioDb)
-                                        ? json(s.tickBandRatioDb) : json(nullptr);
-        dec["phase_locked"] = s.phaseLocked;
-        // NaN has no JSON spelling and the decoder really does report it for a
-        // delay estimate that has not settled, so it becomes null rather than
-        // producing a document no parser will accept.
-        if (std::isfinite(s.delayEstMs)) dec["delay_est_ms"] = s.delayEstMs;
-        else dec["delay_est_ms"] = nullptr;
-        dec["anchored"] = s.anchored;
-        dec["bad_frame_streak"] = s.badFrameStreak;
-        dec["frames_in_window"] = s.framesInWindow;
-        dec["window_size"] = s.windowSize;
-        dec["vote_quality"] = s.voteQuality;
-        dec["refusal"] = s.refusal;
-        dec["audio_seconds"] = s.sampleRate ? static_cast<double>(s.samplesConsumed) / s.sampleRate : 0.0;
-        dec["last_quality"] = s.lastQuality;
-        dec["last_decoded_utc"] = s.lastDecodedUtc;
-        dec["last_decode_age_seconds"] = s.lastTimeAgeSec;
-        dec["time_check"] = s.timeCheck;
-        dec["time_rejections"] = s.timeRejections;
-        dec["time_adoptions"] = s.timeAdoptions;
-        if (s.timeRejections) {
-            dec["last_rejected_utc"] = s.lastRejectedUtc;
-            dec["last_rejected_jump_seconds"] = s.lastRejectedJumpSec;
-        } else {
-            dec["last_rejected_utc"] = nullptr;
-            dec["last_rejected_jump_seconds"] = nullptr;
-        }
-        dec["leap_pending"] = s.leapPending;
-        dec["dut1_seconds"] = s.dut1Tenths / 10.0;
-        o["decoder"] = std::move(dec);
-
-        json t;
-        t["have_offset"] = s.haveOffset;
-        t["offset_ms"] = s.hostOffsetSec * 1000.0;
-        t["raw_offset_ms"] = s.rawOffsetSec * 1000.0;
-        t["clock_offset_ms"] = s.offsetSec * 1000.0;
-        t["rate_ppm"] = s.offsetRate * 1e6;
-        t["rate_uncertainty_ppm"] = s.offsetRateUncertainty * 1e6;
-        t["rate_measured"] = s.offsetRateMeasured;
-        t["rate_span_seconds"] = s.offsetRateSpanSec;
-        t["rate_term_ms"] = s.rateTermSec * 1000.0;
-        t["jitter_ms"] = s.jitterSec * 1000.0;
-        t["dispersion_ms"] = s.dispersionSec * 1000.0;
-        t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
-        t["ws_rtt_ms"] = s.wsRttMs;
-        t["rtt_from_websocket"] = s.rttFromWs;
-        t["http_rtt_ms"] = s.httpRttMs;
-        t["age_seconds"] = s.offsetAgeSec;
-        t["samples"] = s.offsetSamples;
-        o["timing"] = std::move(t);
-
-        json d;
-        d["total_ms"] = s.delaySec * 1000.0;
-        d["propagation_ms"] = s.propagationSec * 1000.0;
-        d["network_ms"] = s.networkSec * 1000.0;
-        d["codec_ms"] = s.codecSec * 1000.0;
-        d["chain_ms"] = s.chainSec * 1000.0;
-        d["decoder_bias_ms"] = s.decoderSec * 1000.0;
-        d["configured_ms"] = s.extraSec * 1000.0;
-        d["path"] = s.pathDescription;
-        if (s.receiverLocation.valid) {
-            d["receiver_lat"] = s.receiverLocation.lat;
-            d["receiver_lon"] = s.receiverLocation.lon;
-        }
-        o["delay"] = std::move(d);
-
-        json sc;
-        sc["fitted"] = s.clockFitValid;
-        sc["residual_ms"] = s.clockResidualSec * 1000.0;
-        sc["span_seconds"] = s.clockSpanSec;
-        sc["ppm"] = s.clockPpm;
-        sc["slope_uncertainty_ms"] = s.clockSlopeUncSec * 1000.0;
-        sc["slope_held"] = s.clockSlopeHeld;
-        sc["last_excess_delay_ms"] = s.lastExcessDelaySec * 1000.0;
-        o["sample_clock"] = std::move(sc);
-
-        // Present only for an upstream peer: for a receiver every field in it
-        // would be a zero that a reader could mistake for a measurement.
-        if (s.kind == SourceKind::Ntp) {
-            const NtpPeerInfo& n = s.ntp;
-            json p;
-            p["server"] = n.server;
-            p["address"] = n.address;
-            p["address_host"] = n.addressHost;
-            p["port"] = n.port;
-            p["stratum"] = n.stratum;
-            p["refid"] = n.refid;
-            p["leap"] = n.leap;
-            p["root_delay_ms"] = n.rootDelaySec * 1000.0;
-            p["root_dispersion_ms"] = n.rootDispersionSec * 1000.0;
-            p["root_distance_ms"] = n.rootDistanceSec * 1000.0;
-            p["server_precision_us"] = n.serverPrecisionSec * 1e6;
-            p["poll_seconds"] = n.pollSec;
-            p["delay_ms"] = n.delaySec * 1000.0;
-            p["filter_jitter_ms"] = n.filterJitterSec * 1000.0;
-            p["reach"] = n.reach;
-            // The octal byte every other NTP implementation prints, because
-            // that is the form people recognise: 377 is eight polls of eight.
-            {
-                char b[8];
-                std::snprintf(b, sizeof b, "%03o", n.reach);
-                p["reach_octal"] = b;
-            }
-            p["last_reply_age_seconds"] = n.lastReplyAgeSec;
-            p["sent"] = n.sent;
-            p["received"] = n.received;
-            p["rejected"] = n.rejected;
-            p["spikes"] = n.spikes;
-            p["max_root_distance_ms"] = n.maxRootDistanceSec * 1000.0;
-            p["max_stratum"] = n.maxStratum;
-            p["configured_poll_seconds"] = n.configuredPollSec;
-            p["last_reject_reason"] = n.lastRejectReason;
-            p["kiss_code"] = n.kissCode;
-            p["stopped"] = n.stopped;
-            o["ntp"] = std::move(p);
-        }
-
-        arr.push_back(std::move(o));
-    }
+    for (const SourceSnapshot& s : in.sources) arr.push_back(sourceJson(s, in.combined));
     j["sources"] = std::move(arr);
+    return j;
+}
 
-    return dumpJson(j, pretty);
+std::string renderStatusJson(const StatusInput& in, bool pretty) {
+    return dumpJson(statusJson(in), pretty);
+}
+
+json sourceJson(const SourceSnapshot& s, const Combined& combined) {
+    json o;
+    o["name"] = s.name;
+    o["kind"] = sourceKindName(s.kind);
+    o["primary_class"] = s.primaryClass;
+    o["url"] = s.url;
+    o["enabled"] = s.enabled;
+    o["active"] = s.active;
+    o["active_reason"] = s.activeReason;
+    // The one question both kinds answer, and the one the Selector asks.
+    o["ready"] = s.ready;
+    o["not_ready_reason"] = s.notReadyReason;
+    o["receiver_name"] = s.receiverName;
+    o["carrier_hz"] = s.carrierHz;
+    o["dial_hz"] = s.dialHz;
+    o["format"] = formatName(s.format);
+    o["weight"] = s.weight;
+    {
+        const auto used = std::find(combined.usedNames.begin(), combined.usedNames.end(),
+                                    s.name) != combined.usedNames.end();
+        const auto why = combined.notUsedReasons.find(s.name);
+        o["in_use"] = used;
+        o["not_used_reason"] = why != combined.notUsedReasons.end()
+                                   ? json(why->second) : json(nullptr);
+    }
+    // Against the others of its kind, as the consensus judges it; null when it
+    // is not in the comparison.
+    o["agreement"] = nullptr;
+    for (const SourceResidual& r : combined.residuals) {
+        if (r.name != s.name) continue;
+        o["agreement"] = {{"residual_ms", r.averagedSec * 1000.0},
+                          {"instant_ms", r.instantSec * 1000.0},
+                          {"peers", r.peers},
+                          {"settled_for_seconds", r.settledForSec},
+                          {"refused", r.refused}};
+    }
+
+    json link;
+    link["state"] = linkStateName(s.link);
+    link["detail"] = s.linkDetail;
+    link["age_seconds"] = s.linkAgeSec;
+    link["last_audio_age_seconds"] = s.lastAudioAgeSec;
+    link["packets"] = s.packets;
+    link["audio_bytes"] = s.audioBytes;
+    link["decode_errors"] = s.decodeErrors;
+    link["connect_attempts"] = s.connectAttempts;
+    link["reacquisitions"] = s.reacquisitions;
+    link["http_rtt_ms"] = s.httpRttMs;
+    o["link"] = std::move(link);
+
+    json audio;
+    audio["sample_rate"] = s.sampleRate;
+    audio["baseband_power_dbfs"] = s.basebandPowerDb;
+    audio["noise_dbfs"] = s.noiseDb;
+    if (s.basebandPowerDb > -998.0 && s.noiseDb > -998.0)
+        audio["snr_db"] = s.basebandPowerDb - s.noiseDb;
+    o["audio"] = std::move(audio);
+
+    json dec;
+    dec["state"] = s.clockState;
+    dec["station"] = s.station;
+    dec["stage"] = funnelStage(s);
+    dec["tone_snr_db"] = s.toneSnrDb;
+    dec["tone_detected"] = s.toneDetected;
+    // Which station the tick is really from: + leans WWV, - leans WWVH.
+    dec["tick_band_ratio_db"] = std::isfinite(s.tickBandRatioDb)
+                                    ? json(s.tickBandRatioDb) : json(nullptr);
+    dec["phase_locked"] = s.phaseLocked;
+    // NaN has no JSON spelling and the decoder really does report it for a
+    // delay estimate that has not settled, so it becomes null rather than
+    // producing a document no parser will accept.
+    if (std::isfinite(s.delayEstMs)) dec["delay_est_ms"] = s.delayEstMs;
+    else dec["delay_est_ms"] = nullptr;
+    dec["anchored"] = s.anchored;
+    dec["bad_frame_streak"] = s.badFrameStreak;
+    dec["frames_in_window"] = s.framesInWindow;
+    dec["window_size"] = s.windowSize;
+    dec["vote_quality"] = s.voteQuality;
+    dec["refusal"] = s.refusal;
+    dec["audio_seconds"] = s.sampleRate ? static_cast<double>(s.samplesConsumed) / s.sampleRate : 0.0;
+    dec["last_quality"] = s.lastQuality;
+    dec["last_decoded_utc"] = s.lastDecodedUtc;
+    dec["last_decode_age_seconds"] = s.lastTimeAgeSec;
+    dec["time_check"] = s.timeCheck;
+    dec["time_rejections"] = s.timeRejections;
+    dec["time_adoptions"] = s.timeAdoptions;
+    if (s.timeRejections) {
+        dec["last_rejected_utc"] = s.lastRejectedUtc;
+        dec["last_rejected_jump_seconds"] = s.lastRejectedJumpSec;
+    } else {
+        dec["last_rejected_utc"] = nullptr;
+        dec["last_rejected_jump_seconds"] = nullptr;
+    }
+    dec["leap_pending"] = s.leapPending;
+    dec["dut1_seconds"] = s.dut1Tenths / 10.0;
+    o["decoder"] = std::move(dec);
+
+    json t;
+    t["have_offset"] = s.haveOffset;
+    t["offset_ms"] = s.hostOffsetSec * 1000.0;
+    t["raw_offset_ms"] = s.rawOffsetSec * 1000.0;
+    t["clock_offset_ms"] = s.offsetSec * 1000.0;
+    t["rate_ppm"] = s.offsetRate * 1e6;
+    t["rate_uncertainty_ppm"] = s.offsetRateUncertainty * 1e6;
+    t["rate_measured"] = s.offsetRateMeasured;
+    t["rate_span_seconds"] = s.offsetRateSpanSec;
+    t["rate_term_ms"] = s.rateTermSec * 1000.0;
+    t["jitter_ms"] = s.jitterSec * 1000.0;
+    t["dispersion_ms"] = s.dispersionSec * 1000.0;
+    t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
+    t["ws_rtt_ms"] = s.wsRttMs;
+    t["rtt_from_websocket"] = s.rttFromWs;
+    t["http_rtt_ms"] = s.httpRttMs;
+    t["age_seconds"] = s.offsetAgeSec;
+    t["samples"] = s.offsetSamples;
+    o["timing"] = std::move(t);
+
+    json d;
+    d["total_ms"] = s.delaySec * 1000.0;
+    d["propagation_ms"] = s.propagationSec * 1000.0;
+    d["network_ms"] = s.networkSec * 1000.0;
+    d["codec_ms"] = s.codecSec * 1000.0;
+    d["chain_ms"] = s.chainSec * 1000.0;
+    d["decoder_bias_ms"] = s.decoderSec * 1000.0;
+    d["configured_ms"] = s.extraSec * 1000.0;
+    d["path"] = s.pathDescription;
+    if (s.receiverLocation.valid) {
+        d["receiver_lat"] = s.receiverLocation.lat;
+        d["receiver_lon"] = s.receiverLocation.lon;
+    }
+    o["delay"] = std::move(d);
+
+    json sc;
+    sc["fitted"] = s.clockFitValid;
+    sc["residual_ms"] = s.clockResidualSec * 1000.0;
+    sc["span_seconds"] = s.clockSpanSec;
+    sc["ppm"] = s.clockPpm;
+    sc["slope_uncertainty_ms"] = s.clockSlopeUncSec * 1000.0;
+    sc["slope_held"] = s.clockSlopeHeld;
+    sc["last_excess_delay_ms"] = s.lastExcessDelaySec * 1000.0;
+    o["sample_clock"] = std::move(sc);
+
+    // Present only for an upstream peer: for a receiver every field in it
+    // would be a zero that a reader could mistake for a measurement.
+    if (s.kind == SourceKind::Ntp) {
+        const NtpPeerInfo& n = s.ntp;
+        json p;
+        p["server"] = n.server;
+        p["address"] = n.address;
+        p["address_host"] = n.addressHost;
+        p["port"] = n.port;
+        p["stratum"] = n.stratum;
+        p["refid"] = n.refid;
+        p["leap"] = n.leap;
+        p["root_delay_ms"] = n.rootDelaySec * 1000.0;
+        p["root_dispersion_ms"] = n.rootDispersionSec * 1000.0;
+        p["root_distance_ms"] = n.rootDistanceSec * 1000.0;
+        p["server_precision_us"] = n.serverPrecisionSec * 1e6;
+        p["poll_seconds"] = n.pollSec;
+        p["delay_ms"] = n.delaySec * 1000.0;
+        p["filter_jitter_ms"] = n.filterJitterSec * 1000.0;
+        p["reach"] = n.reach;
+        // The octal byte every other NTP implementation prints, because
+        // that is the form people recognise: 377 is eight polls of eight.
+        {
+            char b[8];
+            std::snprintf(b, sizeof b, "%03o", n.reach);
+            p["reach_octal"] = b;
+        }
+        p["last_reply_age_seconds"] = n.lastReplyAgeSec;
+        p["sent"] = n.sent;
+        p["received"] = n.received;
+        p["rejected"] = n.rejected;
+        p["spikes"] = n.spikes;
+        p["max_root_distance_ms"] = n.maxRootDistanceSec * 1000.0;
+        p["max_stratum"] = n.maxStratum;
+        p["configured_poll_seconds"] = n.configuredPollSec;
+        p["last_reject_reason"] = n.lastRejectReason;
+        p["kiss_code"] = n.kissCode;
+        p["stopped"] = n.stopped;
+        o["ntp"] = std::move(p);
+    }
+
+    return o;
 }
 
 } // namespace ubersdr_ntp

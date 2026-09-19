@@ -210,19 +210,7 @@ std::string eventLogJson(const EventLog* log, const std::string& query, bool pre
             if (!wantKind.empty() && (!e.haveKind || wantKind != sourceKindName(e.kind))) continue;
             if (static_cast<int>(info.severity) < minSev) continue;
 
-            const long long ms = static_cast<long long>(std::llround(e.unix * 1000.0));
-            nlohmann::json o;
-            o["id"] = e.id;
-            o["unix"] = e.unix;
-            o["utc"] = iso8601(ms);
-            o["uptime_seconds"] = e.uptimeSec;
-            o["type"] = info.name;
-            o["category"] = info.category;
-            o["severity"] = eventSeverityName(info.severity);
-            o["source"] = e.source.empty() ? nlohmann::json(nullptr) : nlohmann::json(e.source);
-            o["kind"] = e.haveKind ? nlohmann::json(sourceKindName(e.kind)) : nlohmann::json(nullptr);
-            o["message"] = e.message;
-            events.push_back(std::move(o));
+            events.push_back(eventJson(e));
         }
     }
     j["events"] = std::move(events);

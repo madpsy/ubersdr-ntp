@@ -279,6 +279,19 @@ struct HttpConfig {
     int port = 1234;
 };
 
+// Publishing to MQTT through UberSDR's addon ingest port (see Mqtt.h).
+//
+// On by default and needing nothing set, as in the receiver's other addons:
+// with no ingest port to reach, or none that recognises this machine, it stays
+// dormant and costs one refused connection every thirty seconds. The URL is
+// only for a receiver whose operator moved the port or whose container is not
+// called "ubersdr"; the environment variable UBERSDR_INGEST_URL overrides it,
+// which is the spelling the other addons read.
+struct MqttConfig {
+    bool enabled = true;
+    std::string ingestUrl = "http://ubersdr:6926";
+};
+
 struct LogConfig {
     std::string file;                  // empty: no file
     LogLevel level = LogLevel::Info;
@@ -290,6 +303,7 @@ struct Config {
     LogConfig log;
     NtpConfig ntp;
     HttpConfig http;
+    MqttConfig mqtt;
     ClockConfig clock;
     std::vector<SourceConfig> sources;
     std::vector<NtpSourceConfig> ntpSources;

@@ -149,9 +149,10 @@ sudo apt-get install -y libopus0 libcurl4 libssl3
 
 `build.sh` runs `tools/selftest.py` against each release binary — it drives the
 real NTP socket and the real HTTP service, including synchronising from an
-upstream NTP server (a fake one on the loopback, so it needs no network). The
-rest are offline, need no receiver and no network, and are built alongside the
-daemon:
+upstream NTP server (a fake one on the loopback, so it needs no network) and
+publishing to MQTT through a fake of UberSDR's addon ingest port that applies
+the receiver's own validation to every topic and entity. The rest are offline,
+need no receiver and no network, and are built alongside the daemon:
 
 ```bash
 ./build-native/ubersdr-ntp-decodertest   # the DSP: synthesised WWV/WWVH/WWVB
@@ -946,7 +947,8 @@ label and filter without knowing the vocabulary in advance:
   "types": [ { "type": "failover", "label": "Failed over", "category": "class",
                "severity": "warning", "description": "…" }, … ],
   "events": [ { "id": 7, "utc": "2026-09-17T00:34:48Z", "unix": 1789605288.1,
-                "uptime_seconds": 10.3, "type": "failover", "category": "class",
+                "uptime_seconds": 10.3, "type": "failover", "label": "Failed over",
+                "category": "class",
                 "severity": "warning", "source": null, "kind": "ntp",
                 "message": "serving from the ntp sources: …" }, … ]
 }
@@ -978,9 +980,18 @@ from, and a `clock` object carries the arrangement and the headline figure:
   "class_delta": {                   // the radio delay model's absolute error
     "valid": true, "delta_ms": 0.42, "instant_ms": 0.07,
     "settled_for_seconds": 1412, "primary_sources": 2, "secondary_sources": 2
-  }
+  },
+  "primary_median_ms": -0.31,        // each class's median offset; null with
+  "secondary_median_ms": -0.73       // nothing ready in it
 }
 ```
+
+Alongside it, `events` carries the newest event's id and how many of each
+[type](#events) there have been since startup — not bounded by the event log's
+hundred, so a failover last week still counts — and `http.stream_clients` how
+many pages and other followers hold `/api/events` open. Each source carries its
+`agreement` with the others of its kind: the residual the consensus judges it
+on, or `null` when it is not in the comparison.
 
 The same summary rides on every one-second `tick` event, so a display follows a
 failover as it happens rather than at the next 5 s `status`.
@@ -1044,6 +1055,132 @@ curl -N http://127.0.0.1:1234/api/events
 The `tick` fires on the corrected second boundary, so a display driven from it
 ticks with WWV rather than with the machine it is running on — and keeps doing so
 across a change in the offset, because the boundary moves with the correction.
+
+## MQTT and Home Assistant
+
+Running beside an UberSDR receiver that has MQTT enabled, this publishes through
+the receiver's own MQTT connection, and appears in Home Assistant as a device of
+its own, nested under the receiver. **There is nothing to configure**: it uses
+UberSDR's addon ingest port, as the receiver's other addons do, which knows who
+is calling from the TCP connection itself — there is no broker address, no
+credential and no topic to set.
+
+Where there is no such port to reach — MQTT off on the receiver, or no receiver
+beside it — or where the port does not recognise this machine as an installed
+addon, it says so once in the log, stays dormant, and asks again every 30 s, so
+it starts publishing by itself when the receiver comes up. Nothing about it can
+stop time being served: it runs on a thread of its own, and no failure there is
+fatal.
+
+### Topics
+
+Under the receiver's topic prefix, `ubersdr/metrics` by default:
+
+| Topic | Retained | Contents |
+|---|---|---|
+| `…/addons/ntp/summary` | yes | The served time, the two classes, the NTP server's counters, a line per source and the newest event. Every 30 s, and within seconds of any event |
+| `…/addons/ntp/source/<name>` | yes | Everything `/api/status` says about one source. Every 30 s |
+| `…/addons/ntp/events` | no | Every [event](#events), once and in order, in the `/api/eventlog` shape |
+| `…/addons/ntp/status` | yes | `online` / `offline`, maintained by UberSDR |
+
+`ntp` is whatever name the receiver's `addons.yaml` gives this addon.
+`<name>` is the source's name folded to what a topic allows — lowercase letters,
+digits, `-` and `_` — so `Local 10 MHz` is `source/local-10-mhz`; the
+summary's line for each source names its topic.
+
+Between them the summary and the source topics carry every field of
+`/api/status` — the self-test checks that, key by key. The summary is
+`/api/status` without its `sources` array, plus:
+
+```json
+{
+  "time_utc": "2026-09-19T00:55:57Z",
+  "started_utc": "2026-09-18T21:12:04Z",
+  "ntp": { "requests": 48213, "requests_per_minute": 31.5, "…": "…" },
+  "sources": {
+    "local-10": { "kind": "radio", "state": "live", "in_use": true, "ready": true,
+                  "stage": "locked", "link": "streaming", "offset_vs_served_ms": 0.42,
+                  "not_used_reason": null, "topic": "source/local-10" },
+    "cloudflare": { "kind": "ntp", "state": "standby", "…": "…" }
+  },
+  "counts": { "radio": 2, "radio_ready": 2, "ntp": 1, "ntp_ready": 1 },
+  "last_event": { "type": "source_ready", "message": "…", "…": "…" },
+  "mqtt": { "events_pending": 0, "events_lost": 0 }
+}
+```
+
+`state` is the status page diagram's: `live` feeds the served time, `standby`
+is measured but held out of it, `down` is neither.
+
+No event is dropped to save the rate limit: one that does not fit waits its
+turn, one the receiver could not pass on — its broker down — is sent again, and
+those recorded while the receiver was unreachable are sent when it comes back,
+each stamped with when it happened. `mqtt.events_pending` is how many are
+waiting. The only way to lose one is for the event log to overwrite it first,
+more than a hundred behind, and `mqtt.events_lost` counts those.
+
+### Staying inside the receiver's limit
+
+The receiver allows an addon 120 publishes a minute by default and refuses the
+rest. This reads the actual figure from the port and paces itself to use about
+half of it: the summary twice a minute, plus at most one every 5 s while events
+are arriving; events from a bucket of their own a quarter of the limit deep,
+which they wait for rather than being dropped; and the source topics every
+30 s, stretched as sources are added so that all of them together fit in what
+is left. A publish refused for the rate (429), or because the receiver's broker
+is down (503), holds everything for 15 s.
+
+### Home Assistant
+
+When the receiver has Home Assistant discovery on, these are declared at
+connection, all reading the one retained summary, so they have values the moment
+Home Assistant subscribes:
+
+| Entity | Type | Notes |
+|---|---|---|
+| Synchronised | binary sensor | Attributes: why not, and the reference id |
+| Stratum | sensor | 16 while unsynchronised |
+| Serving | sensor | `primary`, `secondary`, `both`, `coasting` or `none`; the arrangement as attributes |
+| Failed Over | binary sensor | Problem: the secondary class is serving |
+| Host Clock Offset | sensor | ms; the correction this host would need |
+| Root Dispersion | sensor | ms; how far out the served time could be |
+| Sources In Use | sensor | Each source's line from the summary as attributes |
+| Receivers Locked | sensor | Radio sources usable now |
+| Upstream Servers Usable | sensor | NTP sources usable now |
+| Class Delta | sensor | ms; [the difference between the classes](#the-difference-between-the-classes-is-the-interesting-number), while both are measured |
+| NTP Requests | sensor | Running total, `total_increasing` |
+| NTP Request Rate | sensor | Requests a minute |
+| Failovers | sensor | Since startup, `total_increasing` |
+| Decoded Times Refused | sensor | Misread time codes caught since startup, `total_increasing` |
+| Leap Second Pending | binary sensor | |
+| Last Event | sensor | The message; the whole event as attributes |
+| Reference Age, Clock Drift, Reference, Started | sensors | Diagnostic |
+
+The version is on the device card rather than an entity of its own.
+
+A figure with nothing to show yet — the offset before the first measurement,
+the class delta while only one class is measured — is left `unknown` rather than
+shown as a zero that was never measured. Per-source entities are left out
+deliberately: their number would grow with the configuration and the receiver
+caps an addon at 20. Each source's state is an attribute of Sources In Use, and
+its full record is on its own topic.
+
+Entities go unavailable when either the receiver or this stops publishing, so a
+dead daemon shows as unavailable rather than leaving a stale "synchronised"
+looking current.
+
+### Overriding the endpoint
+
+Only needed where the receiver's container is not called `ubersdr`, or its
+operator has moved the port from 6926:
+
+```jsonc
+"mqtt": { "ingest_url": "http://ubersdr:6926" }   // or "enabled": false
+```
+
+The environment variable `UBERSDR_INGEST_URL` overrides it, as it does for the
+receiver's other addons. The ingest API itself is `addon_mqtt.md` in the
+ka9q_ubersdr repository.
 
 ## What is in here from elsewhere
 
