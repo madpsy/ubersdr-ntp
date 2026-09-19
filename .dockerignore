@@ -1,0 +1,7 @@
+# Same exclusions docker.sh applies when it stages the context.
+.git
+build
+build-*
+ubersdr-ntp_*
+config.json
+**/__pycache__

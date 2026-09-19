@@ -340,13 +340,13 @@ tr.fresh td { animation:fresh 4s ease-out; }
   <div id="detail"></div>
 
   <div class="foot">
-    <code><a href="/api/events">/api/events</a></code> one event per corrected second &middot;
-    <code><a href="/api/time">/api/time</a></code> the time &middot;
-    <code><a href="/api/status">/api/status</a></code> everything &middot;
-    <code><a href="/api/sources">/api/sources</a></code> &middot;
-    <code><a href="/api/health">/api/health</a></code> &middot;
-    <code><a href="/api/eventlog">/api/eventlog</a></code> the last 100 events &middot;
-    <code><a href="/api/metrics?pretty=1">/api/metrics</a></code> history
+    <code><a href="api/events">/api/events</a></code> one event per corrected second &middot;
+    <code><a href="api/time">/api/time</a></code> the time &middot;
+    <code><a href="api/status">/api/status</a></code> everything &middot;
+    <code><a href="api/sources">/api/sources</a></code> &middot;
+    <code><a href="api/health">/api/health</a></code> &middot;
+    <code><a href="api/eventlog">/api/eventlog</a></code> the last 100 events &middot;
+    <code><a href="api/metrics?pretty=1">/api/metrics</a></code> history
   </div>
 </div>
 
@@ -518,7 +518,7 @@ async function timingFor(url) {
 }
 
 async function takeSample() {
-  const url = new URL("/api/time?seq=" + (++seq), location.href).href;
+  const url = new URL("api/time?seq=" + (++seq), location.href).href;
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), kFetchTimeoutMs);
   let d, t0, t3;
@@ -1105,7 +1105,7 @@ async function fetchEvents() {
   if (evFetching) return;
   evFetching = true;
   try {
-    const r = await fetch("/api/eventlog?pretty=0", { cache: "no-store" });
+    const r = await fetch("api/eventlog?pretty=0", { cache: "no-store" });
     const d = await r.json();
     if (!Object.keys(evTypes).length) buildTypeFilter(d.types);
     // Rows newer than what was already on the page flash once, but not on the
@@ -1736,7 +1736,7 @@ async function fetchMetrics() {
   mFetching = true;
   const range = mRange;
   try {
-    const r = await fetch("/api/metrics?range=" + range, { cache: "no-store" });
+    const r = await fetch("api/metrics?range=" + range, { cache: "no-store" });
     const d = await r.json();
     if (range === mRange) { mData = d; renderMetrics(); }
   } catch (x) {
@@ -1804,7 +1804,7 @@ function connect() {
   if (retryTimer) { clearTimeout(retryTimer); retryTimer = 0; }
   drop();
   lastEventAt = Date.now();
-  const s = es = new EventSource("/api/events");
+  const s = es = new EventSource("api/events");
   const alive = () => { if (s === es) lastEventAt = Date.now(); };
   s.addEventListener("open", () => {
     if (s !== es) return;

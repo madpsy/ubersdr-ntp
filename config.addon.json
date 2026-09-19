@@ -1,0 +1,60 @@
+// ubersdr-ntp — configuration for the UberSDR addon container.
+//
+// install.sh puts this at ~/ubersdr/ntp/config/config.json the first time, and
+// never overwrites it after that: edit it there, then ./restart.sh. The same
+// file is built into the image, and used whenever that one is missing.
+//
+// config.example.json in the repository explains every setting at length; this
+// file sets only what differs for the addon, and leaves the rest at defaults.
+{
+  "ntp": {
+    // Inside the container only. The compose file publishes no port for NTP,
+    // so nothing outside the Docker network can reach it yet.
+    "port": 123,
+    "listen": ["0.0.0.0", "::"]
+  },
+
+  "http": {
+    // The status page and JSON API, reached through the receiver at
+    // /addon/ntp/. The receiver's addon proxy entry names this port.
+    "enabled": true,
+    "port": 6099,
+    "listen": "0.0.0.0"
+  },
+
+  // MQTT through the receiver's addon ingest port: nothing to set.
+  "mqtt": {
+    "enabled": true,
+    "ingest_url": "http://ubersdr:6926"
+  },
+
+  "clock": {
+    "primary": "radio",
+    "secondary": "standby"
+  },
+
+  // The other class: measured all the time, used when the radio fails, and
+  // the only absolute check on the radio's delay model. Delete it if this
+  // machine must talk to nothing but the receiver.
+  "ntp_sources": [
+    "time.cloudflare.com"
+  ],
+
+  // The receiver this runs beside, on WWV's three strongest carriers. 5 MHz
+  // carries the night, 15 MHz the day, 10 MHz most of both. Addon containers
+  // are on the receiver's own Docker network, which its default
+  // timeout_bypass_ips exempts from session limits, so no password is needed.
+  // A receiver that does not exempt it wants its bypass password in each one.
+  "sources": [
+    { "name": "local-5",  "url": "http://ubersdr:8080", "carrier_hz": 5000000 },
+    { "name": "local-10", "url": "http://ubersdr:8080", "carrier_hz": 10000000 },
+    { "name": "local-15", "url": "http://ubersdr:8080", "carrier_hz": 15000000 }
+  ],
+
+  "log": {
+    // To stderr, which the compose file sends to the receiver's log collector.
+    "level": "info",
+    "stderr": true,
+    "status_interval_seconds": 30
+  }
+}

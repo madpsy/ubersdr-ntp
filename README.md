@@ -196,6 +196,51 @@ ntpdate -q -p 3 -u 127.0.0.1        # or, on a non-default port:
 chronyc -h 127.0.0.1 -p 12300 tracking
 ```
 
+### As an UberSDR addon
+
+On a machine running an [UberSDR](https://ubersdr.org) receiver, it installs as
+an addon container beside it, like the receiver's other addons:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/madpsy/ubersdr-ntp/main/install.sh | bash
+```
+
+That sets up `~/ubersdr/ntp/` with the compose file, the start/stop/restart/update
+scripts and `config/config.json`. Out of the box it listens to the local
+receiver on WWV's 5, 10 and 15 MHz, with `time.cloudflare.com` as its network
+reference — see `config.addon.json`. The addon container is on the receiver's
+own Docker network, which UberSDR's default `timeout_bypass_ips` exempts from
+session limits, so it needs no password. Edit `config/config.json` and
+`./restart.sh` to change any of it; `install.sh` never overwrites that file.
+
+Then add it under **UberSDR Admin → Addon Proxies** (or from `addons.json`):
+
+| Field | Value |
+|---|---|
+| Name | `ntp` |
+| Host | `ntp` |
+| Port | `6099` |
+| Enabled | `true` |
+| Strip prefix | `true` |
+| Rate limit | `100` |
+
+The status page is then at `http://your-ubersdr-host/addon/ntp/`. The page
+addresses the API relatively, so it works the same there as at the root of its
+own port. It publishes to MQTT and Home Assistant through the receiver with no
+further setup ([MQTT and Home Assistant](#mqtt-and-home-assistant)).
+
+**NTP itself is not published yet.** The container listens on 123/udp inside
+the Docker network only; the compose file has no `ports:` section at all.
+
+The images are multi-architecture, amd64 and arm64, built from source on
+`ubuntu:24.04`:
+
+```bash
+./docker.sh build     # linux/amd64, loaded locally
+./docker.sh arm64     # linux/arm64, loaded locally
+./docker.sh push      # both, as one manifest, to madpsy/ubersdr-ntp:latest
+```
+
 ### As a service
 
 A hardened unit is in [`systemd/ubersdr-ntp.service`](systemd/ubersdr-ntp.service).

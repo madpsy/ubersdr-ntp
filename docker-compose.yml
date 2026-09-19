@@ -1,0 +1,47 @@
+services:
+  ubersdr-ntp:
+    image: madpsy/ubersdr-ntp:latest
+    container_name: ntp
+    restart: unless-stopped
+    cpu_shares: 512
+    environment:
+      # Every setting is in ./config/config.json — the receivers, frequencies,
+      # upstream NTP servers and ports. Edit it there, then ./restart.sh.
+      #
+      # These are optional overrides; uncomment to use.
+      #
+      # Status page / JSON API port (default: 6099, which the receiver's addon
+      # proxy entry expects — change both together or neither).
+      # WEB_PORT: "6099"
+      #
+      # trace, debug, info, warn or error (default: info).
+      # LOG_LEVEL: "info"
+      #
+      # UberSDR's addon MQTT ingest port, only if the operator moved it from
+      # 6926. MQTT needs no other setting.
+      # UBERSDR_INGEST_URL: "http://ubersdr:6926"
+    #
+    # No ports: section, deliberately. The status page is reached through the
+    # receiver at /addon/ntp/, over the sdr-network. NTP itself (123/udp) is
+    # not published to the host or the internet yet: it listens only inside
+    # this container's network.
+    sysctls:
+      # Lets the unprivileged user inside bind NTP's port 123. Docker sets this
+      # by default for a container's own network namespace; stated here so it
+      # does not depend on that.
+      net.ipv4.ip_unprivileged_port_start: 0
+    networks:
+      - sdr-network
+    volumes:
+      - ./config:/config:ro
+    logging:
+      driver: "fluentd"
+      options:
+        fluentd-address: "127.0.0.1:24224"
+        fluentd-async: "true"
+        tag: "ntp"
+
+networks:
+  sdr-network:
+    external: true
+    name: ubersdr_sdr-network
