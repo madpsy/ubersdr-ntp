@@ -4,22 +4,24 @@ services:
     container_name: ntp
     restart: unless-stopped
     cpu_shares: 512
-    environment:
-      # Every setting is in ./config/config.json — the receivers, frequencies,
-      # upstream NTP servers and ports. Edit it there, then ./restart.sh.
-      #
-      # These are optional overrides; uncomment to use.
-      #
-      # Status page / JSON API port (default: 6099, which the receiver's addon
-      # proxy entry expects — change both together or neither).
-      # WEB_PORT: "6099"
-      #
-      # trace, debug, info, warn or error (default: info).
-      # LOG_LEVEL: "info"
-      #
-      # UberSDR's addon MQTT ingest port, only if the operator moved it from
-      # 6926. MQTT needs no other setting.
-      # UBERSDR_INGEST_URL: "http://ubersdr:6926"
+    # Every setting is in ./config/config.json — the receivers, frequencies,
+    # upstream NTP servers and ports. Edit it there, then ./restart.sh.
+    #
+    # These are optional overrides. To use one, uncomment the environment:
+    # line as well as the setting: left on its own, with nothing under it,
+    # that line is an empty value and Compose refuses the whole file.
+    #
+    # environment:
+    #   # Status page / JSON API port (default: 6099, which the receiver's
+    #   # addon proxy entry expects — change both together or neither).
+    #   WEB_PORT: "6099"
+    #
+    #   # trace, debug, info, warn or error (default: info).
+    #   LOG_LEVEL: "info"
+    #
+    #   # UberSDR's addon MQTT ingest port, only if the operator moved it
+    #   # from 6926. MQTT needs no other setting.
+    #   UBERSDR_INGEST_URL: "http://ubersdr:6926"
     #
     # No ports: section, deliberately. The status page is reached through the
     # receiver at /addon/ntp/, over the sdr-network. NTP itself (123/udp) is
