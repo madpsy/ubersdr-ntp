@@ -207,8 +207,9 @@ curl -fsSL https://raw.githubusercontent.com/madpsy/ubersdr-ntp/main/install.sh 
 
 That sets up `~/ubersdr/ntp/` with the compose file, the start/stop/restart/update
 scripts and `config/config.json`. Out of the box it listens to the local
-receiver on WWV's 5, 10 and 15 MHz, with `time.cloudflare.com` as its network
-reference — see `config.addon.json`. The addon container is on the receiver's
+receiver on WWV's 5, 10 and 15 MHz, with `time.cloudflare.com` and two fixed
+NIST servers as its network reference — three, because one upstream cannot be
+checked against anything; see `config.addon.json`. The addon container is on the receiver's
 own Docker network, which UberSDR's default `timeout_bypass_ips` exempts from
 session limits, so it needs no password. Edit `config/config.json` and
 `./restart.sh` to change any of it; `install.sh` never overwrites that file.
