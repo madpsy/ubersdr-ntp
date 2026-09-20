@@ -62,6 +62,15 @@ public:
     virtual void setActive(bool on, const std::string& why) = 0;
     virtual bool active() const = 0;
 
+    // The daemon clock's drift against UTC, as the combination currently knows
+    // it, handed down every pass. One crystal, one rate: a source that cannot
+    // fit it from its own samples uses this instead of assuming zero. See
+    // OffsetEstimator::setRatePrior for why assuming zero was expensive.
+    //
+    // Sources that fit their own rate ignore it, and a source using it is kept
+    // out of the average it came from, so this only ever flows downwards.
+    virtual void setSystemRate(double /*rateSec*/, double /*uncertaintySec*/, bool /*known*/) {}
+
     // The decoded times refused since the last call, as how far each was from
     // what the source's own history says the time is, in seconds -- and then
     // forgotten, so the caller sees each one once. For the history chart: a

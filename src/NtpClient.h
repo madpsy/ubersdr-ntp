@@ -132,6 +132,7 @@ public:
     void requestReacquire(const std::string& why) override;
 
     void setActive(bool on, const std::string& why) override;
+    void setSystemRate(double rateSec, double uncertaintySec, bool known) override;
     bool active() const override { return m_active.load(); }
 
 private:

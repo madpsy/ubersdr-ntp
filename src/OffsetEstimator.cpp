@@ -235,9 +235,18 @@ void OffsetEstimator::recompute() {
 
     const bool measured = fit.ok && std::abs(fit.slope) <= kMaxRatePpm * 1e-6 &&
                           fit.slopeSe <= kMaxMeasuredUncertaintyPpm * 1e-6;
+    // Own fit first; the system's rate when there is not one yet. Zero only
+    // when nothing anywhere knows the drift -- which is the first minutes after
+    // a start and nothing else. See setRatePrior for what this cost.
     m_est.rateMeasured = measured;
-    m_est.rate = measured ? fit.slope : 0.0;
-    m_est.rateUncertainty = measured ? fit.slopeSe : kUnmeasuredRatePpm * 1e-6;
+    m_est.rateFromPrior = !measured && m_priorKnown;
+    m_est.rate = measured ? fit.slope : (m_est.rateFromPrior ? m_priorRate : 0.0);
+    // A borrowed rate carries the lender's uncertainty, not the bound: it is
+    // the same crystal, and pretending otherwise would put 50 ppm of invented
+    // doubt into a dispersion that the system already knows to 0.5.
+    m_est.rateUncertainty = measured       ? fit.slopeSe
+                          : m_est.rateFromPrior ? m_priorUncertainty
+                                                : kUnmeasuredRatePpm * 1e-6;
     m_est.rateSpanSec = fit.ok ? fit.span : 0.0;
     m_est.rateSamples = fit.ok ? fit.kept : 0;
     m_est.levelShifts = m_levelShifts;

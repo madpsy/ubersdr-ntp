@@ -97,7 +97,8 @@ struct OffsetEstimate {
     double offsetSec = 0.0;      // UTC minus the daemon clock at atSec
     double jitterSec = 0.0;      // spread of the level window about the rate line (1.4826 MAD)
 
-    bool rateMeasured = false;   // false: rate is taken as zero and rateUncertainty is the bound
+    bool rateMeasured = false;   // fitted from THIS source's own samples
+    bool rateFromPrior = false;  // not fitted here; borrowed from the system (setRatePrior)
     double rate = 0.0;           // d(offset)/d(daemon time); 1e-6 is 1 ppm
     double rateUncertainty = 0.0;
     double rateSpanSec = 0.0;    // how much time the rate was fitted over
@@ -118,6 +119,33 @@ public:
     bool empty() const { return m_samples.empty(); }
     double newestAt() const { return m_newestAt; }
 
+    // THE CRYSTAL'S DRIFT IS ONE NUMBER, NOT ONE PER SOURCE
+    //
+    // Every source here measures the same physical thing: UTC against this
+    // daemon's clock. The Selector's combine says so in as many words, and
+    // averages the sources' rates because of it. But a source that cannot fit
+    // the rate from its own samples used to assume ZERO, and that is not a
+    // neutral assumption -- it is a claim that a crystal known to be running
+    // 26 ppm fast is perfect.
+    //
+    // It cost about 7 ms. A peer polled every 64 s gets a 512-second level
+    // window (forPollInterval above), the daemon clock moves 13 ms across that
+    // window at 26 ppm, and a median through samples carried forward at a rate
+    // of zero lands half the ramp behind the newest one. The radio sources,
+    // sampling every second, fit their own rate in minutes and never showed it.
+    // The peer needed two hours to fit one, and read 7 ms late until it did --
+    // which then looked exactly like the radio being 7 ms early.
+    //
+    // So: a source that has not fitted a rate borrows the one the system has
+    // already determined. `rateMeasured` stays false, which keeps it out of the
+    // Selector's rate average, so nothing here is circular -- it consumes that
+    // average, it does not feed it.
+    void setRatePrior(double rateSec, double uncertaintySec, bool known) {
+        m_priorRate = rateSec;
+        m_priorUncertainty = uncertaintySec;
+        m_priorKnown = known;
+    }
+
     // Recomputed only when a sample has arrived since the last call.
     const OffsetEstimate& estimate();
 
@@ -132,6 +160,11 @@ private:
     bool m_dirty = true;
     int m_levelShifts = 0;
     OffsetEstimate m_est;
+
+    // The system's rate, handed in from outside; see setRatePrior.
+    double m_priorRate = 0.0;
+    double m_priorUncertainty = 0.0;
+    bool m_priorKnown = false;
 };
 
 } // namespace ubersdr_ntp

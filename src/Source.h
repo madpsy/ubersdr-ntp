@@ -84,6 +84,7 @@ public:
     // be holding one of them. Coming back costs a full acquisition -- about
     // five minutes of clean signal -- which is the price of the mode.
     void setActive(bool on, const std::string& why) override;
+    void setSystemRate(double rateSec, double uncertaintySec, bool known) override;
     bool active() const override { return m_active.load(); }
 
 private:

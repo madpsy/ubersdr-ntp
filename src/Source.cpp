@@ -1952,6 +1952,14 @@ void Source::updateDelayModel() {
 
 // ---------------------------------------------------------------------------
 
+// One crystal, one rate: see TimeSource::setSystemRate. Cheap enough to do on
+// every pass -- it only writes three doubles -- and the estimator picks it up
+// at its next recompute.
+void Source::setSystemRate(double rateSec, double uncertaintySec, bool known) {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_offsets.setRatePrior(rateSec, uncertaintySec, known);
+}
+
 void Source::requestReacquire(const std::string& why) {
     {
         std::lock_guard<std::mutex> lk(m_mu);

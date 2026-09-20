@@ -72,6 +72,60 @@ struct EdgeNoise {
     }
 };
 
+// A slow-polled peer on a drifting crystal: the 7 ms bug, and the fix.
+//
+// An upstream NTP peer polled every 64 s gets a 512-second level window
+// (OffsetTuning::forPollInterval) and cannot fit its own rate for over half an
+// hour. Until it does, the level is a median through samples carried forward at
+// whatever rate it believes -- and believing ZERO on a crystal running 26 ppm
+// means the median lands about half the window's drift behind the newest
+// sample. That is ~6.7 ms, it looked exactly like the radio class reading
+// early, and it is what setRatePrior exists to stop.
+void testSlowPeerBorrowsTheRate() {
+    std::printf("\nOffsetEstimator: a peer polled every 64 s, crystal 26 ppm, rate not yet fittable\n");
+    constexpr double kRate = -26e-6;
+    constexpr double kPoll = 64.0;
+    constexpr double t0 = 50000.0, o0 = 0.0;
+    auto truth = [&](double t) { return o0 + kRate * (t - t0); };
+
+    const OffsetTuning t = OffsetTuning::forPollInterval(kPoll);
+    OffsetEstimator without(t), with(t);
+    // What the Selector would already know from the radio sources, which sample
+    // every second and fit this within minutes.
+    with.setRatePrior(kRate, 0.5e-6, true);
+
+    EdgeNoise noise(11, 0.0005);
+    double tEnd = t0;
+    for (int k = 0; k <= 18; ++k) {           // 18 polls ~ 19 min, well short of a fit
+        tEnd = t0 + k * kPoll;
+        const double y = truth(tEnd) + noise();
+        without.add(tEnd, y);
+        with.add(tEnd, y);
+    }
+
+    const OffsetEstimate& a = without.estimate();
+    const OffsetEstimate& b = with.estimate();
+    const double errA = a.offsetAt(tEnd) - truth(tEnd);
+    const double errB = b.offsetAt(tEnd) - truth(tEnd);
+
+    check("neither has fitted its own rate yet", !a.rateMeasured && !b.rateMeasured,
+          "without=%d with=%d", a.rateMeasured, b.rateMeasured);
+    check("without a prior it assumes the crystal is perfect", !a.rateFromPrior && a.rate == 0.0,
+          "rate %+.2f ppm", a.rate * 1e6);
+    check("...and reads milliseconds late because of it", std::abs(errA) > 0.004,
+          "%+.2f ms", errA * 1e3);
+    check("with the system's rate it is marked borrowed", b.rateFromPrior && b.rate == kRate,
+          "fromPrior=%d rate %+.2f ppm", b.rateFromPrior, b.rate * 1e6);
+    check("...and the level is right to under a millisecond", std::abs(errB) < 0.001,
+          "%+.3f ms", errB * 1e3);
+    check("...and it no longer claims 50 ppm of doubt", b.rateUncertainty < 1e-6,
+          "%.2f ppm", b.rateUncertainty * 1e6);
+    check("a borrowed rate is still not a measured one, so the combine ignores it",
+          !b.rateMeasured, "measured=%d", b.rateMeasured);
+    std::printf("        (assuming zero rate here costs %+.2f ms; borrowing it costs %+.3f ms)\n",
+                errA * 1e3, errB * 1e3);
+}
+
 void testDrift() {
     std::printf("\nOffsetEstimator: a crystal 40 ppm fast, 5 ms edge scatter, 2%% outliers at 50 ms\n");
     constexpr double kRate = -40e-6;   // a fast crystal: UTC minus it falls
@@ -1009,6 +1063,7 @@ void testTimeContinuity() {
 int main() {
     std::printf("ubersdr-ntp clock test\n");
     testDrift();
+    testSlowPeerBorrowsTheRate();
     testStep();
     testWander();
     testImplausibleRate();

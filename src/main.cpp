@@ -459,6 +459,13 @@ int main(int argc, char** argv) {
         const auto snaps = snapshots();
         const Combined c = selector.combine(snaps, daemonNow());
 
+        // The daemon clock's drift, back down to every source. One crystal, one
+        // rate: a source sampling too slowly to fit its own borrows this rather
+        // than assuming the clock is perfect, which it measurably is not. Only
+        // sources that have NOT fitted a rate use it, and those are already
+        // excluded from the average it came from, so it cannot feed itself.
+        for (auto& s : sources) s->setSystemRate(c.rate, c.rateUncertainty, c.rateMeasured);
+
         // A source the consensus has refused for long enough is sent back to
         // start over (see kReacquireAfterSec). Without this a decoder holding a
         // steady wrong lock would stay refused until someone restarted the
