@@ -83,14 +83,43 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // to about 1.4 ms: 13.6 ms, equal to the decoder bias above, good to perhaps
 // ±2.5 ms.
 //
-// Refined 2026-09-17 to 12.6 ms against the NTP class, which is the one
-// reference that does not share this term. Over many hours with two receivers
-// in standby against time.cloudflare.com, the radio-minus-NTP difference held
-// between +0.8 and +1.5 ms: the radio put UTC about 1 ms LATE, so the delay it
-// added was about 1 ms too large. A per-path error would not hold that steady
-// across hours and two receivers; a shared constant does, and this is the
-// loosest shared one.
-constexpr double kUberSdrChainDelaySec = 0.0126;
+// Refined 2026-09-17 to 12.6 ms against the NTP class, on a reading of +0.8 to
+// +1.5 ms from two receivers in standby against time.cloudflare.com.
+//
+// WITHDRAWN 2026-09-20, and back up to 14.1 ms. That refinement was the one
+// measurement here ever taken against a reference that was itself wrong: the
+// propagation model was a strict lower bound (Propagation.h explains how, and
+// it is fixed now), so the comparison it was fitted to carried a one-signed
+// deficit of its own. Tuning a constant to cancel a modelling error is how the
+// error survives: it moves from a term that describes the path into one that
+// does not, and stops being visible on any receiver.
+//
+// The new figure comes from 11.5 settled hours of class delta on one receiver
+// at 2516 km, read off /api/metrics in half-hour buckets rather than watched:
+//
+//   mean -1.610 ms, median -1.535, sd 0.819
+//   local day   -1.395 ms      local night  -1.844 ms
+//
+// The 0.45 ms day-night split is the ionosphere and belongs to propagation --
+// the layer climbs after sunset and a fixed height cannot follow it. What is
+// left is flat, present in daylight on a one-hop path where the geometry is
+// best known, and the operator sees the same floor on every instance he has
+// measured. That is this term. Adding the mean back (the 350 km height already
+// returns 0.11 ms of it on this path) puts the constant at 14.1 ms.
+//
+// Which is where it started. The 2026-09-13 measurement said 13.6 +/- 2.5 ms
+// against a host ntpd held to about 1.4 ms, and two routes with nothing in
+// common landing inside half a millisecond of each other is worth more than
+// either on its own.
+//
+// It stays degenerate with the Opus and decoder-edge constants above: the class
+// delta sees only their sum, so charging the difference here is bookkeeping,
+// justified by this being the term defined as the residual and the only one
+// never measured on its own. Running one source as pcm-v4 alongside an Opus one
+// on the same dial would settle the split -- the codec term is the only thing
+// that differs between them -- and until someone does, this is an attribution
+// rather than a measurement.
+constexpr double kUberSdrChainDelaySec = 0.0141;
 
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
