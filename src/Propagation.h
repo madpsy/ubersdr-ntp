@@ -44,20 +44,68 @@ GeoPoint wwvbSite();   // Fort Collins, Colorado
 // Great-circle distance in metres.
 double greatCircleMeters(const GeoPoint& a, const GeoPoint& b);
 
+inline constexpr double kGroundwaveLimitM = 300000.0;   // 300 km
+
+// THIS MODEL IS A LOWER BOUND, AND THAT IS WHY IT NEEDED FIXING
+//
+// Every free choice here used to be made in the direction that shortens the
+// path: the fewest hops that can span the distance, at the lowest plausible
+// reflection height. A real path is never SHORTER than the shortest geometry
+// that can carry it, but it is very often longer -- a higher layer, or one hop
+// more than the minimum. So the error was not zero-mean noise, it was a
+// one-signed deficit, and it showed: the radio class read LATE against the NTP
+// class on every receiver ever measured, never once early.
+//
+// A delay model wants the MEAN over the modes actually carrying the signal,
+// not the floor of their range. The two changes below are both in that
+// direction, and neither was fitted to the NTP comparison -- see Selector.h on
+// why that comparison must stay independent.
+//
+// 350 km, not 300. Mid-latitude F2 sits near 250-300 km by day and climbs to
+// 350-450 km through the night, and higher still as a path approaches its MUF,
+// where the ionogram's nose turns up. 300 km is a fair DAYTIME figure and was
+// being used all hours. 350 km is the honest all-hours average for the outlets
+// these decoders hear, and it is still comfortably inside the band.
+inline constexpr double kVirtualHeightM = 350000.0;
+
+// The lowest takeoff angle a hop is credited with. A ray cannot leave below
+// the local horizon, and an HF antenna over real ground has nothing useful
+// below about 3 degrees. This is what bounds the hop length below.
+inline constexpr double kMinElevationRad = 3.0 * 3.14159265358979323846 / 180.0;
+
+// Longest ground distance one hop can cover, from geometry rather than folklore.
+//
+// The old code carried a hard-coded 4000 km "usual working number for F2"
+// alongside a 300 km height, and those two cannot both be true: at 300 km the
+// geometric maximum is 3836 km even at ZERO elevation, and 3225 km at a usable
+// 3 degrees. Every path between about 3225 and 4000 km was therefore being
+// given one hop where the geometry demands two, and was under-delayed by most
+// of a millisecond -- a pure modelling error, always in the same direction.
+//
+// Derivation. Earth centre O, station A at radius R, reflection point B at
+// radius R+h. The ray leaves A at elevation eps above the local horizon, which
+// is perpendicular to OA, so the interior angle at A is 90 deg + eps. With
+// theta the half-hop arc at O, the remaining angle at B is 90 deg - eps -
+// theta, and the sine rule gives
+//
+//     (R+h) / sin(90 + eps)  =  R / sin(90 - eps - theta)
+//     cos(eps + theta)       =  R cos(eps) / (R + h)
+//     theta                  =  acos( R cos(eps) / (R+h) ) - eps
+//
+// and one hop spans 2*R*theta of ground.
+double maxHopMeters(double virtualHeightM = kVirtualHeightM,
+                    double minElevationRad = kMinElevationRad);
+
 // One-way propagation delay in seconds for a skywave path of this length.
 //
-// virtualHeightM is the reflection height; 300 km is a reasonable all-hours
-// average for the HF outlets. Paths under kGroundwaveLimitM are treated as
-// groundwave and get the great-circle distance at the speed of light.
-double skywaveDelaySeconds(double distanceMeters, double virtualHeightM = 300000.0);
-
-inline constexpr double kGroundwaveLimitM = 300000.0;   // 300 km
-// Longest ground distance one F-layer hop is taken to cover. The real figure
-// depends on the takeoff angle and the layer height; 4000 km is the usual
-// working number for F2.
-inline constexpr double kMaxHopM = 4000000.0;
+// virtualHeightM is the reflection height. Paths under kGroundwaveLimitM are
+// treated as groundwave and get the great-circle distance at the speed of
+// light. Hop count comes from maxHopMeters at the same height, so the two can
+// never again disagree about what the geometry allows.
+double skywaveDelaySeconds(double distanceMeters, double virtualHeightM = kVirtualHeightM);
 
 // A human-readable one-liner for the log: distance, hops and delay.
-std::string describePath(const GeoPoint& rx, const GeoPoint& tx, double virtualHeightM = 300000.0);
+std::string describePath(const GeoPoint& rx, const GeoPoint& tx,
+                         double virtualHeightM = kVirtualHeightM);
 
 } // namespace ubersdr_ntp

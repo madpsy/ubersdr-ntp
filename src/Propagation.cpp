@@ -33,11 +33,31 @@ double greatCircleMeters(const GeoPoint& a, const GeoPoint& b) {
     return 2.0 * kEarthRadiusM * std::asin(std::min(1.0, std::sqrt(h)));
 }
 
+// theta = acos( R cos(eps) / (R+h) ) - eps, and the hop spans 2*R*theta.
+// See Propagation.h for the triangle this comes out of.
+double maxHopMeters(double virtualHeightM, double minElevationRad) {
+    const double Rh = kEarthRadiusM + std::max(1.0, virtualHeightM);
+    const double eps = std::max(0.0, minElevationRad);
+    // R cos(eps) / (R+h) < 1 for any positive height, so the arccos is always
+    // defined; the clamp is there for the degenerate h -> 0 case only.
+    const double c = std::min(1.0, kEarthRadiusM * std::cos(eps) / Rh);
+    const double theta = std::acos(c) - eps;
+    return theta > 0.0 ? 2.0 * kEarthRadiusM * theta : 0.0;
+}
+
+// How many hops this path is taken to need: the fewest that the geometry can
+// actually carry, which is not the same as the fewest that divide the distance.
+int hopCount(double distanceMeters, double virtualHeightM) {
+    const double maxHop = maxHopMeters(virtualHeightM, kMinElevationRad);
+    if (maxHop <= 0.0) return 1;
+    return std::max(1, static_cast<int>(std::ceil(distanceMeters / maxHop)));
+}
+
 double skywaveDelaySeconds(double distanceMeters, double virtualHeightM) {
     if (distanceMeters <= 0.0) return 0.0;
     if (distanceMeters < kGroundwaveLimitM) return distanceMeters / kC;
 
-    const int hops = static_cast<int>(std::ceil(distanceMeters / kMaxHopM));
+    const int hops = hopCount(distanceMeters, virtualHeightM);
     const double groundPerHop = distanceMeters / hops;
 
     // Each hop is up to the reflection point and back down. Half a hop
@@ -56,7 +76,7 @@ std::string describePath(const GeoPoint& rx, const GeoPoint& tx, double virtualH
     if (!rx.valid || !tx.valid) return "path unknown (no receiver coordinates)";
     const double d = greatCircleMeters(rx, tx);
     const double t = skywaveDelaySeconds(d, virtualHeightM);
-    const int hops = d < kGroundwaveLimitM ? 0 : static_cast<int>(std::ceil(d / kMaxHopM));
+    const int hops = d < kGroundwaveLimitM ? 0 : hopCount(d, virtualHeightM);
     char buf[160];
     if (hops == 0) {
         std::snprintf(buf, sizeof buf, "%.0f km groundwave, %.2f ms", d / 1000.0, t * 1000.0);
