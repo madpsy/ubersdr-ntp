@@ -193,6 +193,28 @@ struct NtpConfig {
     // amplifier if left open; the response is the same size as the request so
     // the gain is 1, but a limit still caps what this can be aimed at.
     double rateLimitPerClient = 10.0;
+
+    // Where the daemon clock's fitted frequency is kept between runs. ntpd's
+    // driftfile, and for ntpd's reason: the crystal's rate error is a property
+    // of a piece of hardware, it is the same after a restart as before, and
+    // measuring it takes ten minutes that the clock spends knowing less than it
+    // did yesterday.
+    //
+    // Without it every restart costs a blind window. No source can fit a rate
+    // until it holds minRateSpanSec of its OWN samples, a radio source does not
+    // start collecting until it locks, and an upstream NTP peer polled once a
+    // minute needs half an hour. Until something has fitted one there is no
+    // rate for anything to borrow (see OffsetEstimator::setRatePrior), every
+    // level is carried forward as though the crystal were perfect, and each
+    // class is biased by half its own level window times the true drift. The
+    // two classes have different windows, so the difference between them --
+    // the one measurement here that checks the radio against anything -- reads
+    // several milliseconds out for a quarter of an hour after every start.
+    //
+    // Empty disables it. The default is next to the configuration file, which
+    // is the one directory an operator has already had to make writable and
+    // the one the addon container already mounts.
+    std::string driftFile;
 };
 
 // What the secondary class does while the primary is healthy.

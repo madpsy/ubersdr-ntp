@@ -38,6 +38,20 @@
     "honour_leap_warning": true,
     // Responses per second per client, 0 to disable.
     "rate_limit_per_client": 10.0
+
+    // Where the crystal's fitted frequency is kept between runs -- ntpd's
+    // driftfile, for ntpd's reason. Default: "drift" beside this file. "-"
+    // disables it.
+    //
+    // The rate error is a property of a piece of hardware and does not change
+    // over a restart, but measuring it takes ten minutes, and nothing can
+    // borrow a rate that nothing has fitted yet. Until one exists every level
+    // is carried forward as though the crystal were perfect, and because the
+    // radio and NTP classes have different level windows they are biased by
+    // different amounts -- so the difference between them, the one figure here
+    // that checks the radio against anything, reads several ms out for a
+    // quarter of an hour after every start. This is what removes that.
+    // "drift_file": "/var/lib/ubersdr-ntp/drift"
   },
 
   "http": {

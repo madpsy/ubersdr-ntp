@@ -186,6 +186,7 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         if (!getOpt(n, "answer_when_unsynchronised", c.ntp.answerWhenUnsynchronised, err)) return false;
         if (!getOpt(n, "honour_leap_warning", c.ntp.honourLeapWarning, err)) return false;
         if (!getOpt(n, "rate_limit_per_client", c.ntp.rateLimitPerClient, err)) return false;
+        if (!getOpt(n, "drift_file", c.ntp.driftFile, err)) return false;
         if (auto lit = n.find("listen"); lit != n.end() && !lit->is_null()) {
             if (!getOpt(n, "listen", c.ntp.listen, err)) return false;
         }

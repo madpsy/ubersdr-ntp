@@ -41,6 +41,11 @@
 #include "TimeSource.h"
 #include "Version.h"
 
+#include <cerrno>
+#include <fstream>
+#include <iomanip>
+#include <optional>
+
 #include <curl/curl.h>
 #include <ixwebsocket/IXNetSystem.h>
 
@@ -148,6 +153,82 @@ bool parseSourceSpec(const std::string& spec, ubersdr_ntp::SourceConfig& out, st
     // time-signal carrier this decodes is below 1 kHz.
     out.carrierHz = static_cast<std::uint64_t>(v < 1000.0 ? v * 1e6 : v);
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// The drift file: ntpd's, and for ntpd's reason. See NtpConfig::driftFile.
+// ---------------------------------------------------------------------------
+
+// The most a stored figure may claim. A crystal outside this is a corrupt file
+// or a different machine's, and seeding from it would be worse than starting
+// blind -- a wrong rate is applied with confidence, where no rate at least
+// carries its doubt in the dispersion.
+constexpr double kMaxDriftPpm = 500.0;
+
+// What a restored rate claims to be worth. Not the uncertainty it was written
+// with: the crystal has had a power cycle and a temperature excursion since,
+// and this figure only has to be good enough to stop a level window being
+// carried forward at zero. Any source that fits its own rate overrides it
+// within the minute.
+constexpr double kRestoredDriftUncertaintyPpm = 2.0;
+
+// Once an hour is plenty. The quantity moves with temperature over hours, the
+// file exists to save ten minutes and not to be a log, and a daemon meant to
+// run for months should not write to the config directory every pass.
+constexpr double kDriftWriteIntervalSec = 3600.0;
+
+// A change too small to be worth a write, given what the figure is for.
+constexpr double kDriftWriteThresholdPpm = 0.05;
+
+std::string defaultDriftPath(const std::string& configPath) {
+    if (configPath.empty()) return "";
+    const std::size_t slash = configPath.find_last_of('/');
+    return slash == std::string::npos ? "drift" : configPath.substr(0, slash + 1) + "drift";
+}
+
+// The stored rate in ppm, or nothing. One number, on one line, as ntpd writes
+// it -- so an operator can read it, and so a bad one is obvious at a glance.
+std::optional<double> readDriftPpm(const std::string& path) {
+    if (path.empty()) return std::nullopt;
+    std::ifstream f(path);
+    if (!f) return std::nullopt;
+    double ppm = 0.0;
+    if (!(f >> ppm)) return std::nullopt;
+    if (!std::isfinite(ppm) || std::abs(ppm) > kMaxDriftPpm) {
+        LOG_WARN("drift", "%s holds %+.3f ppm, which no crystal has: ignoring it",
+                 path.c_str(), ppm);
+        return std::nullopt;
+    }
+    return ppm;
+}
+
+// Written through a temporary and renamed: a daemon killed mid-write should
+// leave the old figure, not half of a new one. A failure is logged once and
+// never again -- a read-only config directory is a reason to lose the saving,
+// not a reason to fill the log for months.
+void writeDriftPpm(const std::string& path, double ppm) {
+    static bool complained = false;
+    if (path.empty()) return;
+    const std::string tmp = path + ".tmp";
+    {
+        std::ofstream f(tmp, std::ios::trunc);
+        if (!f) {
+            if (!complained) {
+                complained = true;
+                LOG_WARN("drift", "cannot write %s: the rate will be measured again "
+                                  "after every restart", tmp.c_str());
+            }
+            return;
+        }
+        f << std::fixed << std::setprecision(3) << ppm << "\n";
+    }
+    if (std::rename(tmp.c_str(), path.c_str()) != 0) {
+        if (!complained) {
+            complained = true;
+            LOG_WARN("drift", "cannot replace %s: %s", path.c_str(), std::strerror(errno));
+        }
+        std::remove(tmp.c_str());
+    }
 }
 
 } // namespace
@@ -359,6 +440,23 @@ int main(int argc, char** argv) {
         }
     }
 
+    // The crystal, as it was last time. Read before anything starts so the very
+    // first pass already has a rate to hand down; see NtpConfig::driftFile.
+    const std::string driftPath = cfg.ntp.driftFile == "-" ? std::string()
+                                : !cfg.ntp.driftFile.empty() ? cfg.ntp.driftFile
+                                : defaultDriftPath(configPath);
+    const std::optional<double> storedPpm = readDriftPpm(driftPath);
+    if (storedPpm) {
+        LOG_INFO(kTag, "drift: starting at %+.3f ppm from %s, so no source has to "
+                       "spend ten minutes rediscovering it",
+                 *storedPpm, driftPath.c_str());
+    } else if (!driftPath.empty()) {
+        LOG_INFO(kTag, "drift: no usable %s yet; the rate will be measured and saved",
+                 driftPath.c_str());
+    }
+    double lastWrittenPpm = storedPpm.value_or(0.0);
+    double lastWriteAt = storedPpm ? monotonicNow() : 0.0;
+
     Selector selector(cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm, cfg.ntp.minSources, cfg.clock);
 
     // Which class each source is in. Decided here, from the configuration,
@@ -464,7 +562,33 @@ int main(int argc, char** argv) {
         // than assuming the clock is perfect, which it measurably is not. Only
         // sources that have NOT fitted a rate use it, and those are already
         // excluded from the average it came from, so it cannot feed itself.
-        for (auto& s : sources) s->setSystemRate(c.rate, c.rateUncertainty, c.rateMeasured);
+        // A live fit wins; the stored crystal stands in until there is one. That
+        // second clause is the whole point of the drift file -- without it every
+        // source carries its level window forward at a rate of zero for the ten
+        // minutes before anything has fitted one, and the two classes, having
+        // different window lengths, disagree by the difference.
+        {
+            const bool haveRate = c.rateMeasured || storedPpm.has_value();
+            const double rate = c.rateMeasured ? c.rate : storedPpm.value_or(0.0) * 1e-6;
+            const double unc  = c.rateMeasured ? c.rateUncertainty
+                                               : kRestoredDriftUncertaintyPpm * 1e-6;
+            for (auto& s : sources) s->setSystemRate(rate, unc, haveRate);
+
+            // Save it back, rarely. Only a measured rate is ever written: the
+            // stored one writing itself back would keep a stale figure alive
+            // for ever.
+            if (c.rateMeasured && !driftPath.empty()) {
+                const double ppm = c.rate * 1e6;
+                const double nowMono = monotonicNow();
+                if (std::abs(ppm - lastWrittenPpm) >= kDriftWriteThresholdPpm &&
+                    (lastWriteAt == 0.0 || nowMono - lastWriteAt >= kDriftWriteIntervalSec)) {
+                    writeDriftPpm(driftPath, ppm);
+                    lastWrittenPpm = ppm;
+                    lastWriteAt = nowMono;
+                    LOG_DEBUG(kTag, "drift: saved %+.3f ppm", ppm);
+                }
+            }
+        }
 
         // A source the consensus has refused for long enough is sent back to
         // start over (see kReacquireAfterSec). Without this a decoder holding a
