@@ -119,7 +119,22 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // on the same dial would settle the split -- the codec term is the only thing
 // that differs between them -- and until someone does, this is an attribution
 // rather than a measurement.
-constexpr double kUberSdrChainDelaySec = 0.0141;
+//
+// 13.1 ms, and this figure is worth more than the two before it, because it is
+// the first taken against a reference that was checked. The 14.1 above came
+// from a class delta measured when every source carried its level window
+// forward at a rate of zero (see OffsetEstimator::setRatePrior) against a
+// single anycast server with nothing to outvote it. With the rate borrowed and
+// a second upstream agreeing to 0.3 ms, the delta settled at +1.06 ms over six
+// minutes, range 0.97 to 1.21 -- a quarter of the scatter the same measurement
+// used to have. Taking that off gives 13.04.
+//
+// Which is the interesting part: the 2026-09-13 measurement, made directly
+// against an ntpd-held host and owing nothing to any of this, said 13.6 +/- 2.5.
+// Two routes with nothing in common, half a millisecond apart. The remaining
+// difference is far inside kDelayUncertaintyFloorSec and not worth another
+// pass; the pcm-v4 experiment is what would take it further, not more of this.
+constexpr double kUberSdrChainDelaySec = 0.0131;
 
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
