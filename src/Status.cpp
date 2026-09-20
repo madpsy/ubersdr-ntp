@@ -113,6 +113,11 @@ std::string renderTimeJson(const Combined& c, double receiveDaemonSec,
     // estimate from the rate it is expected to move at.
     j["clock_offset_ms"] = (xmit - now) * 1000.0;
     j["clock_rate_ppm"] = c.rate * 1e6;
+    // Whether that rate is fitted or still assumed zero. Carried because a
+    // reader cannot tell the two apart from the figure alone -- an unfitted
+    // rate reads 0.0 ppm, which is also a perfectly plausible measurement --
+    // and the page needs it to say why the early numbers are moving.
+    j["clock_rate_measured"] = c.rateMeasured;
     j["reference_age_seconds"] = c.ageSec;
     j["sources_used"] = c.used;
     if (!c.note.empty()) j["note"] = c.note;

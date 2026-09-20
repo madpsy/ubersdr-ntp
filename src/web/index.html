@@ -23,6 +23,11 @@ h1 span { color:var(--muted); font-weight:400; }
   padding:16px; margin-bottom:14px; }
 .label { color:var(--muted); font-size:11px; text-transform:uppercase;
   letter-spacing:.07em; font-weight:600; }
+.settling[hidden] { display:none; }
+.settletop { margin:6px 0 8px; font-size:13px; }
+.settlelist { margin:0 0 8px; padding-left:18px; font-size:12px;
+  color:var(--muted); line-height:1.55; }
+.settlelist b { color:var(--ink); font-weight:600; }
 
 /* the clock: the one thing worth being large, because it is the product */
 .clocks { display:flex; flex-wrap:wrap; align-items:flex-end; gap:14px 48px; }
@@ -186,6 +191,28 @@ tr.fresh td { animation:fresh 4s ease-out; }
       <button type="button" data-range="day" aria-pressed="false">24 hours</button>
     </div>
     <span class="note" id="rangenote">1-minute averages · kept in memory since the daemon started</span>
+  </div>
+
+  <!-- Only for the first hour. A restart makes the difference between the two
+       classes read several ms out, and without this the page invites the
+       reader to draw a conclusion from a number that is still converging. -->
+  <div class="card tone-warn settling" id="settling" hidden>
+    <div class="label">Still settling</div>
+    <p class="settletop" id="settletop">&nbsp;</p>
+    <ul class="settlelist">
+      <li><b>Clock rate</b> <span id="setrate">not yet measured</span>. Until it is,
+        nothing takes out the receiver's sample-clock drift &mdash; around 24&nbsp;ppm,
+        or 1.4&nbsp;ms a minute &mdash; so the upstream NTP offset climbs steadily and
+        the difference between the classes goes with it.</li>
+      <li><b>NTP filter</b> keeps eight polls; at a 64&nbsp;s poll that is about
+        8&nbsp;minutes just to fill once.</li>
+      <li><b>Sample-clock fit</b> regresses over a 5-minute window, per source.</li>
+      <li><b>Sources</b> confirm a first decoded time against their own history
+        before counting, and one that recovers waits 180&nbsp;s before it is taken
+        back, so the consensus can change shape for a while.</li>
+    </ul>
+    <p class="note">Nothing below is wrong, but the difference between radio and NTP
+      is not worth reading yet. Give it about an hour, then use the 24-hour history.</p>
   </div>
 
   <div class="card" id="clockcard">
@@ -382,6 +409,33 @@ function stageTone(stage, state) {
   if (state === "locked") return "ok";
   if (stage === "no audio" || stage === "no tick") return "bad";
   return "warn";
+}
+// What the served time is actually referenced to, which the refid alone cannot
+// say. The refid is a single four-character NTP label, so when the radio
+// sources are split across two stations it can only name one of them -- and it
+// named whichever carried the most weight, which is right on the wire and
+// misleading on a page. Here: every station in the answer, commonest first,
+// with the refid kept in the tooltip because that is what a client sees.
+//
+// Falls back to the bare refid whenever no radio source is in the answer, which
+// is the failover case: an upstream has an address, not a station.
+function stationMix(d) {
+  const label = { wwv: "WWV", wwvh: "WWVH", wwvb: "WWVB" };
+  const counts = new Map();
+  for (const s of d.sources || []) {
+    if (s.kind !== "radio" || !s.in_use) continue;
+    const name = label[s.station] || (s.station ? String(s.station).toUpperCase() : "");
+    if (!name) continue;
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  if (!counts.size) return { text: d.refid || "", title: "" };
+
+  // Commonest first, ties alphabetical so the order cannot flicker.
+  const byCount = [...counts.entries()].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]));
+  const text = byCount.map((e) => e[0]).join(" + ");
+  const detail = byCount.map((e) => e[1] + " x " + e[0]).join(", ");
+  const title = ' title="' + esc(detail + " · refid " + (d.refid || "")) + '"';
+  return { text, title };
 }
 // The station, or while the decoder has not decided one, which way the tick
 // leans -- a blank read as missing data when it meant "both heard about
@@ -838,6 +892,20 @@ function onTick(d) {
   $("sub").textContent = "up " + dur(d.uptime_seconds) + " · NTP on port " + d.ntp.port +
     " · " + nReady + " of " + d.sources_total + " sources ready";
 
+  // The first hour. Hidden the moment it stops applying rather than left to
+  // decay into furniture nobody reads.
+  const settling = d.uptime_seconds < 3600;
+  $("settling").hidden = !settling;
+  if (settling) {
+    const rated = !!d.clock_rate_measured;
+    $("settletop").textContent =
+      "The daemon started " + dur(d.uptime_seconds) + " ago. Several of the estimates " +
+      "below are still converging, and until they have, the figures move about.";
+    $("setrate").innerHTML = rated
+      ? "is measured (" + (d.clock_rate_ppm || 0).toFixed(1) + "&nbsp;ppm)"
+      : "is <b>not yet measured</b>";
+  }
+
   const tone = d.synchronised ? dispTone(d.dispersion_ms) : "bad";
   const k = d.clock || {};
   if (k.primary !== lastClock.primary || k.secondary !== lastClock.secondary) { lastClock = k; renderTimeline(); }
@@ -846,8 +914,14 @@ function onTick(d) {
   // source is in the answer and one below the upstream when the time has
   // failed over to one. Saying "stratum 1" regardless would be the one lie
   // this page could tell that a client would act on.
-  $("syncpill").innerHTML = '<span class="pill ' + tone + '">' +
-    (d.synchronised ? "stratum " + d.stratum + " · " + esc(d.refid) : "unsynchronised") +
+  // What the reference actually is. The refid is one four-character label and
+  // has to name a single station, but the served time can be a consensus over
+  // two of them at once -- so showing the refid alone said "WWVH" while two of
+  // three sources were on WWV. The mix is what is true; the refid stays in the
+  // tooltip, because that is the value a client sees on the wire.
+  const ref = stationMix(d);
+  $("syncpill").innerHTML = '<span class="pill ' + tone + '"' + ref.title + ">" +
+    (d.synchronised ? "stratum " + d.stratum + " · " + esc(ref.text) : "unsynchronised") +
     "</span>" +
     (d.leap_pending ? ' <span class="pill warn">leap pending</span>' : "") +
     (k.serving === "secondary" ? ' <span class="pill bad">failed over to ' +

@@ -761,12 +761,35 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
             // through the day, so the tag follows the decoder rather than the
             // configuration -- and the tightest survivor is picked from among
             // the RADIO ones, since an upstream has no station to name.
+            // Which station, though, when the survivors disagree? Naming the
+            // single tightest one was wrong in the common case: three sources
+            // on one receiver sit within a fraction of a millisecond of each
+            // other, so the "tightest" holds barely a third of the weight, and
+            // the whole clock's advertised identity flipped between WWV and
+            // WWVH on a 0.2 ms difference in dispersion. A client watching the
+            // refid saw its reference change for no reason it could act on.
+            //
+            // Summed weight per station instead -- the combine's own weight,
+            // since naming the reference and weighting it are the same
+            // question. Two ordinary WWV sources outweigh one marginally
+            // tighter WWVH, which is the honest answer: that is where the
+            // served time came from.
+            std::map<std::string, double> byStation;
             const Candidate* tightestRadio = nullptr;
             for (const Candidate& k : survivors) {
                 if (k.s->kind != SourceKind::Radio) continue;
+                byStation[k.s->station] += k.weight / (k.quality * k.quality);
                 if (!tightestRadio || k.quality < tightestRadio->quality) tightestRadio = &k;
             }
-            c.refid = refidFor(tightestRadio->s->station);
+            // Seeded with the tightest source's station and replaced only on a
+            // strictly greater total, so a genuine tie keeps the tightest --
+            // the one tiebreak here with a reason behind it.
+            std::string station = tightestRadio->s->station;
+            double bestWeight = byStation[station];
+            for (const auto& kv : byStation) {
+                if (kv.second > bestWeight) { bestWeight = kv.second; station = kv.first; }
+            }
+            c.refid = refidFor(station);
             c.refidIsAddress = false;
             c.refidAddress = 0;
             c.rootDelaySec = 0.0;

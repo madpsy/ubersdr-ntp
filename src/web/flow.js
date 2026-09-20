@@ -197,8 +197,15 @@ function model(d) {
   const sec = Math.floor(d.unix + 0.05) % 60;
   cols[2].push({
     key: "core", kind: "core", state: d.synchronised ? "live" : "down",
-    title: "ubersdr-ntp",
-    sub: d.synchronised ? "stratum " + d.stratum + " · " + d.refid + " · v" + (d.version || "") : "unsynchronised",
+    // Not the product name: the column heading already says what this stage
+    // is, the page title already says what is running, and a reader following
+    // signals across the diagram wants the ROLE of each box. Every other node
+    // here names a role or a station rather than a program.
+    title: "This server",
+    // The reference as the page states it everywhere else: every station in
+    // the answer, not just the one the refid had room to name. index.html owns
+    // that helper; guarded so this file still draws if it is ever loaded alone.
+    sub: d.synchronised ? "stratum " + d.stratum + " · " + refOf(d) + " · v" + (d.version || "") : "unsynchronised",
     pill: k.serving === "secondary" ? ["failed over to " + k.secondary, "bad"]
       : k.serving === "both" ? ["serving both classes", "warn"]
       : k.failover_in_seconds != null ? ["failing over in " + Math.ceil(k.failover_in_seconds) + " s", "warn"]
@@ -206,7 +213,7 @@ function model(d) {
       : d.synchronised ? ["serving " + (k.primary || "time"), "ok"] : ["not serving", "bad"],
     ring: sec,
     kf: "±" + msv(d.dispersion_ms, 0), kfc: toneOf(d.dispersion_ms, 50, 250),
-    kl: d.synchronised ? "stratum " + d.stratum + " · " + d.refid : "unsynchronised",
+    kl: d.synchronised ? "stratum " + d.stratum + " · " + refOf(d) : "unsynchronised",
     body: '<div class="fl-from"><i>time from</i>' + ((d.used_names || []).length
       ? d.used_names.map((n) => '<span>' + esc(n) + "</span>").join("") : "<em>nothing in use</em>") + "</div>" +
       metrics([
@@ -269,6 +276,19 @@ function reqRate() {
 // ---------------------------------------------------------------------------
 // Drawing
 // ---------------------------------------------------------------------------
+// See stationMix() in index.html: the refid can only name one station, but the
+// served time is often a consensus over two. Guarded so this file degrades to
+// the bare refid rather than throwing if it is ever drawn without the page.
+function refOf(d) {
+  try {
+    if (typeof stationMix === "function") {
+      const r = stationMix(d);
+      if (r && r.text) return r.text;
+    }
+  } catch (x) {}
+  return d.refid || "";
+}
+
 const HEADS = ["Time signals", "Receivers & servers", "Disciplined clock", "Outputs"];
 const SHORT_HEADS = ["Signals", "Receivers", "Clock", "Outputs"];
 

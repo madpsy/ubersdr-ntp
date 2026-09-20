@@ -650,6 +650,14 @@ void NtpPeer::closeSocket() {
     m_fd = -1;
 }
 
+// One crystal, one rate: see TimeSource::setSystemRate. Cheap enough to do on
+// every pass -- it only writes three doubles -- and the estimator picks it up
+// at its next recompute.
+void NtpPeer::setSystemRate(double rateSec, double uncertaintySec, bool known) {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_offsets.setRatePrior(rateSec, uncertaintySec, known);
+}
+
 void NtpPeer::dropTiming(const char* why) {
     std::lock_guard<std::mutex> lk(m_mu);
     for (Sample& s : m_filter) s = Sample{};
@@ -1088,10 +1096,24 @@ void NtpPeer::recompute() {
                            daemonMinusRealtime();
     m_snap.rawOffsetSec = m_snap.hostOffsetSec - m_snap.delaySec;
 
+    // "stratum 3 (10.84.8.4)" read as though that address were something we
+    // talk to. It is not: above stratum 1 the refid is the server's own
+    // UPSTREAM, which for a big operator is a private address on their network
+    // that we can neither reach nor check. At stratum 1 the same four bytes are
+    // a clock code instead -- GPS, PPS, DCF -- so the two want different words.
+    // See refidText().
+    const char* addr = m_snap.ntp.address.empty() ? m_cfg.server.c_str()
+                                                  : m_snap.ntp.address.c_str();
     char path[256];
-    std::snprintf(path, sizeof path, "%s, stratum %d (%s), round trip %.1f ms halved",
-                  m_snap.ntp.address.empty() ? m_cfg.server.c_str() : m_snap.ntp.address.c_str(),
-                  m_snap.ntp.stratum, m_snap.ntp.refid.c_str(), m_snap.ntp.delaySec * 1000.0);
+    if (m_snap.ntp.stratum <= 1) {
+        std::snprintf(path, sizeof path, "%s, stratum %d, reference %s, round trip %.1f ms halved",
+                      addr, m_snap.ntp.stratum, m_snap.ntp.refid.c_str(),
+                      m_snap.ntp.delaySec * 1000.0);
+    } else {
+        std::snprintf(path, sizeof path, "%s, stratum %d via its upstream %s, round trip %.1f ms halved",
+                      addr, m_snap.ntp.stratum, m_snap.ntp.refid.c_str(),
+                      m_snap.ntp.delaySec * 1000.0);
+    }
     m_snap.pathDescription = path;
 }
 
