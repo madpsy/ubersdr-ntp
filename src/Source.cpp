@@ -1869,14 +1869,18 @@ void Source::updateDelayModel() {
     // and it is worth about 14 ms on a European path, which is why the station
     // tag is used the moment it is available.
     GeoPoint tx;
+    bool lf = false;
     if (m_snap.station == "wwvh") tx = wwvhSite();
-    else if (m_snap.station == "wwvb" || m_cfg.dialHz < kWwvbCeilingHz) tx = wwvbSite();
+    else if (m_snap.station == "wwvb" || m_cfg.dialHz < kWwvbCeilingHz) { tx = wwvbSite(); lf = true; }
     else tx = wwvSite();
 
     double prop = 0.0;
     if (m_snap.receiverLocation.valid) {
-        prop = skywaveDelaySeconds(greatCircleMeters(m_snap.receiverLocation, tx));
-        m_snap.pathDescription = describePath(m_snap.receiverLocation, tx);
+        // 60 kHz gets the groundwave, not F-layer hops. See Propagation.h.
+        const double d = greatCircleMeters(m_snap.receiverLocation, tx);
+        prop = lf ? lfDelaySeconds(d) : skywaveDelaySeconds(d);
+        m_snap.pathDescription = lf ? describeLfPath(m_snap.receiverLocation, tx)
+                                    : describePath(m_snap.receiverLocation, tx);
     } else {
         m_snap.pathDescription = "no receiver coordinates; propagation not modelled";
     }

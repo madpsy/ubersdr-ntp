@@ -104,8 +104,34 @@ double maxHopMeters(double virtualHeightM = kVirtualHeightM,
 // never again disagree about what the geometry allows.
 double skywaveDelaySeconds(double distanceMeters, double virtualHeightM = kVirtualHeightM);
 
+// WWVB IS NOT AN HF PATH AND MUST NOT USE THE GEOMETRY ABOVE
+//
+// 60 kHz does not hop off the F layer. It travels in the Earth-ionosphere
+// waveguide, turning at the D region -- near 70 km by day, 85-90 km at night --
+// and across the continental US the FIRST energy to arrive is the groundwave,
+// which follows the surface. That is also what an envelope decoder locks to:
+// the leading edge of the second, not whatever arrives later.
+//
+// Sending it through the F2 geometry put WWVB at a 350 km reflection height and
+// over-delayed it by about 0.45 ms at 2500 km -- alone among the errors in this
+// file, in the direction that makes the radio read EARLY.
+//
+// So: great circle, at the speed of light, retarded slightly because the ground
+// is not a perfect conductor. 1.0003 is a fair working index over mixed land at
+// LF, and it is worth about 1 us per 1000 km -- negligible next to everything
+// else in the budget, and carried only because it costs one multiply to be
+// right rather than approximately right.
+//
+// Past roughly 2000 km the skywave begins to matter and the two modes
+// interfere. The waveguide path is only about 0.1 ms longer than the surface
+// one at those ranges, so the mode choice stays well inside the delay
+// uncertainty; the 350 km height did not.
+inline constexpr double kLfGroundIndex = 1.0003;
+double lfDelaySeconds(double distanceMeters);
+
 // A human-readable one-liner for the log: distance, hops and delay.
 std::string describePath(const GeoPoint& rx, const GeoPoint& tx,
                          double virtualHeightM = kVirtualHeightM);
+std::string describeLfPath(const GeoPoint& rx, const GeoPoint& tx);
 
 } // namespace ubersdr_ntp

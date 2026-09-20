@@ -72,6 +72,20 @@ double skywaveDelaySeconds(double distanceMeters, double virtualHeightM) {
     return (2.0 * hops * slant) / kC;
 }
 
+double lfDelaySeconds(double distanceMeters) {
+    if (distanceMeters <= 0.0) return 0.0;
+    return distanceMeters * kLfGroundIndex / kC;
+}
+
+std::string describeLfPath(const GeoPoint& rx, const GeoPoint& tx) {
+    if (!rx.valid || !tx.valid) return "path unknown (no receiver coordinates)";
+    const double d = greatCircleMeters(rx, tx);
+    char buf[160];
+    std::snprintf(buf, sizeof buf, "%.0f km groundwave at LF, %.2f ms",
+                  d / 1000.0, lfDelaySeconds(d) * 1000.0);
+    return buf;
+}
+
 std::string describePath(const GeoPoint& rx, const GeoPoint& tx, double virtualHeightM) {
     if (!rx.valid || !tx.valid) return "path unknown (no receiver coordinates)";
     const double d = greatCircleMeters(rx, tx);
