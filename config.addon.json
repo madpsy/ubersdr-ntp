@@ -36,8 +36,32 @@
   // The other class: measured all the time, used when the radio fails, and
   // the only absolute check on the radio's delay model. Delete it if this
   // machine must talk to nothing but the receiver.
+  //
+  // THREE, AND NOT FROM A POOL
+  //
+  // One server cannot be checked. Its `residual_ms` is 0.0 by construction,
+  // there is nothing to outvote it, and every asymmetry on its one path lands
+  // in the radio's delay model as if the radio had earned it. That is not
+  // theoretical: time.cloudflare.com is anycast, it moved from 162.159.200.1
+  // to .123 across a restart on 2026-09-20, and the class offset went from
+  // +1.0 ms to +7.3 ms on a reference that had not actually changed.
+  //
+  // Not pool.ntp.org, and not time.nist.gov either, however sensible they look.
+  // Both hand back a different server on each refresh -- the pool by design,
+  // time.nist.gov through a load balancer on a 30 second TTL -- and a changed
+  // address clears the eight-sample clock filter (see NtpPeer::resolve). At a
+  // 64 second poll that register needs eight and a half minutes to refill, so
+  // a peer that moves every few minutes never once converges. It would add
+  // noise wearing the clothes of a second opinion.
+  //
+  // time-a-g and time-b-g are single fixed addresses, 129.6.15.28 and .29, and
+  // they serve UTC(NIST) -- the same realisation WWV broadcasts. Checking a
+  // WWV-disciplined clock against NIST's own network time is as close to
+  // like-for-like as this comparison can get.
   "ntp_sources": [
-    "time.cloudflare.com"
+    "time.cloudflare.com",
+    "time-a-g.nist.gov",
+    "time-b-g.nist.gov"
   ],
 
   // The receiver this runs beside, on WWV's three strongest carriers. 5 MHz

@@ -190,6 +190,14 @@
 
     // More public servers. Three or more and the agreement test has something
     // to work with, so one of them going wrong cannot move the clock.
+    //
+    // Prefer a NAMED server with a fixed address over a pool entry. A pool
+    // hands back a different machine on each DNS refresh, and a changed
+    // address clears this peer's eight-sample clock filter (NtpPeer::resolve);
+    // at a 64 second poll that register takes eight and a half minutes to
+    // refill, so a peer that moves every few minutes never settles and
+    // contributes noise rather than a second opinion. Enable these only if
+    // nothing steadier is reachable.
     // "0.pool.ntp.org",
     // "1.pool.ntp.org",
 
