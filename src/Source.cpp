@@ -120,21 +120,28 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // that differs between them -- and until someone does, this is an attribution
 // rather than a measurement.
 //
-// 13.1 ms, and this figure is worth more than the two before it, because it is
-// the first taken against a reference that was checked. The 14.1 above came
-// from a class delta measured when every source carried its level window
-// forward at a rate of zero (see OffsetEstimator::setRatePrior) against a
-// single anycast server with nothing to outvote it. With the rate borrowed and
-// a second upstream agreeing to 0.3 ms, the delta settled at +1.06 ms over six
-// minutes, range 0.97 to 1.21 -- a quarter of the scatter the same measurement
-// used to have. Taking that off gives 13.04.
+// 14.1 ms, and this one is measured rather than glanced at. Sixty-four minutes
+// of settled class delta, once the system rate was being borrowed and a second
+// upstream was there to check the first:
 //
-// Which is the interesting part: the 2026-09-13 measurement, made directly
-// against an ntpd-held host and owing nothing to any of this, said 13.6 +/- 2.5.
-// Two routes with nothing in common, half a millisecond apart. The remaining
-// difference is far inside kDelayUncertaintyFloorSec and not worth another
-// pass; the pcm-v4 experiment is what would take it further, not more of this.
-constexpr double kUberSdrChainDelaySec = 0.0131;
+//     mean +0.107 ms, median +0.113, sd 0.491, range -0.91 to +1.07
+//     positive in 41 of 65 samples
+//
+// Centred on zero and scattering both ways, which is what this measurement is
+// supposed to look like and never had before tonight.
+//
+// It briefly went to 13.1 on a SIX-minute window reading +1.06. That window was
+// the smoothed delta still climbing out of its own settling transient, and a
+// rising curve was read as a plateau. The same figure over an hour is +0.107.
+// Three times now this constant has been moved on a window too short to carry
+// it -- 13.6 to 12.6, 12.6 to 14.1, 14.1 to 13.1 -- and twice that was wrong.
+// The EMA has a five-minute time constant, so anything under about twenty
+// minutes of it is still describing the last disturbance rather than the
+// crystal. Do not move this again on less.
+//
+// The 2026-09-13 measurement, made directly against an ntpd-held host and
+// owing nothing to any of this, said 13.6 +/- 2.5 ms.
+constexpr double kUberSdrChainDelaySec = 0.0141;
 
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
