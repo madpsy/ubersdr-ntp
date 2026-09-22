@@ -332,6 +332,11 @@
     //                     it (default 0). The receiver's own delay (radiod to
     //                     the WebSocket) is the same on every UberSDR instance
     //                     and already built in, as is the decoder's edge bias.
+    //                     Positive or negative. Positive says the signal took
+    //                     LONGER to arrive than the model thinks, which moves
+    //                     the time this source gives forward; negative moves
+    //                     it back. So a source that reads 2 ms AHEAD of a
+    //                     reference you trust wants -2.0.
     //                     Leave at 0 unless this one source disagrees with a
     //                     reference clock you trust for a reason of its own.
     //                     Getting it wrong biases the served time by exactly
