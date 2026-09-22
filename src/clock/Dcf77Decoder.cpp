@@ -71,16 +71,22 @@ constexpr double kSearchHz    = 20.0;   // bins searched, for the noise median
 constexpr double kPullHz      = 3.0;
 constexpr double kSearchStep  = 0.25;
 constexpr double kToneGate    = 12.0;   // peak over median bin power
+// The carrier's SNR while running, as the search measures it -- the carrier's
+// bin over the median of its neighbours -- but on the mixed signal, where the
+// carrier sits at 0 Hz, and over and over rather than once. The neighbours are
+// at half-integer hertz: over a 2 s window those are the exact nulls of every
+// line the 1 Hz AM keying puts at whole hertz, and from 5 Hz out the carrier's
+// own leakage is far enough down not to lift the median.
+constexpr double kLiveToneSeconds = 2.0;
+constexpr int    kLiveToneSide    = 16;    // neighbour bins each side
+constexpr double kLiveToneFirstHz = 5.5;
 
 // ---- carrier reference ---------------------------------------------------
 constexpr double kRefHz   = 1.0;   // PM phase reference corner
 constexpr double kDcHz    = 0.1;   // what is taken off y before it is summed
-// Half-width of the centred mean taken off y before its variance is taken as
-// the correlator's noise: 10 ms wide, so a first null at 100 Hz and a 10 Hz
-// tone down 36 dB.
+// Half-width of the centred mean taken off y for the high-passed correlation:
+// 10 ms wide, so a first null at 100 Hz and a 10 Hz tone down 36 dB.
 constexpr double kHpHalfSec = 0.005;
-// Raw power over high-passed power past which a burst is correlated high-passed.
-constexpr double kHpTrigger = 2.0;
 constexpr double kFreqGain = 0.2;  // per-second fraction of the residual taken
 
 // ---- PM correlator -------------------------------------------------------
@@ -95,6 +101,11 @@ constexpr double kPmAcqScore    = 3.5;
 constexpr double kPmMinSnr      = 4.0;
 constexpr int    kPmMissLimit   = 10;
 constexpr double kPmFullConfSnr = 12.0;   // where a PM bit's confidence saturates
+// The tracked burst's noise estimate, followed across seconds (NoiseEst): an
+// eight-second average, and a second whose own estimate is past four times it
+// (twice the sigma) judged against that instead.
+constexpr double kPmNoiseAlpha  = 1.0 / 8.0;
+constexpr double kPmNoiseJump   = 4.0;
 // A PM lock that puts the second more than this far from where AM had it
 // re-segments: the count of seconds from AM is not to be trusted across it.
 constexpr double kResegTolSec   = 0.030;
@@ -125,6 +136,12 @@ constexpr int    kTrkWarm  = 8;
 // A second with neither an AM cut nor a PM peak for this long, running, has
 // nothing holding the segmentation to the air any more.
 constexpr int kMaxBlindSeconds = 90;
+
+// Minutes in a row the count of seconds may run with nothing confirming it --
+// marker faded, PM not tracking -- before the anchor is let go. Two: a fade
+// over one s59 is ordinary, and nothing here certifies while it lasts, but a
+// count kept on no evidence at all for longer is a count to find again.
+constexpr int kMaxUnconfirmedMinutes = 2;
 
 // WWVB's layout, for the synthetic frames the voter is fed (finalizeFrame).
 constexpr std::array<int, 7> kVoterMarkers = {0, 9, 19, 29, 39, 49, 59};
@@ -257,11 +274,10 @@ struct Dcf77Decoder::Impl {
         std::size_t cap = 1;
         while (cap < static_cast<std::size_t>(3 * sr)) cap <<= 1;
         pre.assign(cap, 0.0);
-        pre2.assign(cap, 0.0);
         preH.assign(cap, 0.0);
-        preH2.assign(cap, 0.0);
         hpM = std::max<int64_t>(1, std::llround(kHpHalfSec * sr));
         mask = static_cast<int64_t>(cap) - 1;
+        hpKeep2 = hpSignalKept();
 
         acqTarget = static_cast<int64_t>(std::llround(kAcqSeconds * sr));
         for (double f = fNominal - kSearchHz; f <= fNominal + kSearchHz + 1e-9; f += kSearchStep) {
@@ -271,6 +287,19 @@ struct Dcf77Decoder::Impl {
             b.stepIm = std::sin(-2.0 * kPi * f / sr);
             bins.push_back(b);
         }
+        auto bin = [&](double f) {
+            Bin b;
+            b.f = f;
+            b.stepRe = std::cos(-2.0 * kPi * f / sr);
+            b.stepIm = std::sin(-2.0 * kPi * f / sr);
+            return b;
+        };
+        liveBins.push_back(bin(0.0));
+        for (int i = 0; i < kLiveToneSide; ++i) {
+            liveBins.push_back(bin(kLiveToneFirstHz + i));
+            liveBins.push_back(bin(-(kLiveToneFirstHz + i)));
+        }
+        liveTarget = static_cast<int64_t>(std::llround(kLiveToneSeconds * sr));
         pctScratch.reserve(kPctWin);
         reset();
     }
@@ -304,6 +333,8 @@ struct Dcf77Decoder::Impl {
         acqCount = 0;
         lastToneSnrDb = 0.0f;
         for (Bin& b : bins) { b.accRe = b.accIm = 0.0; b.rotRe = 1.0; b.rotIm = 0.0; }
+        for (Bin& b : liveBins) { b.accRe = b.accIm = 0.0; b.rotRe = 1.0; b.rotIm = 0.0; }
+        liveCount = 0;
         f0 = fNominal;
         oscRe = 1.0; oscIm = 0.0; oscRenorm = 0;
         lpI.reset(); lpQ.reset();
@@ -312,9 +343,8 @@ struct Dcf77Decoder::Impl {
         pHi = pLo = 0.0f;
         refRe = refIm = 0.0; yDc = 0.0; freqCount = 0; freqPrevRe = freqPrevIm = 0.0;
         std::fill(pre.begin(), pre.end(), 0.0);
-        std::fill(pre2.begin(), pre2.end(), 0.0);
         std::fill(preH.begin(), preH.end(), 0.0);
-        std::fill(preH2.begin(), preH2.end(), 0.0);
+        noiseRaw = NoiseEst{}; noiseHp = NoiseEst{};
         steadyStart = 0;
         segValid = false; segEdge = 0.0; scanPos = 0; blindSeconds = 0;
         amTrk.reset(); pmTrk.reset();
@@ -392,7 +422,6 @@ struct Dcf77Decoder::Impl {
         envBaseSample = samplesConsumed;
         steadyStart = samplesConsumed;
         pre[static_cast<std::size_t>(steadyStart & mask)] = 0.0;
-        pre2[static_cast<std::size_t>(steadyStart & mask)] = 0.0;
         lastSearchEnd = steadyStart;
         setMixer(f0);
         oscRe = 1.0; oscIm = 0.0; oscRenorm = 0;
@@ -403,6 +432,34 @@ struct Dcf77Decoder::Impl {
         aRef = 1.0 - std::exp(-2.0 * kPi * kRefHz / sr);
         aDc = 1.0 - std::exp(-2.0 * kPi * kDcHz / sr);
         setLockState(ClockLockState::Acquiring);
+    }
+
+    // ---- carrier SNR, running ---------------------------------------------
+
+    void liveToneStep(double zr, double zi) {
+        for (Bin& b : liveBins) {
+            b.accRe += zr * b.rotRe - zi * b.rotIm;
+            b.accIm += zr * b.rotIm + zi * b.rotRe;
+            const double nr = b.rotRe * b.stepRe - b.rotIm * b.stepIm;
+            b.rotIm = b.rotRe * b.stepIm + b.rotIm * b.stepRe;
+            b.rotRe = nr;
+        }
+        if ((liveCount & 1023) == 1023) {
+            for (Bin& b : liveBins) {
+                const double m = std::hypot(b.rotRe, b.rotIm);
+                if (m > 1e-9) { b.rotRe /= m; b.rotIm /= m; }
+            }
+        }
+        if (++liveCount < liveTarget) return;
+        std::array<double, 2 * kLiveToneSide> nb{};
+        for (std::size_t i = 1; i < liveBins.size(); ++i)
+            nb[i - 1] = liveBins[i].accRe * liveBins[i].accRe + liveBins[i].accIm * liveBins[i].accIm;
+        std::nth_element(nb.begin(), nb.begin() + kLiveToneSide, nb.end());
+        const double median = nb[kLiveToneSide];
+        const double carrier = liveBins[0].accRe * liveBins[0].accRe + liveBins[0].accIm * liveBins[0].accIm;
+        if (median > 0.0 && carrier > 0.0) lastToneSnrDb = static_cast<float>(10.0 * std::log10(carrier / median));
+        for (Bin& b : liveBins) { b.accRe = b.accIm = 0.0; b.rotRe = 1.0; b.rotIm = 0.0; }
+        liveCount = 0;
     }
 
     // ---- per sample ------------------------------------------------------
@@ -419,6 +476,8 @@ struct Dcf77Decoder::Impl {
             oscRenorm = 0;
         }
 
+        liveToneStep(zr, zi);
+
         // PM: the phase against the carrier's own recent phase.
         refRe += aRef * (zr - refRe);
         refIm += aRef * (zi - refIm);
@@ -429,28 +488,25 @@ struct Dcf77Decoder::Impl {
         const std::size_t i0 = static_cast<std::size_t>(k & mask);
         const std::size_t i1 = static_cast<std::size_t>((k + 1) & mask);
         pre[i1] = pre[i0] + y;
-        pre2[i1] = pre2[i0] + y * y;
 
         // The same, high-passed without a phase shift: each sample less the
         // mean of the 2M+1 centred on it, M samples late. A causal filter would
-        // move the correlation peak; this cannot. It is always the noise
-        // estimate (snrAt), and it is what is correlated when a burst carries
-        // strong low-frequency interference (hpNeeded). A steady tone a few
-        // hertz off the carrier lands in y as a large slow sinusoid: counted as
-        // noise it made every PM bit look like a coin toss, and correlated it
-        // flipped bits. But the high-pass costs real signal -- about 3 dB on the
-        // KiwiSDR recording -- so a clean burst is correlated on y itself.
+        // move the correlation peak; this cannot. It is what is correlated when
+        // it gives the correlation the better SNR (hpBetter). A steady tone a
+        // few hertz off the carrier lands in y as a large slow sinusoid, and
+        // correlated raw it flipped bits. But the high-pass costs real signal
+        // -- 1.5 dB of the burst at 12 kHz (hpSignalKept) -- so a clean burst
+        // is correlated on y itself.
         const int64_t c = k - hpM;
         if (c >= steadyStart + hpM) {
             const std::size_t c0 = static_cast<std::size_t>(c & mask);
             const std::size_t c1 = static_cast<std::size_t>((c + 1) & mask);
-            if (c == steadyStart + hpM) { preH[c0] = 0.0; preH2[c0] = 0.0; }
+            if (c == steadyStart + hpM) preH[c0] = 0.0;
             const double raw = pre[c1] - pre[c0];
             const double ma = (pre[i1] - pre[static_cast<std::size_t>((c - hpM) & mask)]) /
                               static_cast<double>(2 * hpM + 1);
             const double yh = raw - ma;
             preH[c1] = preH[c0] + yh;
-            preH2[c1] = preH2[c0] + yh * yh;
         }
 
         // Follow the carrier: a residual offset shows as the reference turning.
@@ -504,40 +560,119 @@ struct Dcf77Decoder::Impl {
         return tau - 2.0 >= static_cast<double>(prefixLo()) &&
                tau + kChips * tc + 2.0 <= static_cast<double>(prefixHi());
     }
-    double corrAt(double tau, double tc) const {
-        const std::vector<double>& p = useHp ? preH : pre;
+    double corrOn(const std::vector<double>& p, double tau, double tc) const {
         double s = 0.0;
         for (const auto& c : coeffs) s += c.w * prefixAt(p, tau + c.k * tc);
         return s;
     }
+    double corrAt(double tau, double tc) const { return corrOn(useHp ? preH : pre, tau, tc); }
 
-    // Whether [a, b) carries strong low-frequency interference: y's power
-    // more than double what is left of it high-passed. Noise and the chips
-    // alone lose little to the high-pass (a ratio near 1.0-1.2); a tone near
-    // the carrier puts most of y's power below it.
-    bool hpNeeded(double a, double b) const {
-        const double n = b - a;
-        if (!(n > 1.0)) return false;
-        auto power = [&](const std::vector<double>& p1, const std::vector<double>& p2) {
-            const double m = (prefixAt(p1, b) - prefixAt(p1, a)) / n;
-            return (prefixAt(p2, b) - prefixAt(p2, a)) / n - m * m;
-        };
-        return power(pre, pre2) > kHpTrigger * std::max(1e-30, power(preH, preH2));
+    // sigma_C^2 on prefix p: the spread of the correlation itself, at lags
+    // that do not line up with a burst. Acquisition has always measured its
+    // noise this way (pmAcquireStep); tracking now does too.
+    //
+    // Not the variance of y times the number of samples, which is what
+    // tracking used. That treats y as white, and y is not: it carries
+    // everything in the IQ passband, and a signal a few kHz off the carrier
+    // puts far more power into y than the chip correlation ever sees -- a
+    // 1.5 ms chip integrates it away. Measured on a receiver whose passband
+    // held a tone 14 dB above DCF77 at +5.3 kHz: that estimate read every
+    // tracked second at SNR 0.7 where the burst was at 6.9, so PM acquired,
+    // missed ten seconds and dropped, forever. Nor is y white even on white
+    // noise: the carrier reference's own noise moves slowly across a burst,
+    // and the correlation sees some of it -- about 14% more sigma than the
+    // per-sample figure, which read every bit that much too confident.
+    //
+    // Lags at `at(j)` for j in [0, n). The median of the squares, over the
+    // chi-square with one degree of freedom each is on noise, is 0.455 sigma^2.
+    template <typename At>
+    double noise2On(const std::vector<double>& p, double tc, int n, At at) const {
+        std::array<double, 32> sq{};
+        int k = 0;
+        for (int j = 0; j < n && k < static_cast<int>(sq.size()); ++j) {
+            const double t = at(j);
+            if (!burstInRing(t, tc)) continue;
+            const double c = corrOn(p, t, tc);
+            sq[static_cast<std::size_t>(k++)] = c * c;
+        }
+        if (k < 8) return -1.0;
+        std::nth_element(sq.begin(), sq.begin() + k / 2, sq.begin() + k);
+        return std::max(1e-30, sq[static_cast<std::size_t>(k / 2)] / 0.455);
     }
-    // |C| / sigma_C, sigma from the burst's own residual variance.
-    double snrAt(double tau, double tc, double C) const {
-        const double N = kChips * tc;
-        const double s1 = prefixAt(preH, tau + N) - prefixAt(preH, tau);
-        const double s2 = prefixAt(preH2, tau + N) - prefixAt(preH2, tau);
-        const double mean = s1 / N, sig = C / N;
-        // Noise is what is left of the high-passed burst's power once the chip
-        // signal is taken out. The high-pass takes a little of the signal too,
-        // so on a clean burst that difference can reach zero; floored at 0.1%
-        // of the power, past which a PM bit's confidence is saturated anyway.
-        const double pow = std::max(1e-30, s2 / N - mean * mean);
-        const double var = std::max(1e-3 * pow, pow - sig * sig);
-        return std::fabs(C) / std::sqrt(var * N);
+
+    // Behind a tracked burst: 24 lags running back from it, a non-integer
+    // number of chips apart and starting four chips out, past the correlation
+    // triangle. They overlap the burst, and leave its sidelobes in the
+    // estimate -- measured at these lags, 1.2% of the peak rms, 2.5% at most:
+    // nothing until a burst is far past where a bit's confidence saturates.
+    double trackNoise2(const std::vector<double>& p, double tau, double tc) const {
+        return noise2On(p, tc, 24, [&](int j) { return tau - (4.0 + 5.37 * j) * tc; });
     }
+
+    // Whether the high-passed correlation has the better SNR. The high-pass
+    // takes low-frequency interference out of the noise, and some of the
+    // burst with it -- the fraction hpSignalKept works out -- so it wins when
+    // it takes out more noise power than that. Decided on the correlation's
+    // own noise: the question was once answered on y's power over its whole
+    // band, which is the same mistake as the white noise figure.
+    bool hpBetter(double raw2, double hp2) const {
+        return raw2 > 0.0 && hp2 > 0.0 && hp2 < hpKeep2 * raw2;
+    }
+
+    // What the high-pass leaves of a burst's correlation peak, as a fraction
+    // of its power: the chip waveform at this rate, less its centred mean,
+    // against the waveform itself. 0.72 at 12 kHz.
+    double hpSignalKept() const {
+        const double spc = kChipSec * sr;
+        const int64_t n = static_cast<int64_t>(std::ceil(kChips * spc));
+        std::vector<double> w(static_cast<std::size_t>(n + 2 * hpM + 1), 0.0);
+        for (int64_t i = 0; i < n; ++i)
+            w[static_cast<std::size_t>(i + hpM)] = chips[static_cast<std::size_t>(std::min<int64_t>(kChips - 1, static_cast<int64_t>(i / spc)))];
+        std::vector<double> run(w.size() + 1, 0.0);
+        for (std::size_t i = 0; i < w.size(); ++i) run[i + 1] = run[i] + w[i];
+        double kept = 0.0, full = 0.0;
+        for (std::size_t i = static_cast<std::size_t>(hpM); i + static_cast<std::size_t>(hpM) < w.size(); ++i) {
+            const double mean = (run[i + static_cast<std::size_t>(hpM) + 1] - run[i - static_cast<std::size_t>(hpM)]) /
+                                static_cast<double>(2 * hpM + 1);
+            kept += (w[i] - mean) * w[i];
+            full += w[i] * w[i];
+        }
+        const double a = full > 0.0 ? kept / full : 1.0;
+        return a * a;
+    }
+
+    // The noise a tracked burst is judged against, followed across seconds.
+    // One second's median of 24 lags is itself uncertain, and read raw that
+    // uncertainty becomes seconds that look weak for no reason on the air.
+    // The noise under a burst is the channel's, and moves over seconds, so an
+    // eight-second average costs nothing real.
+    //
+    // Except for a second whose own estimate is several times the average --
+    // a static crash, a keyed transmitter nearby -- which is judged against
+    // its own figure, since reading it against quieter ones would hand its
+    // bit a confidence it has not earned. That second only. Adopting it AS the
+    // average held every following second to it while it decayed, and one
+    // heavy-tailed estimate on plain noise was then enough to miss ten seconds
+    // running and drop the lock.
+    //
+    // Nor does such a second go into the average at its full size: it is
+    // clipped to the same four times first. A fade is the case that matters.
+    // With no carrier, y is noise over a decaying reference and a second's
+    // estimate runs a hundred times the average and more; taken whole, five
+    // such seconds left the average so high that it took over a minute to
+    // come down, every second after the carrier came back read SNR 0.2, and
+    // PM lost the lock the fade had not cost it. Clipped, a genuine rise is
+    // still followed within a few seconds, and a fade is not.
+    struct NoiseEst {
+        double v = 0.0;      // the average
+        double now = 0.0;    // what this second is judged against
+        void update(double inst) {
+            if (inst <= 0.0) { now = v; return; }
+            if (!(v > 0.0)) { v = now = inst; return; }
+            now = inst > kPmNoiseJump * v ? inst : v;
+            v += kPmNoiseAlpha * (std::min(inst, kPmNoiseJump * v) - v);
+        }
+    };
 
     // Early-late on the triangle the chip correlation makes: E and L one half
     // chip either side of the estimate, and (E - L)/(E + L) is the error in
@@ -591,7 +726,11 @@ struct Dcf77Decoder::Impl {
             acqHistN = 0;
             acqHistNext = 0;
         }
-        useHp = hpNeeded(static_cast<double>(lo), static_cast<double>(hi) + kChips * tc);
+        {
+            const double span = static_cast<double>(hi - lo + 1) / 24.0;
+            auto at = [&](int j) { return static_cast<double>(lo) + (j + 0.5) * span; };
+            useHp = hpBetter(noise2On(pre, tc, 24, at), noise2On(preH, tc, 24, at));
+        }
         const std::vector<double>& pr = useHp ? preH : pre;
         std::vector<double> c(static_cast<std::size_t>(pint));
         for (int64_t tau = lo; tau <= hi; ++tau) {
@@ -650,6 +789,7 @@ struct Dcf77Decoder::Impl {
     void pmLockAt(double tau, double P) {
         pmLocked = true;
         pmMiss = 0;
+        noiseRaw = NoiseEst{}; noiseHp = NoiseEst{};
         acqPint = 0;
         pmTrk.reset();
         const double pmEdge = tau - kPmStartSec * P;
@@ -695,7 +835,11 @@ struct Dcf77Decoder::Impl {
             Cout = 0.0; snrOut = 0.0; tauOut = pred;
             return false;
         }
-        useHp = hpNeeded(base - win, base + win + kChips * tc);
+        noiseRaw.update(trackNoise2(pre, base, tc));
+        noiseHp.update(trackNoise2(preH, base, tc));
+        useHp = hpBetter(noiseRaw.v, noiseHp.v);
+        const double noise2 = useHp ? noiseHp.now : noiseRaw.now;
+        auto snrOf = [&](double C) { return noise2 > 0.0 ? std::fabs(C) / std::sqrt(noise2) : 0.0; };
         double best = 0.0, bestTau = base;
         for (int d = -win; d <= win; ++d) {
             const double c = corrAt(base + d, tc);
@@ -703,14 +847,14 @@ struct Dcf77Decoder::Impl {
         }
         const double tau = refine(bestTau, tc, best >= 0.0 ? 1.0 : -1.0);
         const double C = corrAt(tau, tc);
-        const double snr = snrAt(tau, tc, C);
+        const double snr = snrOf(C);
         if (snr >= kPmMinSnr && std::fabs(tau - pred) <= win) {
             tauOut = tau; Cout = C; snrOut = snr;
             return true;
         }
         tauOut = pred;
         Cout = corrAt(pred, tc);
-        snrOut = snrAt(pred, tc, Cout);
+        snrOut = snrOf(Cout);
         return false;
     }
 
@@ -955,15 +1099,27 @@ struct Dcf77Decoder::Impl {
     bool pmSyncHere() {
         if (hist.size() < 16) return false;
         const std::size_t base = hist.size() - 16;   // s59
+        // Sixteen bits decided together, so judged together: every one read
+        // (kPmBitMinConf) and the right way round, and their MEAN at the
+        // agreement level (kPmSyncConf) -- not each of them. On noise alone
+        // sixteen signs come out right one time in 65536 and a mean of 3 sigma
+        // over sixteen is out of reach, so the whole word is stronger evidence
+        // than any one bit of it; and the word lines up at one offset only
+        // (s59 against s0, s9 against s10), so it cannot anchor a second out.
+        // Demanding 3 sigma of every bit threw that away: a signal whose bits
+        // sat near 4 sigma, all sixteen right, missed the odd one under 3 in
+        // nearly every minute and never anchored at all.
         auto matches = [&](int pol) {
+            float sum = 0.0f;
             for (std::size_t j = 0; j < 16; ++j) {
                 const SecRec& h = hist[base + j];
-                if (h.pmSign == 0 || h.pmConf < kPmSyncConf) return false;
+                if (h.pmSign == 0 || h.pmConf < kPmBitMinConf) return false;
                 const int sof = j == 0 ? 59 : static_cast<int>(j) - 1;
                 const int bit = h.pmSign * pol > 0 ? 0 : 1;
                 if (bit != pmFixedBit(sof)) return false;
+                sum += h.pmConf;
             }
-            return true;
+            return sum >= 16.0f * kPmSyncConf;
         };
         const SecRec& s59 = hist[base];
         if (s59.amConf >= kSyncConf && s59.am != ClockSymbol::Marker) return false;
@@ -994,6 +1150,7 @@ struct Dcf77Decoder::Impl {
         voter.reset();
         for (auto& f : frame) f = SecRec{};
         frFilled = 0;
+        unconfirmedRun = 0;
     }
 
     void demote() {
@@ -1180,37 +1337,69 @@ struct Dcf77Decoder::Impl {
         learnPolarity();
 
         // ---- is the minute where we think it is? -------------------------
-        int pmMatch = 0, pmMismatch = 0, amBad = 0;
-        for (int s = 0; s < 60; ++s) {
+        //
+        // The count of seconds is settled by where the minute's two fixed
+        // features fall: AM's marker, the one second with no cut, at s59; and
+        // PM's sync word in s59 and s0-s14. A slipped count moves them, so
+        // only they can say it slipped.
+        //
+        // A confident marker reading ELSEWHERE, with s59 confidently the
+        // marker, is not a slip: the minute has one marker and it is where it
+        // belongs. It is one second misread -- a burst of interference filling
+        // a cut -- which costs that bit and nothing else. Counting it as a
+        // slip threw away the anchor and every frame the voter held, and with
+        // PM not tracking the way back was a new marker and two more frames:
+        // a receiver locked for seven minutes was out for four.
+        //
+        // So: CONFIRMED when a feature is where it belongs; CONTRADICTED when
+        // one is confidently somewhere it does not belong and nothing
+        // confirms; otherwise UNCONFIRMED -- faded, not wrong.
+        int pmMatch = 0, pmMismatch = 0, amStrayMarks = 0;
+        for (int s = 0; s < 59; ++s) {
             const SecRec& r = frame[static_cast<std::size_t>(s)];
             const int fixed = pmFixedBit(s);
             if (polarityKnown && fixed >= 0 && r.pmSign != 0) {
                 if (pmBitOf(r) == fixed) { if (r.pmConf >= kPmSyncConf) ++pmMatch; }
                 else if (r.pmConf >= kPmStructConf) ++pmMismatch;
             }
-            if (r.amConf >= kStructConf && r.am != ClockSymbol::Unknown) {
-                const bool expectMark = s == 59 && !leapMinute;
-                if ((r.am == ClockSymbol::Marker) != expectMark) ++amBad;
-            }
+            if (r.amConf >= kStructConf && r.am == ClockSymbol::Marker) ++amStrayMarks;
         }
         const SecRec& s59 = frame[59];
-        const bool amMarkSeen = s59.amConf >= kStructConf &&
-                                (leapMinute ? s59.am == ClockSymbol::Zero : s59.am == ClockSymbol::Marker);
+        {
+            const int fixed = pmFixedBit(59);
+            if (polarityKnown && s59.pmSign != 0) {
+                if (pmBitOf(s59) == fixed) { if (s59.pmConf >= kPmSyncConf) ++pmMatch; }
+                else if (s59.pmConf >= kPmStructConf) ++pmMismatch;
+            }
+        }
+        // A leap minute's s59 is an ordinary 0 and its marker comes at s60.
+        const ClockSymbol s59Expect = leapMinute ? ClockSymbol::Zero : ClockSymbol::Marker;
+        const bool s59Read = s59.amConf >= kStructConf && s59.am != ClockSymbol::Unknown;
+        const bool amStrong = s59Read && s59.am == s59Expect;
         const bool pmStrong = pmMatch >= 12 && pmMismatch == 0;
-        const bool amStrong = amBad == 0 && amMarkSeen;
-        const bool framed = frFilled >= 60 &&
-                            (pmStrong || amStrong) &&
-                            !(amBad > 0 && !pmStrong) &&
-                            !(pmMismatch > 0 && !amStrong);
-        if (!framed) {
+        // Contradicted by what matters -- marker or not -- and no finer: in a
+        // leap minute a 0.2 s cut at s59 is still a cut where one belongs.
+        const bool s59Wrong = s59Read && (s59.am == ClockSymbol::Marker) != (s59Expect == ClockSymbol::Marker);
+        const bool amContra = s59Wrong || (!amStrong && amStrayMarks > 0);
+        const bool pmContra = pmMismatch > 0;
+        const bool contradicted = (amContra && !pmStrong) || (pmContra && !amStrong);
+        const bool confirmed = frFilled >= 60 && (amStrong || pmStrong) && !contradicted;
+        if (contradicted || frFilled < 60 ||
+            (!confirmed && ++unconfirmedRun > kMaxUnconfirmedMinutes)) {
             dropAnchor();
             demote();
             return;
         }
+        if (confirmed) unconfirmedRun = 0;
 
         // ---- the time, twice ---------------------------------------------
-        const Decoded pm = decode(Src::Pm);
-        const Decoded am = decode(Src::Am);
+        //
+        // Not read from an unconfirmed minute: its count of seconds is taken
+        // on trust, and a time code read at the wrong offset can still pass
+        // parity. It goes to the voter empty, which keeps the voter's run of
+        // consecutive minutes -- and the frames already in it -- intact.
+        const Decoded pm = confirmed ? decode(Src::Pm) : Decoded{};
+        const Decoded am = confirmed ? decode(Src::Am) : Decoded{};
         prevFrameFrom = lastFrameFrom;
         const Decoded* use = nullptr;
         bool both = false;
@@ -1306,7 +1495,7 @@ struct Dcf77Decoder::Impl {
         const bool leapNext = leapMinute || (use && (use->leapWarn || lastLeapWarn) && leapSecondPossible(use->utc));
         lastLeapWarn = use && use->leapWarn;
 
-        if (certified && !leapNext) {
+        if (certified && confirmed && !leapNext) {
             haveVoted = true;
             setLockState(ClockLockState::Locked);
         } else {
@@ -1361,7 +1550,9 @@ struct Dcf77Decoder::Impl {
     struct Bin { double f = 0, stepRe = 1, stepIm = 0, rotRe = 1, rotIm = 0, accRe = 0, accIm = 0; };
     std::vector<Bin> bins;
     int64_t acqCount = 0, acqTarget = 0;
-    float lastToneSnrDb = 0.0f;
+    float lastToneSnrDb = 0.0f;       // at the search, then every kLiveToneSeconds
+    std::vector<Bin> liveBins;        // [0] the carrier at 0 Hz, then its neighbours
+    int64_t liveCount = 0, liveTarget = 0;
 
     // mixer
     double f0 = 0.0;
@@ -1385,14 +1576,16 @@ struct Dcf77Decoder::Impl {
     double refRe = 0.0, refIm = 0.0, yDc = 0.0;
     int freqCount = 0;
     double freqPrevRe = 0.0, freqPrevIm = 0.0;
-    std::vector<double> pre, pre2;      // prefix sums of y, and of y^2
-    bool useHp = false;                 // correlate the high-passed y (hpNeeded)
-    std::vector<double> preH, preH2;    // ... of y high-passed, and its square: noise only
+    std::vector<double> pre;            // prefix sums of y
+    bool useHp = false;                 // correlate the high-passed y (hpBetter)
+    std::vector<double> preH;           // ... of y high-passed
     int64_t hpM = 0;                    // half-width of the high-pass's mean
     int64_t mask = 0;
     int64_t steadyStart = 0;
     bool pmLocked = false;
     int pmMiss = 0;
+    double hpKeep2 = 1.0;               // burst power the high-pass keeps (hpSignalKept)
+    NoiseEst noiseRaw, noiseHp;         // tracked bursts' sigma_C^2, raw and high-passed
     std::vector<std::vector<float>> acqHist;   // C^2/sigma^2 by lag, last few searches
     int acqPint = 0, acqHistN = 0, acqHistNext = 0;
     int64_t acqBase = 0;
@@ -1426,6 +1619,7 @@ struct Dcf77Decoder::Impl {
     std::uint8_t lastFrameFrom = 0;
     std::uint8_t prevFrameFrom = 0;
     int pmRefusedLocks = 0;       // PM locks refused for contradicting a decoding AM
+    int unconfirmedRun = 0;       // consecutive minutes neither confirmed nor contradicted
 
     bool haveVoted = false;
     int votedMinute = -1, votedHour = -1, votedDoy = -1, votedYear = -1;
