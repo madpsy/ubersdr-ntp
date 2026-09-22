@@ -437,8 +437,8 @@ audio stream measures:
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
 | Network | 5–100 ms | Measured, as half the round trip of a JSON ping that the receiver itself answers, down the audio connection |
 | Codec | 8 ms (Opus), 0 (PCM v4) | A measured constant |
-| UberSDR chain | 14.1 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. Calibrated against the NTP class — see below |
-| Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB, DCF77) | A measured constant, from `tools/decodertest.cpp` and `tools/dcf77test.cpp` |
+| UberSDR chain | 9.4 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. Calibrated against the NTP class — see below |
+| Decoder bias | −8.9 ms (WWV/WWVH), 0 (WWVB, DCF77) | WWV: −13.6 ms measured on synthetic signals by `tools/decodertest.cpp`, plus a +4.7 ms WWV-only residual (below). DCF77: `tools/dcf77test.cpp` |
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
 
 The network term is measured over the **WebSocket**, not with an HTTP request,
@@ -497,6 +497,20 @@ with the crystal's rate shared across classes and a second upstream checking the
 first, centred on zero (mean +0.11 ms, sd 0.49). Anything under about twenty
 minutes of the smoothed delta describes the last disturbance rather than the
 constant: two of the three moves of it were read off windows that short.
+
+Every one of those measurements was on WWV, where the class delta sees only the
+*sum* of the chain constant, the WWV decoder bias and the skywave model. DCF77 is
+the first source with none of the WWV terms in it, and on 2026-09-22 it read
+**+4.78 ms**, steady over forty settled minutes and timed by phase modulation,
+against an NTP server fed directly by a GPS receiver 0.17 ms away. Nothing
+DCF77-specific can explain that: its AM and PM demodulators are independent and
+agree to under a millisecond, and radiod delays an IQ session exactly as it does
+a USB one (its channel filter is linear-phase, with a delay fixed by the block
+size, not the passband). So the chain constant is **9.4 ms**, and the 4.7 ms WWV
+needed on top of it is WWV's own: a residual that belongs to its decoder bias,
+which was measured on synthetic ticks, or to its skywave model, or to both. It is
+kept with the decoder term so that every WWV source's total is exactly what it
+was calibrated to. WWVB, like DCF77, has no WWV terms and moves with the chain.
 
 It was calibrated on WWV sources over Opus, so it carries whatever error sits in
 the terms those sources subtract and a DCF77 source does not -- the WWV decoder

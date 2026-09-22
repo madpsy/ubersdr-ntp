@@ -73,6 +73,28 @@ constexpr double kOpusDelaySec = 0.008;
 // than fixed in the decoder, whose tracker is built around the upstream value.
 constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 
+// What WWV and WWVH need on top of everything else, measured only as a
+// residual: +4.7 ms. It is the 4.7 ms the chain constant below carried until
+// 2026-09-22, moved here unchanged, so every WWV source's total delay is
+// exactly what it was calibrated to.
+//
+// It belongs to WWV because only WWV needs it. DCF77 read 4.7 ms early against
+// a GPS-fed NTP server for forty settled minutes with the chain at 14.1, and
+// nothing DCF77-specific can account for that: its AM and PM demodulators are
+// independent and agree to under a millisecond, its groundwave path cannot be
+// wrong by kilometres enough, and radiod's channel filter delays the iq preset
+// exactly as it does usb (filter.c: a linear-phase sinc, (M-1)/2 samples,
+// whatever the passband). WWV, calibrated against the NTP class with the same
+// chain, came out right. The chain is shared; the difference is not.
+//
+// Which WWV term is short is not known. The decoder bias above was measured on
+// synthetic signals, and a real tick, smeared by multipath and the ionosphere,
+// need not sit where a clean one does; or the skywave model's single hop at
+// 350 km is shorter than the path the signal takes. Both are WWV's alone, and
+// until a receiver that hears WWV and DCF77 together splits them, this is the
+// sum, kept with the decoder term where the status page shows it.
+constexpr double kWwvResidualSec = 0.0047;
+
 // The delay from RF reaching the SDR to the audio leaving UberSDR's WebSocket:
 // radiod's demodulator and filters, its block framing, the server's handling.
 // It is a property of the software, the same on every instance, so it is one
@@ -141,7 +163,18 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 //
 // The 2026-09-13 measurement, made directly against an ntpd-held host and
 // owing nothing to any of this, said 13.6 +/- 2.5 ms.
-constexpr double kUberSdrChainDelaySec = 0.0141;
+//
+// 9.4 ms, 2026-09-22, and this time split rather than moved. Every figure
+// above was taken on WWV, where the class delta sees only the SUM of this
+// constant, the WWV decoder bias and the skywave model -- so 14.1 was right for
+// that sum and said nothing about this term alone. DCF77 is the first source
+// with none of the WWV terms in it, and against an NTP server fed directly by a
+// GPS receiver, 0.17 ms away, over a 0.05 ms path to the receiver, it read
+// +4.78 ms steady for forty settled minutes, timed by PM: its delay was 4.7 ms
+// over-counted. What DCF77 and WWV share is this term, so this term is 4.7 ms
+// lower, and WWV keeps its total through kWwvResidualSec. WWVB, the other
+// source with no WWV terms, moves with DCF77.
+constexpr double kUberSdrChainDelaySec = 0.0094;
 
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
@@ -2072,17 +2105,17 @@ void Source::updateDelayModel() {
     // early makes the offset read large, so it is taken back off.
     // DCF77's edges are exact to the test's resolution whichever demodulator
     // is timing them (tools/dcf77test), so it has none either.
-    const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec : 0.0;
+    // WWV's residual rides here too (kWwvResidualSec), with the term it is most
+    // likely to belong to.
+    const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec + kWwvResidualSec : 0.0;
 
     m_snap.propagationSec = prop;
     m_snap.networkSec = net;
     m_snap.codecSec = codec;
     m_snap.decoderSec = decoder;
-    // Measured on USB sessions. A DCF77 source is an IQ session, which radiod
-    // serves from a different preset; whether its framing costs the same is
-    // not known yet, and the class delta on a DCF77 source is what will say.
-    // Applied as it stands until then: a separate IQ figure wants twenty
-    // settled minutes of that delta behind it, not a guess.
+    // The same for an IQ session as a USB one: radiod's channel filter is a
+    // linear-phase sinc whose delay is set by the block and overlap, not the
+    // passband, so the iq and usb presets are delayed alike.
     m_snap.chainSec = kUberSdrChainDelaySec;
     m_snap.extraSec = m_cfg.extraDelayMs / 1000.0;
     m_snap.delaySec = prop + net + codec + decoder + kUberSdrChainDelaySec + m_snap.extraSec;
