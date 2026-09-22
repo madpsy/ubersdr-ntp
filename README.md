@@ -180,7 +180,7 @@ with a reason a person can read.
 ./ubersdr-ntp_amd64 --source https://sdr.example.org@10 --port 12300
 
 # What you actually want:
-cp config.example.json config.json      # then edit it
+cp config.addon.json config.json        # then edit it
 ./ubersdr-ntp_amd64 --config config.json
 ```
 
@@ -208,9 +208,12 @@ curl -fsSL https://raw.githubusercontent.com/madpsy/ubersdr-ntp/main/install.sh 
 
 That sets up `~/ubersdr/ntp/` with the compose file, the start/stop/restart/update
 scripts and `config/config.json`. Out of the box it listens to the local
-receiver on WWV's 5, 10 and 15 MHz, with `time.cloudflare.com` and two fixed
-NIST servers as its network reference — three, because one upstream cannot be
-checked against anything; see `config.addon.json`. The addon container is on the receiver's
+receiver on WWV's 5, 10 and 15 MHz, with `time.cloudflare.com` as its network
+reference. On a first install it reads the receiver's own location from
+`/api/description`, and if that is within 2000 km of Mainflingen and the
+receiver tunes down to 77.5 kHz it listens to DCF77 alone instead, with the
+WWV sources left in the file but disabled. `config.addon.json` documents every setting, including why adding
+more upstreams is worth it. The addon container is on the receiver's
 own Docker network, which UberSDR's default `timeout_bypass_ips` exempts from
 session limits, so it needs no password. Edit `config/config.json` and
 `./restart.sh` to change any of it; `install.sh` never overwrites that file.

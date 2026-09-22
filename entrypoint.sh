@@ -18,7 +18,7 @@ set -e
 config=/config/config.json
 if [ ! -f "$config" ]; then
     echo "entrypoint: no $config mounted; using the built-in default" \
-         "(the local receiver on 5, 10 and 15 MHz, and three upstream servers)" >&2
+         "(the local receiver on 5, 10 and 15 MHz, and time.cloudflare.com)" >&2
     config=/etc/ubersdr-ntp/config.json
 fi
 

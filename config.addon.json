@@ -4,81 +4,400 @@
 // never overwrites it after that: edit it there, then ./restart.sh. The same
 // file is built into the image, and used whenever that one is missing.
 //
-// config.example.json in the repository explains every setting at length; this
-// file sets only what differs for the addon, and leaves the rest at defaults.
+// JSON with comments allowed. Every setting the daemon understands is here.
+// The ones left as comments are at their defaults, and the value shown IS the
+// default: to change one, uncomment it -- and mind the commas, since JSON
+// allows none after the last entry in an object or array.
+//
+// Outside the addon, run it directly with
+//     ubersdr-ntp --config config.json
+// and change the receiver URLs below, which name the receiver's container.
 {
+  // =====================================================================
+  // PORTS
+  // =====================================================================
   "ntp": {
-    // Inside the container only. The compose file publishes no port for NTP,
-    // so nothing outside the Docker network can reach it yet.
+    // The NTP service. Inside the container only: the compose file publishes
+    // no port for NTP, so nothing outside the Docker network can reach it yet.
+    //
+    // 123 is PRIVILEGED outside a container: either run as root, grant the
+    // one capability
+    //     sudo setcap 'cap_net_bind_service=+ep' ./ubersdr-ntp
+    // or put AmbientCapabilities=CAP_NET_BIND_SERVICE in the systemd unit.
+    // Anything above 1023 needs no privilege and is fine for testing.
     "port": 123,
+
+    // Which addresses to answer on. ["127.0.0.1"] to serve only this machine.
     "listen": ["0.0.0.0", "::"]
+
+    // How long to keep answering after the last source loses lock, and how
+    // fast the claimed accuracy decays while doing so. 15 ppm is NTP's own
+    // assumed wander for an undisciplined clock. Past the limit it answers
+    // stratum 0 with LI=3 -- unsynchronised -- which tells a client to look
+    // elsewhere at once rather than making it wait for a timeout.
+    // , "coast_seconds": 3600
+    // , "coast_drift_ppm": 15.0
+
+    // Answer with LI=3 / stratum 0 when unsynchronised, rather than falling
+    // silent. A client learns to look elsewhere at once from the first, and
+    // only on timeout from the second.
+    // , "answer_when_unsynchronised": true
+
+    // Pass the broadcast leap-second warning on to clients. It is decoded
+    // correctly, but false here means a single misread frame asserting it
+    // cannot tell every client on the network a leap second is coming.
+    // , "honour_leap_warning": true
+
+    // Responses per second per client, 0 to disable. NTP on UDP is a
+    // reflection amplifier if left open; the gain is 1, but a limit still caps
+    // what this can be aimed at.
+    // , "rate_limit_per_client": 10.0
+
+    // Where the crystal's fitted frequency is kept between runs -- ntpd's
+    // driftfile, for ntpd's reason. "-" disables it. In the addon the default
+    // is /var/lib/ubersdr-ntp/drift, on the compose file's "state" volume,
+    // because this directory is mounted read-only. Run directly, it is
+    // "drift" beside this file.
+    //
+    // The rate error is a property of a piece of hardware and does not change
+    // over a restart, but measuring it takes ten minutes, and nothing can
+    // borrow a rate that nothing has fitted yet. Until one exists every level
+    // is carried forward as though the crystal were perfect, and because the
+    // radio and NTP classes have different level windows they are biased by
+    // different amounts -- so the difference between them, the one figure here
+    // that checks the radio against anything, reads several ms out for a
+    // quarter of an hour after every start. This is what removes that.
+    // , "drift_file": "/var/lib/ubersdr-ntp/drift"
+
+    // The same figure as clock.min_radio_sources (or min_ntp_sources, when
+    // clock.primary is "ntp"), keyed by role instead of by kind. Kept for old
+    // configurations; use the clock settings, which do not swap meaning when
+    // the primary changes. Giving both with different values is an error.
+    // , "min_sources": 1
   },
 
   "http": {
-    // The status page and JSON API, reached through the receiver at
-    // /addon/ntp/. The receiver's addon proxy entry names this port.
+    // The read-only status service: the JSON API, the one-event-per-second
+    // stream, and the page, reached through the receiver at /addon/ntp/. The
+    // receiver's addon proxy entry names this port, so change both or neither.
+    // WEB_PORT in the compose file overrides it. "enabled": false turns it off.
+    //
+    // Outside the addon the default port is 1234. It serves no passwords, but
+    // it does advertise which receivers this daemon uses -- "127.0.0.1" keeps
+    // it on this machine, and "::" binds IPv6 and IPv4 both.
     "enabled": true,
     "port": 6099,
     "listen": "0.0.0.0"
   },
 
-  // MQTT through the receiver's addon ingest port: nothing to set.
+  // =====================================================================
+  // MQTT
+  //
+  // Published through the UberSDR receiver's own MQTT connection, by way of
+  // its addon ingest port, and into Home Assistant if the receiver has
+  // discovery on. Nothing to set: with no port to reach, or one that does not
+  // recognise this machine as an installed addon, it stays dormant and asks
+  // again every 30 s. The URL is only for a receiver container not called
+  // "ubersdr", or a port moved from 6926; UBERSDR_INGEST_URL in the
+  // environment overrides it. See "MQTT and Home Assistant" in the README.
+  // =====================================================================
   "mqtt": {
     "enabled": true,
     "ingest_url": "http://ubersdr:6926"
   },
 
+  // =====================================================================
+  // THE TWO CLASSES OF SOURCE
+  //
+  // There are two kinds of reference here: the radio sources below, and
+  // upstream NTP servers. They are not interchangeable, and the difference
+  // is not about which is more accurate -- a public NTP server very likely
+  // beats this daemon's own radio estimate. It is about WHAT THEY FAIL TO.
+  // The band dies every night and takes every receiver hearing the same
+  // transmitter with it. The network dies for its own unrelated reasons.
+  // Neither failure covers the other, and a clock meant to run unattended
+  // for months wants both.
+  //
+  // So one class is the primary and the other the secondary.
+  // =====================================================================
   "clock": {
+    // Which class is trusted first. "radio" is the point of this program: a
+    // stratum-1 reference that does not depend on the network. "ntp" makes
+    // the upstreams primary and the radio the check on them, which is the
+    // right way round on a machine where the network is the reliable part
+    // and the radio is the interesting part.
     "primary": "radio",
+
+    // What the OTHER class does while the primary is healthy.
+    //
+    //   "always"   Connected, and contributing. Both classes go into one
+    //              intersection and one weighted mean. The most accurate
+    //              arrangement, and any disagreement shows up as it happens.
+    //
+    //   "standby"  Connected and measured, but held out of the served time.
+    //              The default, and the best trade for most installs:
+    //              failover costs nothing because the standby is already
+    //              warm, a broken standby is known about BEFORE it is
+    //              needed, and the difference between the two classes is
+    //              measured continuously -- which is the only absolute
+    //              reference this daemon has for the constants every radio
+    //              source shares. See "the delta" below.
+    //
+    //   "cold"     Not connected at all until the primary fails. The only
+    //              mode that costs a remote receiver nothing while it is not
+    //              needed -- public UberSDR receivers cap concurrent sessions
+    //              per address, usually at two -- and the only one where
+    //              failover is slow, because a radio source needs about five
+    //              minutes to acquire a lock from nothing.
     "secondary": "standby"
+
+    // How long the primary must have had nothing usable before the secondary
+    // takes over, and how long it must be healthy again before it takes back.
+    //
+    // Deliberately different. Failing over is cheap and failing over late is
+    // expensive. Failing BACK costs a step in the served time for no gain if
+    // the primary is about to drop out again -- and a decoder coming out of a
+    // fade re-locks and loses it repeatedly for several minutes.
+    // , "failover_after_seconds": 60
+    // , "failback_after_seconds": 300
+
+    // How many sources of each KIND must be usable -- locked, fresh, and not
+    // refused for disagreeing with the others -- before that class counts as
+    // healthy. Below it the class does not serve, and if it is the primary
+    // the failover clock starts. Keyed by kind, not by role, so the figures
+    // stay with the receivers and the servers whichever one is primary.
+    //
+    // 1 suits a single-receiver install. 2 radio sources makes the agreement
+    // test load-bearing, which buys protection against one receiver producing
+    // a CONFIDENT misread -- a real failure mode here, because a deep fade
+    // biases the same bits in every frame of the decoder's voter window and
+    // no metric inside one decoder can catch it. An independent receiver can.
+    // , "min_radio_sources": 1
+    // , "min_ntp_sources": 1
+
+    // The secondary's figure keyed by role -- the counterpart of
+    // ntp.min_sources, kept for old configurations. Prefer the two above.
+    // , "min_secondary_sources": 1
   },
 
+  // =====================================================================
+  // UPSTREAM NTP SERVERS
+  //
   // The other class: measured all the time, used when the radio fails, and
-  // the only absolute check on the radio's delay model. Delete it if this
-  // machine must talk to nothing but the receiver.
+  // the only absolute check on the radio's delay model. Delete the entries
+  // (leave the array empty) if this machine must talk to nothing but the
+  // receiver.
   //
-  // THREE, AND NOT FROM A POOL
+  // THE DELTA. While both classes are measured at once -- "always", and
+  // "standby", which is what standby is for -- the status page shows the
+  // difference between them. Every radio source shares the same chain delay,
+  // codec delay and decoder edge bias, so those terms cancel exactly in any
+  // comparison between receivers and NO NUMBER OF RECEIVERS CAN MEASURE THEM.
+  // An NTP server does not share them, so the difference is a direct reading
+  // of the radio delay model's absolute error. It is reported and never
+  // applied: a correction that made the radio agree with the network by
+  // construction would destroy the only independent check in the arrangement.
+  // =====================================================================
+  "ntp_defaults": {
+    // Every setting of an ntp_sources entry can be given here instead, and
+    // applies to each entry that does not set it for itself.
+
+    // Seconds between polls, at least 8. 64 is NTP's own default and what a
+    // public server expects. Anything under 16 is rude to a server you do not
+    // own, and the pool's terms of service say so. The offset estimator's
+    // windows scale off this, so changing it needs nothing else changed.
+    // "poll_seconds": 64,
+
+    // A short burst on the first poll, and whenever a cold peer is brought up.
+    // One sample is not a measurement, and a fallback that takes six minutes
+    // to become usable arrives after the outage it was for.
+    // "iburst": true,
+
+    // Refuse a server whose OWN root distance is worse than this: it is
+    // telling you, in the packet, how well it knows the time.
+    // "max_root_distance_ms": 500,
+
+    // The furthest up the tree to follow. Stratum 16 is unsynchronised and is
+    // always refused; this is about how much accumulated path to accept.
+    // "max_stratum": 15,
+
+    // Relative confidence in the combine, as for a radio source.
+    // "weight": 1.0,
+
+    // Anything the round-trip halving cannot see: a path whose two directions
+    // are known to differ. Positive means the reply takes LONGER than the
+    // request, as a satellite downlink or an asymmetric DSL line does. Leave
+    // at 0 unless you have measured it.
+    // "extra_delay_ms": 0.0,
+
+    // UDP port on the server.
+    // "port": 123
+  },
+
+  // As many as you like. Each is an independent candidate, so the agreement
+  // test that catches one receiver misdecoding also catches one NTP server
+  // that has gone wrong -- given enough of them. One server cannot be
+  // checked: there is nothing to outvote it, and every asymmetry on its path
+  // lands in the delta as if the radio had earned it. Three or more gives the
+  // agreement test something to work with.
   //
-  // One server cannot be checked. Its `residual_ms` is 0.0 by construction,
-  // there is nothing to outvote it, and every asymmetry on its one path lands
-  // in the radio's delay model as if the radio had earned it. That is not
-  // theoretical: time.cloudflare.com is anycast, it moved from 162.159.200.1
-  // to .123 across a restart on 2026-09-20, and the class offset went from
-  // +1.0 ms to +7.3 ms on a reference that had not actually changed.
+  // A bare string is a hostname; HOST:PORT works, and [v6addr]:PORT for an
+  // IPv6 literal. An object takes every ntp_defaults setting plus:
+  //     "server"   the hostname or address (also accepted as "address"/"host")
+  //     "name"     what it is called in the log and on the status page;
+  //                must be unique, and defaults to the server
+  //     "enabled"  false keeps the entry but does not poll it
   //
-  // Not pool.ntp.org, and not time.nist.gov either, however sensible they look.
-  // Both hand back a different server on each refresh -- the pool by design,
-  // time.nist.gov through a load balancer on a 30 second TTL -- and a changed
-  // address clears the eight-sample clock filter (see NtpPeer::resolve). At a
-  // 64 second poll that register needs eight and a half minutes to refill, so
-  // a peer that moves every few minutes never once converges. It would add
-  // noise wearing the clothes of a second opinion.
+  // Prefer a NAMED server with a fixed address over a pool. pool.ntp.org hands
+  // back a different machine on each DNS refresh by design, and time.nist.gov
+  // does the same through a load balancer on a 30 second TTL. A changed
+  // address clears the peer's eight-sample clock filter (NtpPeer::resolve),
+  // and at a 64 second poll that takes eight and a half minutes to refill, so
+  // a peer that moves every few minutes never converges. It adds noise
+  // wearing the clothes of a second opinion. time-a-g.nist.gov and
+  // time-b-g.nist.gov are fixed addresses serving UTC(NIST), the same
+  // realisation WWV broadcasts.
   //
-  // time-a-g and time-b-g are single fixed addresses, 129.6.15.28 and .29, and
-  // they serve UTC(NIST) -- the same realisation WWV broadcasts. Checking a
-  // WWV-disciplined clock against NIST's own network time is as close to
-  // like-for-like as this comparison can get.
+  // time.cloudflare.com is anycast, so which machine answers can change: it
+  // moved from 162.159.200.1 to .123 across a restart on 2026-09-20, and the
+  // class offset went from +1.0 ms to +7.3 ms on a reference that had not
+  // actually changed.
   "ntp_sources": [
-    "time.cloudflare.com",
-    "time-a-g.nist.gov",
-    "time-b-g.nist.gov"
+    // A router or a server on your own network: the lowest delay available,
+    // and the one worth weighting up.
+    // { "server": "192.168.1.1", "poll_seconds": 32, "weight": 2.0 },
+    // "time-a-g.nist.gov",
+    // "time-b-g.nist.gov",
+    "time.cloudflare.com"
   ],
 
-  // The receiver this runs beside, on WWV's three strongest carriers. 5 MHz
-  // carries the night, 15 MHz the day, 10 MHz most of both. Addon containers
-  // are on the receiver's own Docker network, which its default
-  // timeout_bypass_ips exempts from session limits, so no password is needed.
-  // A receiver that does not exempt it wants its bypass password in each one.
+  // =====================================================================
+  // SOURCES -- the receivers, and what each listens to.
+  //
+  // This array is the RADIO class. More than one because HF propagation makes
+  // any single frequency unreliable: 10 MHz from Fort Collins is excellent in
+  // the afternoon and gone at 3am, 5 MHz is the other way round. 5 MHz
+  // carries the night, 15 MHz the day, 10 MHz most of both.
+  //
+  // Addon containers are on the receiver's own Docker network, which its
+  // default timeout_bypass_ips exempts from session limits, so no password is
+  // needed here. A receiver that does not exempt it wants its bypass password
+  // in each source.
+  //
+  // Public receivers usually cap concurrent sessions per IP -- two is common
+  // -- so several frequencies on ONE remote receiver often is not possible.
+  // Several receivers is better anyway: it decorrelates the propagation path
+  // as well as the frequency.
+  // =====================================================================
+  "defaults": {
+    // Every setting of a sources entry except "name" can be given here, and
+    // applies to each source that does not set it for itself.
+
+    // "pcm-v4" is the predictive lossless codec, asked for at full quality
+    // (min_margin=0): no codec delay at all, at roughly four times the
+    // bandwidth of Opus. "opus" is about 24 kbps and adds a constant ~8 ms
+    // that the delay model accounts for -- the choice for a receiver on a
+    // slow or metered link.
+    // "format": "pcm-v4",
+
+    // Check an https:// receiver's certificate.
+    // "verify_tls": true,
+
+    // Work out the delay from the receiver, codec and decoder, which is right
+    // for every UberSDR receiver. false uses "delay_ms" verbatim instead.
+    // "auto_delay": true
+  },
+
   "sources": [
+    // Each entry takes:
+    //
+    //   "name"            what it is called in the log; must be unique.
+    //                     Named after the station and carrier if left out.
+    //   "url"             the receiver, http:// or https://. Required.
+    //
+    //   "carrier_hz"      the TRANSMITTER's carrier (default 10000000). The
+    //                     dial is derived as 1 kHz below it, which is the
+    //                     tuning WWV, WWVH and WWVB all want -- it puts the
+    //                     carrier at 1000 Hz audio in USB. DO NOT subtract the
+    //                     kilohertz yourself.
+    //   "dial_hz"         an explicit dial, for a receiver that needs one.
+    //                     0, the default, derives it.
+    //
+    //   "password"        the receiver's bypass password, if it has one. Worth
+    //                     having: a bypassed session has no time limit, and a
+    //                     session the server kicks costs about four minutes of
+    //                     clean signal to re-acquire a lock.
+    //
+    //   "extra_delay_ms"  anything the delay model cannot see, added on top of
+    //                     it (default 0). The receiver's own delay (radiod to
+    //                     the WebSocket) is the same on every UberSDR instance
+    //                     and already built in, as is the decoder's edge bias.
+    //                     Leave at 0 unless this one source disagrees with a
+    //                     reference clock you trust for a reason of its own.
+    //                     Getting it wrong biases the served time by exactly
+    //                     the amount you got wrong.
+    //   "delay_ms"        the whole delay, used verbatim when auto_delay is
+    //                     false (giving it without auto_delay turns that off).
+    //
+    //   "weight"          relative confidence in the combine (default 1.0). A
+    //                     receiver you know to be worse can be kept and
+    //                     weighted down rather than removed.
+    //   "enabled"         false keeps the entry but does not connect it.
+    //
+    //   and "format", "verify_tls", "auto_delay" as under "defaults".
     { "name": "local-5",  "url": "http://ubersdr:8080", "carrier_hz": 5000000 },
     { "name": "local-10", "url": "http://ubersdr:8080", "carrier_hz": 10000000 },
     { "name": "local-15", "url": "http://ubersdr:8080", "carrier_hz": 15000000 }
+
+    // A remote receiver, for when the local one cannot hear the station.
+    // Use a receiver you have permission to use -- this is a long-lived
+    // session that occupies one of its listener slots.
+    // , { "name": "remote-10", "url": "https://sdr.example.org", "carrier_hz": 10000000, "password": "" }
+
+    // WWV's two extra outlets. 20 MHz is WWV only; 25 MHz is an experimental
+    // broadcast -- real, but intermittent and lower power.
+    // , { "name": "local-20", "url": "http://ubersdr:8080", "carrier_hz": 20000000 }
+
+    // WWVB, for a receiver in range of its 60 kHz groundwave. Chosen
+    // automatically for any dial below 1 MHz -- it is a genuinely different
+    // decoder, not a setting.
+    // , { "name": "wwvb", "url": "http://ubersdr:8080", "carrier_hz": 60000 }
+
+    // DCF77, for a receiver in Europe. The German time signal: 50 kW on
+    // 77.5 kHz longwave from Mainflingen, near Frankfurt, run by PTB. Its
+    // groundwave carries reliably to about 2000 km, which is most of Europe,
+    // and it is often heard further at night. Longwave does not die at night
+    // the way HF does, which makes it a good partner for a WWV source. The
+    // receiver has to cover LF: an RX888 or a KiwiSDR does, many HF-only SDRs
+    // stop above it.
+    //
+    // Recognised by its carrier, exactly, and tuned ON it in IQ mode rather
+    // than 1 kHz below in USB: its phase modulation is what times the second
+    // to tens of microseconds, and an audio channel keeps no phase. IQ is
+    // always lossless, so "format" is ignored. Its amplitude modulation is
+    // decoded alongside as the check and the fallback (see "DCF77" in the
+    // README).
+    // , { "name": "dcf77", "url": "http://ubersdr:8080", "carrier_hz": 77500 }
   ],
 
+  // =====================================================================
+  // LOGGING
+  //
+  // To stderr, which the compose file sends to the receiver's log collector.
+  // LOG_LEVEL in the compose file overrides the level.
+  //
+  // With a file set, the same lines go to stderr and to the file, PLUS a
+  // detailed per-source status block every status_interval_seconds (0 turns
+  // it off) -- which is how you see what each source is doing when this runs
+  // in the background with no terminal. SIGHUP reopens the file, for
+  // logrotate. SIGUSR1 writes a block at once.
+  // =====================================================================
   "log": {
-    // To stderr, which the compose file sends to the receiver's log collector.
+    // trace, debug, info, warn or error.
     "level": "info",
     "stderr": true,
     "status_interval_seconds": 30
+
+    // , "file": ""
   }
 }

@@ -35,6 +35,82 @@ done
 die() { echo "error: $*" >&2; exit 1; }
 
 # ---------------------------------------------------------------------------
+# WWV or DCF77
+# ---------------------------------------------------------------------------
+
+# DCF77's primary antenna at Mainflingen (Propagation.cpp, dcf77Site), and the
+# reach of its groundwave. Inside that, DCF77 is the better station: longwave
+# does not die at night the way HF does, and its phase modulation times the
+# second far more finely than WWV's audio ticks.
+DCF77_LAT=50.015528
+DCF77_LON=9.008515
+DCF77_RANGE_KM=2000
+STATION=""   # empty when an existing configuration was kept
+
+# The receiver's /api/description: from the port UberSDR publishes on the
+# host, or failing that from inside its Docker network, where it is always
+# "ubersdr:8080".
+fetch_description() {
+    curl -fsS --max-time 5 http://localhost:8080/api/description 2>/dev/null && return 0
+    docker run --rm --network ubersdr_sdr-network --entrypoint wget \
+        madpsy/ubersdr-ntp:latest -q -T 5 -O - http://ubersdr:8080/api/description 2>/dev/null
+}
+
+# On a fresh configuration only: if the receiver is within DCF77's range and
+# can tune 77.5 kHz, listen to DCF77 alone, with the WWV sources kept in the
+# file but disabled. Anything missing or unexpected leaves the WWV default.
+choose_station() {
+    local desc gps lat lon minf km
+    STATION="wwv"
+    echo "Asking the local receiver where it is..."
+    if ! desc="$(fetch_description)" || [[ -z "${desc}" ]]; then
+        echo "  No answer from the receiver — using WWV"
+        return
+    fi
+    # UberSDR's JSON is compact and these objects are flat, so no parser is
+    # needed: receiver.gps is the one "gps" object ("gpsdo" is another key).
+    # Each allowed to find nothing: under pipefail a missing key would
+    # otherwise end the install.
+    gps="$(grep -o '"gps":{[^}]*}' <<<"${desc}" | head -n1 || true)"
+    lat="$(grep -oE '"lat":-?[0-9.]+' <<<"${gps}" | cut -d: -f2 || true)"
+    lon="$(grep -oE '"lon":-?[0-9.]+' <<<"${gps}" | cut -d: -f2 || true)"
+    minf="$(grep -o '"tuning_range":{[^}]*}' <<<"${desc}" \
+            | grep -oE '"min_frequency":[0-9.]+' | cut -d: -f2 || true)"
+    if [[ -z "${lat}" || -z "${lon}" ]] \
+       || awk -v a="${lat}" -v b="${lon}" 'BEGIN { exit !(a*a < 1e-4 && b*b < 1e-4) }'; then
+        echo "  The receiver publishes no location — using WWV"
+        return
+    fi
+    km="$(awk -v la1="${lat}" -v lo1="${lon}" -v la2="${DCF77_LAT}" -v lo2="${DCF77_LON}" 'BEGIN {
+        r = atan2(0, -1) / 180
+        dla = (la2 - la1) * r; dlo = (lo2 - lo1) * r
+        h = sin(dla/2)^2 + cos(la1*r) * cos(la2*r) * sin(dlo/2)^2
+        printf "%.0f", 2 * 6371 * atan2(sqrt(h), sqrt(1 - h))
+    }')"
+    echo "  Receiver at ${lat}, ${lon}: ${km} km from DCF77"
+    if (( km > DCF77_RANGE_KM )); then
+        echo "  Beyond DCF77's ${DCF77_RANGE_KM} km groundwave — using WWV"
+        return
+    fi
+    if [[ -z "${minf}" ]] || awk -v f="${minf}" 'BEGIN { exit !(f > 77500) }'; then
+        echo "  The receiver does not report tuning down to 77.5 kHz — using WWV"
+        return
+    fi
+    sed -i -E \
+        -e 's/^(    \{ "name": "local-(5|10|15)",.*"carrier_hz": [0-9]+) \}/\1, "enabled": false }/' \
+        -e 's#^    // (, \{ "name": "dcf77",.*\})$#    \1#' \
+        "${CONFIG_FILE}"
+    if [[ "$(grep -c '"enabled": false }' "${CONFIG_FILE}")" != 3 ]] \
+       || ! grep -q '^    , { "name": "dcf77"' "${CONFIG_FILE}"; then
+        echo "  Could not edit ${CONFIG_FILE} for DCF77 — fetching it again, with WWV"
+        curl -fsSL "${REPO_RAW}/config.addon.json" -o "${CONFIG_FILE}"
+        return
+    fi
+    STATION="dcf77"
+    echo "  Within range and the receiver covers LF — using DCF77, with WWV disabled"
+}
+
+# ---------------------------------------------------------------------------
 # Dependency checks
 # ---------------------------------------------------------------------------
 
@@ -73,6 +149,7 @@ else
     echo "Fetching the default configuration..."
     curl -fsSL "${REPO_RAW}/config.addon.json" -o "${CONFIG_FILE}"
     echo "Saved ${CONFIG_FILE}"
+    choose_station
 fi
 # Readable by the container's own user, which is not this one.
 chmod 755 "${CONFIG_DIR}"
@@ -107,9 +184,17 @@ echo "  Start      : ./start.sh"
 echo "  Restart    : ./restart.sh"
 echo "  Update     : ./update.sh"
 echo ""
-echo "It listens to the local receiver on 5, 10 and 15 MHz, with Cloudflare and two"
-echo "NIST servers as its network reference. Edit ${INSTALL_DIR}/${CONFIG_FILE}"
-echo "to change that, then run ./restart.sh"
+case "${STATION}" in
+    dcf77) echo "It listens to DCF77 on 77.5 kHz through the local receiver, with Cloudflare" ;;
+    wwv)   echo "It listens to WWV through the local receiver on 5, 10 and 15 MHz, with Cloudflare" ;;
+esac
+if [[ -n "${STATION}" ]]; then
+    echo "as its network reference. Edit ${INSTALL_DIR}/${CONFIG_FILE}, where every"
+    echo "setting is documented, then run ./restart.sh"
+else
+    echo "It uses your existing ${INSTALL_DIR}/${CONFIG_FILE}; edit it, then run"
+    echo "./restart.sh"
+fi
 echo ""
 echo "NTP itself (port 123/udp) is not published outside Docker yet."
 echo ""

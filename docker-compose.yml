@@ -36,12 +36,18 @@ services:
       - sdr-network
     volumes:
       - ./config:/config:ro
+      # The daemon's own state -- the crystal's drift, so a restart or an
+      # update does not spend ten minutes measuring it again.
+      - state:/var/lib/ubersdr-ntp
     logging:
       driver: "fluentd"
       options:
         fluentd-address: "127.0.0.1:24224"
         fluentd-async: "true"
         tag: "ntp"
+
+volumes:
+  state:
 
 networks:
   sdr-network:

@@ -213,9 +213,10 @@ struct NtpConfig {
     // the one measurement here that checks the radio against anything -- reads
     // several milliseconds out for a quarter of an hour after every start.
     //
-    // Empty disables it. The default is next to the configuration file, which
-    // is the one directory an operator has already had to make writable and
-    // the one the addon container already mounts.
+    // "-" disables it. Empty means the default: UBERSDR_NTP_DRIFT_FILE if the
+    // environment sets it, which the addon container does because it mounts
+    // the configuration read-only, and otherwise "drift" next to the
+    // configuration file.
     std::string driftFile;
 };
 

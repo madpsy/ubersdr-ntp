@@ -46,7 +46,14 @@ COPY config.addon.json /etc/ubersdr-ntp/config.json
 RUN chmod +x /usr/local/bin/entrypoint.sh \
     && setcap cap_net_bind_service=+ep /usr/local/bin/ubersdr-ntp \
     && apt-get purge -y libcap2-bin && apt-get autoremove -y \
-    && mkdir -p /config
+    && mkdir -p /config /var/lib/ubersdr-ntp \
+    && chown ntp:ntp /var/lib/ubersdr-ntp
+
+# The drift file. /config is mounted read-only and belongs to the host user, so
+# the daemon's own state goes here instead, on a named volume in the compose
+# file so it survives the container being recreated by an update. drift_file in
+# the configuration overrides it.
+ENV UBERSDR_NTP_DRIFT_FILE=/var/lib/ubersdr-ntp/drift
 
 USER ntp
 

@@ -182,7 +182,12 @@ constexpr double kDriftWriteIntervalSec = 3600.0;
 // A change too small to be worth a write, given what the figure is for.
 constexpr double kDriftWriteThresholdPpm = 0.05;
 
+// UBERSDR_NTP_DRIFT_FILE, when set, is the default instead: the container sets
+// it, because its configuration directory is mounted read-only and the drift
+// file has to live somewhere the daemon's own user can write. drift_file in the
+// configuration still wins over both.
 std::string defaultDriftPath(const std::string& configPath) {
+    if (const char* v = std::getenv("UBERSDR_NTP_DRIFT_FILE"); v && *v) return v;
     if (configPath.empty()) return "";
     const std::size_t slash = configPath.find_last_of('/');
     return slash == std::string::npos ? "drift" : configPath.substr(0, slash + 1) + "drift";
