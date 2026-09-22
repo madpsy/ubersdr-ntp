@@ -349,24 +349,24 @@
     // >>> station
     // install.sh replaces everything from here to "<<< station" on a first
     // install, with WWV or DCF77 depending on where the receiver is.
-    { "name": "local-5",  "url": "http://ubersdr:8080", "carrier_hz": 5000000 },
-    { "name": "local-10", "url": "http://ubersdr:8080", "carrier_hz": 10000000 },
-    { "name": "local-15", "url": "http://ubersdr:8080", "carrier_hz": 15000000 }
+    { "name": "local-5",  "url": "http://ubersdr:8080", "carrier_hz": 5000000, "extra_delay_ms": 0.0 },
+    { "name": "local-10", "url": "http://ubersdr:8080", "carrier_hz": 10000000, "extra_delay_ms": 0.0 },
+    { "name": "local-15", "url": "http://ubersdr:8080", "carrier_hz": 15000000, "extra_delay_ms": 0.0 }
     // <<< station
 
     // A remote receiver, for when the local one cannot hear the station.
     // Use a receiver you have permission to use -- this is a long-lived
     // session that occupies one of its listener slots.
-    // , { "name": "remote-10", "url": "https://sdr.example.org", "carrier_hz": 10000000, "password": "" }
+    // , { "name": "remote-10", "url": "https://sdr.example.org", "carrier_hz": 10000000, "extra_delay_ms": 0.0, "password": "" }
 
     // WWV's two extra outlets. 20 MHz is WWV only; 25 MHz is an experimental
     // broadcast -- real, but intermittent and lower power.
-    // , { "name": "local-20", "url": "http://ubersdr:8080", "carrier_hz": 20000000 }
+    // , { "name": "local-20", "url": "http://ubersdr:8080", "carrier_hz": 20000000, "extra_delay_ms": 0.0 }
 
     // WWVB, for a receiver in range of its 60 kHz groundwave. Chosen
     // automatically for any dial below 1 MHz -- it is a genuinely different
     // decoder, not a setting.
-    // , { "name": "wwvb", "url": "http://ubersdr:8080", "carrier_hz": 60000 }
+    // , { "name": "wwvb", "url": "http://ubersdr:8080", "carrier_hz": 60000, "extra_delay_ms": 0.0 }
 
     // DCF77, for a receiver in Europe. The German time signal: 50 kW on
     // 77.5 kHz longwave from Mainflingen, near Frankfurt, run by PTB. Its
@@ -382,7 +382,7 @@
     // always lossless, so "format" is ignored. Its amplitude modulation is
     // decoded alongside as the check and the fallback (see "DCF77" in the
     // README).
-    // , { "name": "dcf77", "url": "http://ubersdr:8080", "carrier_hz": 77500 }
+    // , { "name": "dcf77", "url": "http://ubersdr:8080", "carrier_hz": 77500, "extra_delay_ms": 0.0 }
   ],
 
   // =====================================================================

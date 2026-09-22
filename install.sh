@@ -104,12 +104,12 @@ station_sources() {
     local url="http://ubersdr:8080"
     case "$1" in
         dcf77)
-            echo "    { \"name\": \"dcf77\",    \"url\": \"${url}\", \"carrier_hz\": 77500 }"
+            echo "    { \"name\": \"dcf77\",    \"url\": \"${url}\", \"carrier_hz\": 77500, \"extra_delay_ms\": 0.0 }"
             ;;
         *)
-            echo "    { \"name\": \"local-5\",  \"url\": \"${url}\", \"carrier_hz\": 5000000 },"
-            echo "    { \"name\": \"local-10\", \"url\": \"${url}\", \"carrier_hz\": 10000000 },"
-            echo "    { \"name\": \"local-15\", \"url\": \"${url}\", \"carrier_hz\": 15000000 }"
+            echo "    { \"name\": \"local-5\",  \"url\": \"${url}\", \"carrier_hz\": 5000000, \"extra_delay_ms\": 0.0 },"
+            echo "    { \"name\": \"local-10\", \"url\": \"${url}\", \"carrier_hz\": 10000000, \"extra_delay_ms\": 0.0 },"
+            echo "    { \"name\": \"local-15\", \"url\": \"${url}\", \"carrier_hz\": 15000000, \"extra_delay_ms\": 0.0 }"
             ;;
     esac
 }
