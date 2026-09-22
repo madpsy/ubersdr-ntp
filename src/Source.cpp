@@ -10,7 +10,6 @@
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <curl/curl.h>
-#include <opus/opus.h>
 
 #include <algorithm>
 #include <cmath>
@@ -56,14 +55,6 @@ constexpr double kOffsetStaleSec = 180.0;
 // event should have arrived — WWV sends one a minute.
 constexpr double kAnchorMaxAgeSec = 300.0;
 
-// Opus's constant contribution to the delay. The encoder's own lookahead is
-// 6.5 ms at any rate; the measured end-to-end shift of the decoder's second
-// edge through an encode/decode round trip at 12 kHz is 5-10 ms, the balance
-// being reconstruction. 8 ms is the middle of what was measured, and it is a
-// bias rather than noise: across clean and 3 dB-SNR signals the shift did not
-// move.
-constexpr double kOpusDelaySec = 0.008;
-
 // Where the WWV/WWVH decoder puts a second edge relative to the true edge in
 // its input: 13.6 ms EARLY, the matched filter's chain delay being taken as 7
 // series samples where it is 4.27. Measured, not estimated: tools/decodertest
@@ -90,8 +81,11 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // Which WWV term is short is not known. The decoder bias above was measured on
 // synthetic signals, and a real tick, smeared by multipath and the ionosphere,
 // need not sit where a clean one does; or the skywave model's single hop at
-// 350 km is shorter than the path the signal takes. Both are WWV's alone, and
-// until a receiver that hears WWV and DCF77 together splits them, this is the
+// 350 km is shorter than the path the signal takes. And the WWV calibrations
+// were all made over Opus, which is no longer used: the sum they fixed held the
+// 8 ms then charged for Opus (measured offline as a 5-10 ms bias), so WWV over
+// PCM is right only as far as that figure was, and this carries its error too.
+// Until a receiver that hears WWV and DCF77 together splits them, this is the
 // sum, kept with the decoder term where the status page shows it.
 constexpr double kWwvResidualSec = 0.0047;
 
@@ -134,13 +128,10 @@ constexpr double kWwvResidualSec = 0.0047;
 // common landing inside half a millisecond of each other is worth more than
 // either on its own.
 //
-// It stays degenerate with the Opus and decoder-edge constants above: the class
-// delta sees only their sum, so charging the difference here is bookkeeping,
+// It stays degenerate with the decoder-edge constant above: the class delta
+// sees only their sum, so charging the difference here is bookkeeping,
 // justified by this being the term defined as the residual and the only one
-// never measured on its own. Running one source as pcm-v4 alongside an Opus one
-// on the same dial would settle the split -- the codec term is the only thing
-// that differs between them -- and until someone does, this is an attribution
-// rather than a measurement.
+// never measured on its own.
 //
 // 14.1 ms, and this one is measured rather than glanced at. Sixty-four minutes
 // of settled class delta, once the system rate was being borrowed and a second
@@ -355,7 +346,7 @@ Source::Source(SourceConfig cfg)
     m_snap.enabled = m_cfg.enabled;
     m_snap.carrierHz = m_cfg.carrierHz;
     m_snap.dialHz = m_cfg.dialHz;
-    m_snap.format = m_cfg.format;
+    m_snap.minMarginDb = m_iq ? m_cfg.minMarginDb : 0;
     m_snap.weight = m_cfg.weight;
     m_snap.station = m_broadcast == Broadcast::Dcf77 ? "dcf77"
                    : m_broadcast == Broadcast::Wwvb ? "wwvb"
@@ -365,7 +356,6 @@ Source::Source(SourceConfig cfg)
 
 Source::~Source() {
     stop();
-    if (m_opus) { opus_decoder_destroy(m_opus); m_opus = nullptr; }
 }
 
 void Source::start() {
@@ -408,9 +398,8 @@ void Source::stop() {
 
 void Source::supervise() {
     const char* tag = m_cfg.name.c_str();
-    LOG_INFO(tag, "starting: %s dial %.6f MHz (carrier %.6f MHz) format %s",
-             m_cfg.url.c_str(), m_cfg.dialHz / 1e6, m_cfg.carrierHz / 1e6,
-             formatName(m_cfg.format));
+    LOG_INFO(tag, "starting: %s dial %.6f MHz (carrier %.6f MHz)",
+             m_cfg.url.c_str(), m_cfg.dialHz / 1e6, m_cfg.carrierHz / 1e6);
 
     // At boot for the receiver's name and coordinates, and again after each
     // successful connection for as long as the coordinates are still unknown —
@@ -963,11 +952,11 @@ std::string Source::buildWsUrl() const {
       << "?frequency=" << m_cfg.dialHz;
     if (m_iq) {
         // DCF77: the whole 12 kHz of complex baseband, which is exactly the
-        // server's own IQ preset, so the mode change moves no filter. IQ is
-        // always lossless; min_margin=0 says so explicitly rather than relying
-        // on the parameter's absence meaning it.
+        // server's own IQ preset, so the mode change moves no filter. Lossless
+        // unless min_margin asks for reduced depth, and min_margin=0 says so
+        // explicitly rather than relying on the parameter's absence meaning it.
         u << "&mode=iq&bandwidthLow=-6000&bandwidthHigh=6000"
-          << "&format=pcm-zstd&min_margin=0";
+          << "&format=pcm-zstd&min_margin=" << m_cfg.minMarginDb;
     } else {
         u << "&mode=usb"
           // The passband has to reach 2.2 kHz or the WWV/WWVH second tick —
@@ -978,13 +967,12 @@ std::string Source::buildWsUrl() const {
           << "&bandwidthLow=0&bandwidthHigh=3000"
           // Lossless at full quality, as IQ is: min_margin=0 says so rather
           // than leaving it to the parameter's absence.
-          << (m_cfg.format == AudioFormat::Opus ? "&format=opus" : "&format=pcm-zstd&min_margin=0");
+          << "&format=pcm-zstd&min_margin=0";
     }
     u
-      // Version 4 for both: it is the only version whose Opus frames carry a
-      // self-describing header, and the lossless path at version 4 is the
-      // predictive codec rather than anything zstd. The query parameter is
-      // still spelt "pcm-zstd" for compatibility with older servers.
+      // Version 4 for both: the lossless path at version 4 is the predictive
+      // codec rather than anything zstd. The query parameter is still spelt
+      // "pcm-zstd" for compatibility with older servers.
       << "&version=4"
       << "&user_session_id=" << m_sessionId;
     if (!m_cfg.password.empty()) {
@@ -1056,7 +1044,7 @@ void Source::onText(const std::string& msg) {
 
 void Source::onBinary(const std::string& msg) {
     // The arrival timestamp is taken FIRST, before any parsing or decoding.
-    // Everything below — header parsing, Opus, the whole DSP chain — happens
+    // Everything below — header parsing, decoding, the whole DSP chain — happens
     // after this read, so none of it can add to the number.
     //
     // On the daemon clock, which nothing steers and nothing steps (SampleClock.h
@@ -1082,28 +1070,18 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
     // stretch of the stream. Dropping it without advancing the sample count
     // slips every later sample index 20 ms earlier than the instant it was
     // captured — a slip the SampleClock fit then averages in for five minutes.
-    // So a lost packet is replaced by something of the same length: Opus's own
-    // concealment where there is a decoder to ask, silence otherwise. Only once
-    // a timeline exists — before the first good packet there is nothing to
-    // keep in step.
+    // So a lost packet is replaced by silence of the same length. Only once a
+    // timeline exists — before the first good packet there is nothing to keep
+    // in step.
     auto concealLost = [this](int frameSamples) {
         if (m_decoderRate <= 0 || m_samplesWritten <= 0) return;
         const int n = frameSamples > 0 ? frameSamples : m_lastFrameSamples;
         if (n <= 0) return;
-        if (m_opus && m_opusRate == m_decoderRate && n <= static_cast<int>(m_opusPcm.size())) {
-            const int got = opus_decode(m_opus, nullptr, 0, m_opusPcm.data(), n, 0);
-            if (got > 0) {
-                feedSamples(m_opusPcm.data(), got, m_decoderRate, 0.0, false);
-                return;
-            }
-        }
         feedSilence(n, m_decoderRate);
     };
 
-    // A session that negotiated Opus still receives lossless frames the moment
-    // it tunes to an IQ mode, so the frame itself has to say which it is. The
-    // four-byte "PCM4" magic exists for exactly this; an Opus frame has no
-    // magic, which is why the test is this way round.
+    // Every frame asked for is PCM v4, which opens with the four-byte "PCM4"
+    // magic.
     if (ubersdr::PCMv4StreamDecoder::isV4Frame(pkt, len)) {
         if (!m_pcmv4) m_pcmv4 = std::make_unique<PcmV4Reader>();
         ubersdr::PCMv4Header h;
@@ -1131,7 +1109,6 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
             std::lock_guard<std::mutex> lk(m_mu);
             m_snap.basebandPowerDb = h.basebandPower;
             m_snap.noiseDb = h.noise;
-            m_feedingOpus = 0;
         }
         if (h.channels != m_channels) {
             // Interleaved I/Q fed to a decoder expecting mono would look like a
@@ -1147,8 +1124,8 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
         }
         // Frames, not int16 values: an IQ frame carries two per sample.
         const int frames = h.sampleCount / h.channels;
-        // ensureDecoder before the tracker, as on the Opus path: a rate change
-        // restarts the sample count the tracker is measuring against.
+        // ensureDecoder before the tracker: a rate change restarts the sample
+        // count the tracker is measuring against.
         if (!ensureDecoder(h.sampleRate)) return;
         trackTimeline(h.timestampNanos, h.sampleRate, frames);
         feedSamples(m_pcmv4->dec.samples(), frames, h.sampleRate, arrivalSec);
@@ -1166,88 +1143,15 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
         return;
     }
 
-    // Opus, then.
-    ubersdr::PCMv4Header h;
-    std::size_t off = 0;
-    std::string err;
-    if (!m_opusHeader.decode(pkt, len, h, off, err)) {
-        {
-            std::lock_guard<std::mutex> lk(m_mu);
-            if (m_snap.decodeErrors++ % 200 == 0)
-                LOG_WARN(m_cfg.name.c_str(), "opus header: %s", err.c_str());
-        }
-        // Every delta after this is relative to one never applied, so the
-        // timestamps are off by this packet's delta until the next full one.
-        m_tsHave = false;
-        m_tsWaitResync = true;
-        concealLost(0);
-        return;
-    }
+    // Nothing else is asked for. A frame that is neither is a server speaking
+    // some other protocol; it still occupied its stretch of the stream.
     {
         std::lock_guard<std::mutex> lk(m_mu);
-        m_snap.basebandPowerDb = h.basebandPower;
-        m_snap.noiseDb = h.noise;
-        m_feedingOpus = 1;
+        if (m_snap.decodeErrors++ % 200 == 0)
+            LOG_WARN(m_cfg.name.c_str(), "receiver sent a %zu-byte frame that is not PCM v4", len);
     }
-    if (h.channels != 1) return;
-    if (m_tsWaitResync && m_opusHeader.lastWasResync()) m_tsWaitResync = false;
-
-    // No minimum body length. A one-byte packet is a bare TOC and a valid Opus
-    // frame of the length it declares, and a zero-byte body asks the decoder
-    // for concealment; both occupy their 20 ms of the stream, and dropping them
-    // was a timeline slip.
-    const std::size_t bodyLen = len - off;
-
-    if (!m_opus || m_opusRate != h.sampleRate) {
-        if (m_opus) opus_decoder_destroy(m_opus);
-        int oerr = 0;
-        m_opus = opus_decoder_create(h.sampleRate, 1, &oerr);
-        if (oerr != OPUS_OK || !m_opus) {
-            m_opus = nullptr;
-            LOG_ERROR(m_cfg.name.c_str(), "opus_decoder_create(%d Hz): %s",
-                      h.sampleRate, opus_strerror(oerr));
-            return;
-        }
-        m_opusRate = h.sampleRate;
-        // 120 ms is the longest frame Opus can carry. Sized once against the
-        // rate rather than per packet.
-        m_opusPcm.resize(static_cast<std::size_t>(h.sampleRate) * 120 / 1000 + 16);
-        LOG_INFO(m_cfg.name.c_str(), "opus decoder: %d Hz mono", h.sampleRate);
-    }
-
-    // The packet's own declared length, when it declares one, so a lost frame
-    // is concealed for as long as it actually was.
-    int declared = bodyLen > 0
-        ? opus_packet_get_nb_samples(pkt + off, static_cast<opus_int32>(bodyLen), h.sampleRate)
-        : 0;
-    if (declared <= 0 || declared > static_cast<int>(m_opusPcm.size())) declared = 0;
-
-    // ensureDecoder first, for the timeline: a rate change restarts the sample
-    // count, and the gap tracker must see the count it is about to extend.
-    if (!ensureDecoder(h.sampleRate)) return;
-    if (!m_tsWaitResync) {
-        trackTimeline(h.timestampNanos, h.sampleRate,
-                      declared > 0 ? declared : m_lastFrameSamples);
-    }
-
-    int n;
-    if (bodyLen == 0) {
-        const int frame = m_lastFrameSamples > 0 ? m_lastFrameSamples : h.sampleRate / 50;
-        n = opus_decode(m_opus, nullptr, 0, m_opusPcm.data(), frame, 0);
-    } else {
-        n = opus_decode(m_opus, pkt + off, static_cast<opus_int32>(bodyLen),
-                        m_opusPcm.data(), static_cast<int>(m_opusPcm.size()), 0);
-    }
-    if (n < 0) {
-        {
-            std::lock_guard<std::mutex> lk(m_mu);
-            if (m_snap.decodeErrors++ % 200 == 0)
-                LOG_WARN(m_cfg.name.c_str(), "opus_decode: %s", opus_strerror(n));
-        }
-        concealLost(declared);
-        return;
-    }
-    feedSamples(m_opusPcm.data(), n, h.sampleRate, arrivalSec);
+    m_tsHave = false;
+    concealLost(0);
 }
 
 void Source::feedSilence(int count, int rate) {
@@ -1640,18 +1544,12 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
 
 void Source::resetStream(const char* why) {
     m_clock.reset();
-    m_opusHeader.reset();
     if (m_pcmv4) m_pcmv4->dec.reset();
-    // The Opus decoder's prediction state and its lookahead buffer belong to
-    // the last connection's stream. Carried over, the first frames of the new
-    // one are reconstructed against audio from before the gap.
-    if (m_opus) opus_decoder_ctl(m_opus, OPUS_RESET_STATE);
     m_samplesWritten = 0;
     m_decoderRate = 0;
     m_rateRefused = false;
     m_lastFrameSamples = 0;
     m_tsHave = false;
-    m_tsWaitResync = false;
     m_wwv.reset();
     m_wwvb.reset();
     m_dcf77.reset();
@@ -1662,7 +1560,6 @@ void Source::resetStream(const char* why) {
     m_offsets.clear();
     m_leapFrames = 0;
     m_snap.leapPending = false;
-    m_feedingOpus = -1;
     m_snap.haveOffset = false;
     m_snap.offsetSamples = 0;
     m_snap.clockState = "stopped";
@@ -2016,7 +1913,6 @@ void Source::updateDelayModel() {
         m_snap.delaySec = m_cfg.delayMs / 1000.0;
         m_snap.propagationSec = 0.0;
         m_snap.networkSec = 0.0;
-        m_snap.codecSec = 0.0;
         m_snap.decoderSec = 0.0;
         m_snap.chainSec = 0.0;
         m_snap.extraSec = m_cfg.delayMs / 1000.0;
@@ -2094,11 +1990,6 @@ void Source::updateDelayModel() {
     const double rttMs = m_snap.wsRttMs > 0.0 ? m_snap.wsRttMs : m_snap.httpRttMs;
     m_snap.rttFromWs = m_snap.wsRttMs > 0.0;
     const double net = rttMs > 0.0 ? (rttMs / 1000.0) * 0.5 : 0.0;
-    // The codec the audio actually came through, not the one asked for: a
-    // session that negotiated Opus is sent lossless frames in some modes, and
-    // charging 8 ms of Opus delay to those biases the offset by 8 ms.
-    const bool opus = m_feedingOpus >= 0 ? m_feedingOpus == 1 : m_cfg.format == AudioFormat::Opus;
-    const double codec = opus ? kOpusDelaySec : 0.0;
 
     // The decoder's own edge bias, by which decoder is running -- chosen from
     // the dial exactly as ensureDecoder chooses it. Negative: an edge reported
@@ -2111,14 +2002,13 @@ void Source::updateDelayModel() {
 
     m_snap.propagationSec = prop;
     m_snap.networkSec = net;
-    m_snap.codecSec = codec;
     m_snap.decoderSec = decoder;
     // The same for an IQ session as a USB one: radiod's channel filter is a
     // linear-phase sinc whose delay is set by the block and overlap, not the
     // passband, so the iq and usb presets are delayed alike.
     m_snap.chainSec = kUberSdrChainDelaySec;
     m_snap.extraSec = m_cfg.extraDelayMs / 1000.0;
-    m_snap.delaySec = prop + net + codec + decoder + kUberSdrChainDelaySec + m_snap.extraSec;
+    m_snap.delaySec = prop + net + decoder + kUberSdrChainDelaySec + m_snap.extraSec;
 }
 
 // ---------------------------------------------------------------------------

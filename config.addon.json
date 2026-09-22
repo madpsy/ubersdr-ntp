@@ -293,17 +293,19 @@
     // Every setting of a sources entry except "name" can be given here, and
     // applies to each source that does not set it for itself.
 
-    // "pcm-v4" is the predictive lossless codec, asked for at full quality
-    // (min_margin=0): no codec delay at all, at roughly four times the
-    // bandwidth of Opus. "opus" is about 24 kbps and adds a constant ~8 ms
-    // that the delay model accounts for -- the choice for a receiver on a
-    // slow or metered link.
-    // "format": "pcm-v4",
+    // UberSDR's reduced-depth IQ, as a margin in dB: how far under the band's
+    // own noise floor the quantisation noise must stay. 0 is the lossless
+    // stream; otherwise 15 to 60 (whole dB). The receiver works out the depth
+    // packet by packet to keep that margin, so the saving is large on a quiet
+    // band and small on a busy one. IQ only -- which here means DCF77; WWV and
+    // WWVB arrive as audio, which is always lossless. 26 is what UberSDR's own
+    // clients ask for.
+    // "min_margin": 0,
 
     // Check an https:// receiver's certificate.
     // "verify_tls": true,
 
-    // Work out the delay from the receiver, codec and decoder, which is right
+    // Work out the delay from the receiver and decoder, which is right
     // for every UberSDR receiver. false uses "delay_ms" verbatim instead.
     // "auto_delay": true
   },
@@ -349,7 +351,7 @@
     //                     weighted down rather than removed.
     //   "enabled"         false keeps the entry but does not connect it.
     //
-    //   and "format", "verify_tls", "auto_delay" as under "defaults".
+    //   and "min_margin", "verify_tls", "auto_delay" as under "defaults".
 
     // >>> station
     // install.sh replaces everything from here to "<<< station" on a first
@@ -383,10 +385,9 @@
     //
     // Recognised by its carrier, exactly, and tuned ON it in IQ mode rather
     // than 1 kHz below in USB: its phase modulation is what times the second
-    // to tens of microseconds, and an audio channel keeps no phase. IQ is
-    // always lossless, so "format" is ignored. Its amplitude modulation is
-    // decoded alongside as the check and the fallback (see "DCF77" in the
-    // README).
+    // to tens of microseconds, and an audio channel keeps no phase. Its
+    // amplitude modulation is decoded alongside as the check and the fallback
+    // (see "DCF77" in the README).
     // , { "name": "dcf77", "url": "http://ubersdr:8080", "carrier_hz": 77500, "extra_delay_ms": 0.0 }
   ],
 

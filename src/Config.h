@@ -14,18 +14,19 @@
 //                 longer than the great-circle distance because the signal
 //                 goes up to the ionosphere and back down, once per hop.
 //   receiver      radiod's buffering and the multicast hop inside the server.
-//   codec         Opus adds a measured, constant ~10 ms at 12 kHz. Lossless
-//                 PCM v4 adds none.
 //   network       the one-way trip from the UberSDR server to this host.
 //
-// All four are biases, not noise, and the filtering in SampleClock cannot see
+// The audio is always PCM v4 -- the predictive lossless codec, asked for at
+// full quality -- so the codec itself adds nothing.
+//
+// All three are biases, not noise, and the filtering in SampleClock cannot see
 // any of them — a constant delay is indistinguishable from a clock that is
 // simply wrong, which is precisely the thing being measured. So they are
 // modelled explicitly and the residual uncertainty is reported as dispersion.
 //
 // Auto-estimation covers what is measurable: propagation from the receiver's
 // own coordinates (the server publishes them at /api/description) against the
-// transmitter the decoder reports, the codec's known constant, and half the
+// transmitter the decoder reports, and half the
 // HTTP round-trip to the server. The receiver's internal delay is the same on
 // every UberSDR instance, so it is a built-in constant (measured live), as is
 // the WWV decoder's own edge bias; see Source.cpp. What is left, if anything,
@@ -60,17 +61,6 @@
 
 namespace ubersdr_ntp {
 
-enum class AudioFormat {
-    Opus,      // format=opus  — lossy, ~24 kbps, adds a constant delay.
-    PcmV4,     // format=pcm-zstd&version=4&min_margin=0 — the default: the
-               // predictive lossless codec, asked for at full quality.
-               // The query parameter is still spelt "pcm-zstd" for compatibility;
-               // version 4 carries no zstd at all.
-};
-
-const char* formatName(AudioFormat f);
-bool parseFormat(const std::string& s, AudioFormat& out);
-
 struct SourceConfig {
     std::string name;          // what it is called in the log; must be unique
     std::string url;           // http:// or https:// base, e.g. https://sdr.example.org
@@ -85,12 +75,16 @@ struct SourceConfig {
     // An explicit dial, for a receiver that needs one. 0 means derive it.
     std::uint64_t dialHz = 0;
 
-    AudioFormat format = AudioFormat::PcmV4;
-
     // Delay model — see the file comment.
     bool autoDelay = true;
     double delayMs = 0.0;        // explicit total; used verbatim when autoDelay is false
     double extraDelayMs = 0.0;   // added on top of the auto estimate
+
+    // UberSDR's reduced-depth IQ, as a margin in dB: how far under the band's
+    // own noise floor the quantisation noise must stay (ka9q_ubersdr
+    // pcm_lossy.go). 0 is the lossless stream; otherwise 15-60, whole dB. The
+    // server honours it for IQ only, so of these sources only DCF77 uses it.
+    int minMarginDb = 0;
 
     // Sources whose signal is reliably worse can be kept but weighted down, or
     // held as a standby that only counts when nothing better has a lock.
@@ -376,8 +370,7 @@ std::uint64_t dialForCarrier(std::uint64_t carrierHz);
 // DCF77, Mainflingen. Unlike the NIST stations it is decoded from IQ, not from
 // USB audio: its phase modulation is the precise half of the signal and a
 // demodulated audio channel keeps no phase. UberSDR's "iq" mode is 12 kHz of
-// complex baseband, always lossless (the server sends pcm-v4 for IQ whatever
-// was asked), so the dial goes ON the carrier and the carrier sits at DC.
+// complex baseband, so the dial goes ON the carrier and the carrier sits at DC.
 inline constexpr std::uint64_t kDcf77CarrierHz = 77500;
 // How far the dial may sit from the carrier and leave it inside that 12 kHz.
 inline constexpr std::uint64_t kDcf77MaxDialOffsetHz = 5000;

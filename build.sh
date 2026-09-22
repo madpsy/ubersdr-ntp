@@ -4,8 +4,8 @@
 #
 # Built inside ubuntu:24.04 -- the same image UberSDR's container runtime stage
 # uses -- so the result runs wherever the other UberSDR binaries run. Building
-# on the host works right up until the host is newer than the target: libopus,
-# libcurl and libssl are ordinary shared libraries, and a binary linked against
+# on the host works right up until the host is newer than the target: libcurl
+# and libssl are ordinary shared libraries, and a binary linked against
 # a newer one fails at startup on a symbol version error that names everything
 # except the actual problem. (libstdc++ is linked statically for exactly that
 # reason, so it is not one of them.)
@@ -135,8 +135,8 @@ fi
 # because a container image that installs only the first set produces a binary
 # that will not start, and the error it gives does not say which package is
 # missing.
-build_pkgs="cmake ninja-build g++ python3 pkg-config libopus-dev libcurl4-openssl-dev libssl-dev"
-runtime_pkgs="libopus0 libcurl4 libssl3"
+build_pkgs="cmake ninja-build g++ python3 pkg-config libcurl4-openssl-dev libssl-dev"
+runtime_pkgs="libcurl4 libssl3"
 
 # --- The work done inside each container ---------------------------------
 #

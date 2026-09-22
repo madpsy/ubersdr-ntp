@@ -824,7 +824,7 @@ setInterval(paintCountdowns, 250);
 // The primary and secondary classes, and the difference between them.
 //
 // The difference is the reason this card exists. Every radio source shares the
-// same chain delay, codec delay and decoder bias, so those terms cancel in any
+// same chain delay and decoder bias, so those terms cancel in any
 // comparison between receivers and no number of receivers can measure them. An
 // upstream NTP server does not share them. So while both classes are being
 // measured -- `always`, and `standby`, which is what standby is FOR -- this
@@ -878,7 +878,7 @@ function renderClasses(d, k, radio, peers) {
       k.primary + " − " + k.secondary + " · 5-min average · " + signed(cd.instant_ms) +
       " now · compared for " + dur(cd.settled_for_seconds);
     $("classexplain").textContent = k.primary === "radio"
-      ? "This is the radio delay model's absolute error: the chain, codec and " +
+      ? "This is the radio delay model's absolute error: the chain and " +
         "decoder-bias constants every receiver shares cancel between receivers, " +
         "so nothing but a source outside the radio class can measure them. " +
         "Reported, never applied."
@@ -1131,7 +1131,8 @@ function onStatus(d) {
       ["Receiver", esc(x.receiver_name || "(unnamed)") + " — " + esc(x.url)],
       ["Tuning", (x.dial_hz / 1e6).toFixed(6) + " MHz dial for the " +
         (x.carrier_hz / 1e6).toFixed(4) + " MHz carrier, " +
-        (dec.station === "dcf77" ? "IQ ±6 kHz" : "USB 0–3 kHz") + ", " + esc(x.format) +
+        (dec.station === "dcf77" ? "IQ ±6 kHz" : "USB 0–3 kHz") + ", " +
+        (x.min_margin_db > 0 ? "reduced depth, " + x.min_margin_db + " dB margin" : "lossless") +
         (a.sample_rate ? " at " + a.sample_rate + " Hz" : "")],
       ["Link", esc(l.state) + (l.detail ? " (" + esc(l.detail) + ")" : "") +
         " for " + dur(l.age_seconds) + ", audio " + dur(l.last_audio_age_seconds) + " ago, " +
@@ -1172,7 +1173,7 @@ function onStatus(d) {
           dur(t.age_seconds) + " old"
         : "none yet"],
       ["Delay model", ms(dl.total_ms) + " total = " + ms(dl.propagation_ms) + " propagation + " +
-        ms(dl.network_ms) + " network + " + ms(dl.codec_ms) + " codec + " +
+        ms(dl.network_ms) + " network + " +
         ms(dl.chain_ms) + " UberSDR chain " + signed(dl.decoder_bias_ms) + " decoder bias + " +
         ms(dl.configured_ms) + " configured<br>" +
         '<span class="note">' + esc(dl.path) + "</span>"],

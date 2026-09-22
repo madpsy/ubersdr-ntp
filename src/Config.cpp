@@ -13,24 +13,6 @@ using nlohmann::json;
 
 namespace ubersdr_ntp {
 
-const char* formatName(AudioFormat f) {
-    switch (f) {
-        case AudioFormat::Opus:  return "opus";
-        case AudioFormat::PcmV4: return "pcm-v4";
-    }
-    return "?";
-}
-
-bool parseFormat(const std::string& s, AudioFormat& out) {
-    if (s == "opus") { out = AudioFormat::Opus; return true; }
-    // Three spellings for one thing: "pcm-zstd" is what the query parameter is
-    // called on the wire, "pcm-v4" is what the codec actually is, and "pcm" is
-    // what somebody will type. Version 4 carries no zstd; only the parameter
-    // name is historical.
-    if (s == "pcm-v4" || s == "pcm-zstd" || s == "pcm") { out = AudioFormat::PcmV4; return true; }
-    return false;
-}
-
 const char* sourceKindName(SourceKind k) {
     switch (k) {
         case SourceKind::Radio: return "radio";
@@ -101,17 +83,26 @@ bool getSource(const json& j, SourceConfig& s, std::string& err) {
     if (!getOpt(j, "extra_delay_ms", s.extraDelayMs, err)) return false;
     if (!getOpt(j, "weight", s.weight, err)) return false;
     if (!getOpt(j, "verify_tls", s.verifyTls, err)) return false;
-
-    auto it = j.find("format");
-    if (it != j.end() && !it->is_null()) {
-        std::string f;
-        try { f = it->get<std::string>(); }
-        catch (const std::exception& e) { err = std::string("field \"format\": ") + e.what(); return false; }
-        if (!parseFormat(f, s.format)) {
-            err = "unknown format \"" + f + "\" (expected opus or pcm-v4)";
+    if (auto it = j.find("min_margin"); it != j.end() && !it->is_null()) {
+        if (!it->is_number()) { err = "field \"min_margin\" must be a number of dB"; return false; }
+        const double m = it->get<double>();
+        // The server's own rule, refused here rather than let it be silently
+        // bent: anything not above zero is the lossless stream, and a request
+        // is clamped to 15-60 dB and rounded to whole dB. So a negative figure,
+        // one under 15 or one over 60 would not be what was asked for.
+        if (!std::isfinite(m) || (m != 0.0 && (m < 15.0 || m > 60.0))) {
+            char v[32];
+            std::snprintf(v, sizeof v, "%g", m);
+            err = std::string("min_margin ") + v + " is not one UberSDR serves: 0 for the "
+                  "lossless stream, or 15 to 60 dB of margin under the noise floor";
             return false;
         }
+        s.minMarginDb = static_cast<int>(std::lround(m));
     }
+
+    // "format" was a setting while Opus was the other choice. Every source is
+    // PCM v4 now, and a configuration that still names one loads as it did
+    // (see the warning in load()).
 
     // An explicit delay_ms with auto_delay still on is a contradiction that
     // would silently ignore one of them. Say so rather than pick.
@@ -235,6 +226,23 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
     }
     if (auto it = j.find("ntp_defaults"); it != j.end() && it->is_object()) {
         if (!getNtpSource(*it, c.ntpDefaults, err)) { err = "in \"ntp_defaults\": " + err; return false; }
+    }
+
+    // A leftover "format" asking for Opus is not an error -- an unattended
+    // install must not stop starting over it -- but it is no longer what
+    // happens, so it is said once at startup.
+    {
+        auto asksOpus = [](const json& o) {
+            auto f = o.find("format");
+            return f != o.end() && f->is_string() && f->get<std::string>() == "opus";
+        };
+        bool opus = false;
+        if (auto it = j.find("defaults"); it != j.end() && it->is_object()) opus = opus || asksOpus(*it);
+        if (auto it = j.find("sources"); it != j.end() && it->is_array())
+            for (const json& sj : *it) if (sj.is_object()) opus = opus || asksOpus(sj);
+        if (opus)
+            c.warnings.push_back("\"format\": \"opus\" is no longer a setting and is ignored: "
+                                 "every source is received as lossless PCM v4");
     }
 
     // Radio sources. No longer required to exist: an install whose primary is
@@ -423,9 +431,6 @@ bool Config::finalise(std::string& err) {
                       "leave dial_hz out and it goes on the carrier";
                 return false;
             }
-            // IQ is lossless whatever is asked for, and the delay model and the
-            // status page should say what is actually arriving.
-            s.format = AudioFormat::PcmV4;
         }
 
         if (s.name.empty()) {
@@ -455,6 +460,13 @@ bool Config::finalise(std::string& err) {
         if (!std::isfinite(s.extraDelayMs)) {
             err = label + "extra_delay_ms must be a finite number";
             return false;
+        }
+        // Reduced depth exists for IQ only; the server sends a demodulated
+        // channel lossless whatever it is asked. Not an error -- it may well
+        // have come in from "defaults" -- but not what the setting says either.
+        if (s.minMarginDb > 0 && broadcastFor(s.carrierHz, s.dialHz) != Broadcast::Dcf77) {
+            warnings.push_back(label + "min_margin applies to DCF77's IQ stream only; this source "
+                               "is received as audio, which UberSDR always sends lossless");
         }
         if (s.enabled) ++enabled;
     }

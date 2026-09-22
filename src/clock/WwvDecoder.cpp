@@ -69,7 +69,7 @@ constexpr double kFoldDecay = 0.99;
 // Station tag (see onSeriesSample): one band's folded tick excess must be this
 // many times the other's for a verdict. A single station's own tick leaks into
 // the other band at roughly a third of its excess (3.2x clean, never below
-// 1.77x through Opus with a programme tone in offline measurement), so 1.5x
+// 1.77x through a lossy codec with a programme tone in offline measurement), so 1.5x
 // separates the stations with margin while staying undecided when both are
 // heard at similar strength.
 constexpr double kStationExcessRatio = 1.5;
@@ -447,7 +447,7 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
     // was decided by the two bands' backgrounds rather than by where the tick
     // is. Measured offline on synthetic WWV only: clean, the old margin was
     // 1.47x against a 1.3x gate; with WWV's own 600 Hz programme tone it was
-    // 1.36x; through Opus at 16 kbps plus that tone the 2200 Hz band came out
+    // 1.36x; through a 16 kbps lossy codec plus that tone the 2200 Hz band came out
     // MORE impulsive than 2000 Hz at some tick phases (30.4 vs 28.6), and at
     // 17 of 48 phase/codec/tone combinations no tag ever formed. The excess
     // ratio stayed >= 1.77x for WWV in every one of those cases.
@@ -490,7 +490,7 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
     // tick keeps sharpening its band's fold while phase-incoherent voice
     // averages flat, and propagation can hand a shared frequency from one
     // station to the other. The tag used to be set once, from the five-second
-    // fold at tick lock, and never revisited: offline, one Opus-coded WWV run
+    // fold at tick lock, and never revisited: offline, one lossy-coded WWV run
     // read WWVH (-1.8 dB) at five seconds, then settled at +0.3..+1.4 dB -- WWV,
     // but never decisively -- and kept the wrong tag for the whole stream.
     //   - Unknown -> a station: kStationConfirmSecs consecutive identical

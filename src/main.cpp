@@ -106,8 +106,6 @@ void usage() {
         "                                    (default) — failover is then instant\n"
         "                           cold     do not connect at all until the primary fails\n"
         "      --password PW        Bypass password applied to every --source\n"
-        "      --format FMT         pcm-v4 (default: lossless, no codec delay to\n"
-        "                           calibrate out) or opus (~4x less bandwidth, +8 ms)\n"
         "\n"
         "Overrides (these win over the config file):\n"
         "      --port N             NTP port (default 123, which is privileged)\n"
@@ -248,7 +246,6 @@ int main(int argc, char** argv) {
     std::vector<std::string> ntpSourceSpecs;
     std::string cliPrimary, cliSecondary;
     std::string cliPassword;
-    std::string cliFormat;
     int cliPort = -1, cliHttpPort = -1;
     std::string cliHttpListen, cliLogFile, cliLogLevel;
     double cliStatusInterval = -1.0;
@@ -271,7 +268,6 @@ int main(int argc, char** argv) {
         else if (a == "--primary") cliPrimary = next("--primary");
         else if (a == "--secondary") cliSecondary = next("--secondary");
         else if (a == "--password") cliPassword = next("--password");
-        else if (a == "--format") cliFormat = next("--format");
         else if (a == "--port") cliPort = std::atoi(next("--port").c_str());
         else if (a == "--http-port") cliHttpPort = std::atoi(next("--http-port").c_str());
         else if (a == "--http-listen") cliHttpListen = next("--http-listen");
@@ -300,16 +296,6 @@ int main(int argc, char** argv) {
                      "nothing to do: give --config FILE, at least one --source URL@CARRIER, "
                      "or at least one --ntp-source HOST.\nTry --help.\n");
         return 2;
-    }
-
-    if (!cliFormat.empty()) {
-        AudioFormat f;
-        if (!parseFormat(cliFormat, f)) {
-            std::fprintf(stderr, "unknown --format %s (expected opus or pcm-v4)\n", cliFormat.c_str());
-            return 2;
-        }
-        cfg.defaults.format = f;
-        for (SourceConfig& s : cfg.sources) s.format = f;
     }
 
     for (const std::string& spec : sourceSpecs) {
@@ -377,9 +363,8 @@ int main(int argc, char** argv) {
     LOG_INFO(kTag, "ubersdr-ntp %s starting (User-Agent: %s)", kVersion, kUserAgent);
     for (const std::string& w : cfg.warnings) LOG_WARN(kTag, "%s", w.c_str());
     for (const SourceConfig& s : cfg.sources) {
-        LOG_INFO(kTag, "radio  %-14s %s  dial %.6f MHz (carrier %g MHz) %s%s%s",
+        LOG_INFO(kTag, "radio  %-14s %s  dial %.6f MHz (carrier %g MHz)%s%s",
                  s.name.c_str(), s.url.c_str(), s.dialHz / 1e6, s.carrierHz / 1e6,
-                 formatName(s.format),
                  s.enabled ? "" : " [DISABLED]",
                  s.autoDelay ? "" : " [fixed delay]");
     }

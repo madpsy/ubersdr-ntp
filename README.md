@@ -91,7 +91,7 @@ pleasure of running a clock off a shortwave broadcast.
 
 The residual uncertainty is concentrated in the constants every source shares,
 and they are the ones nothing in this arrangement can measure: the chain-delay
-constant, the codec delay, and the decoder's edge bias all cancel between
+constant and the decoder's edge bias both cancel between
 receivers. The chain constant has since been calibrated against the NTP class
 (see the delay model), but never against an off-air recording at the two rates
 used here.
@@ -100,7 +100,7 @@ used here.
 
 ```bash
 sudo apt-get install -y cmake ninja-build g++ pkg-config \
-    libopus-dev libcurl4-openssl-dev libssl-dev python3
+    libcurl4-openssl-dev libssl-dev python3
 make            # or: ./build.sh --native
 ```
 
@@ -142,7 +142,7 @@ To run on a target host, install the runtime libraries — `libstdc++` is linked
 statically, the rest are not:
 
 ```bash
-sudo apt-get install -y libopus0 libcurl4 libssl3
+sudo apt-get install -y libcurl4 libssl3
 ```
 
 ### Tests
@@ -347,8 +347,8 @@ against a 100 Hz BCD subcarrier — not a setting.
 
 `carrier_hz: 77500` is DCF77, from Mainflingen, and nothing else about it needs
 setting. It is taken as UberSDR's `iq` mode — 12 kHz of complex baseband, which
-every receiver offers publicly and always sends lossless (`format` is forced to
-`pcm-v4`; the URL says `min_margin=0`) — because half of DCF77 is in the
+every receiver offers publicly, lossless like every source here (the URL says
+`min_margin=0`) — because half of DCF77 is in the
 carrier's **phase**, and a demodulated audio channel keeps none.
 
 The station sends its time code twice over. The **AM** is the classic one: the
@@ -404,25 +404,31 @@ UberSDR 290 km from the transmitter, both read every minute alike -- a
 five-second fade apart, which both refused -- and AM's edges sat 0.1 to 0.3 ms
 after PM's.
 
-One thing is not known yet: the UberSDR chain constant below was measured on USB
-sessions, and IQ is served from a different radiod preset. The class delta on a
-DCF77 source is what will say whether it holds, and it is applied unchanged
-until that has been measured properly.
+The UberSDR chain constant below applies to IQ exactly as to USB: radiod's
+channel filter is linear-phase, with a delay set by its block size and not by the
+passband, so the two presets are delayed alike. DCF77 is what measured it.
 
 ## Audio format
 
-**PCM v4 is the default**: the predictive lossless codec, asked for at full
-quality (`min_margin=0`, the same as DCF77's IQ). No codec delay to account for,
-so one fewer constant in the delay model, at about four times the bandwidth of
-Opus. (The query parameter on the wire is still spelt `pcm-zstd` for
-compatibility with older servers; version 4 carries no zstd at all.)
+Every source is received as **PCM v4**: the predictive lossless codec, asked
+for at full quality (`min_margin=0`). A lossless stream adds no codec delay, so
+there is no codec term in the delay model to calibrate. (The query parameter on
+the wire is still spelt `pcm-zstd` for compatibility with older servers; version
+4 carries no zstd at all.)
 
-`"format": "opus"` works too, for a slow or metered link: measured against
-synthetic WWV through an encode/decode round trip at exactly the server's
-settings (12 kHz, 24 kbps, `APPLICATION_VOIP`, complexity 5), the decoder still
-reaches quality-100 lock at 10, 6 and 3 dB SNR, with the second edge landing a
-consistent 5–10 ms late. That is a *bias*, not jitter — it did not move between
-clean and noisy signals — and the delay model accounts for it (8 ms).
+There is no `format` setting. A configuration that still has
+`"format": "opus"` from an older version loads as before, logs once that the
+setting is ignored, and receives PCM v4.
+
+DCF77's IQ stream can instead be taken at **reduced depth** with `min_margin`,
+per source or under `defaults`: the server quantises each packet as coarsely as
+it can while keeping the quantisation noise that many dB under the band's own
+noise floor, so the saving is large on a quiet band and small on a busy one.
+`0` is the lossless stream and the default; otherwise 15–60 dB, in whole dB,
+which is what UberSDR serves (26 is its own clients' choice). Anything else is
+refused at startup rather than silently clamped. UberSDR honours it for IQ only,
+so on a WWV or WWVB source it does nothing and a warning says so. It adds no
+delay: the packets are the same packets, with smaller numbers in them.
 
 ## The delay model
 
@@ -436,7 +442,6 @@ audio stream measures:
 |---|---|---|
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
 | Network | 5–100 ms | Measured, as half the round trip of a JSON ping that the receiver itself answers, down the audio connection |
-| Codec | 8 ms (Opus), 0 (PCM v4) | A measured constant |
 | UberSDR chain | 9.4 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. Calibrated against the NTP class — see below |
 | Decoder bias | −8.9 ms (WWV/WWVH), 0 (WWVB, DCF77) | WWV: −13.6 ms measured on synthetic signals by `tools/decodertest.cpp`, plus a +4.7 ms WWV-only residual (below). DCF77: `tools/dcf77test.cpp` |
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
@@ -474,8 +479,8 @@ The HTTP figure is used only when a server never answers a ping at all.
 ### Calibrating the chain constant against NTP
 
 The terms every source shares cannot be measured by comparing sources: two
-receivers hearing the same transmitter cancel the chain delay, the codec delay
-and the decoder bias exactly, so they agree just as well whatever those are set
+receivers hearing the same transmitter cancel the chain delay and the decoder
+bias exactly, so they agree just as well whatever those are set
 to. Only a reference outside the radio can see them, and one evening against a
 host clock could not separate a fixed over-count from that night's ionosphere
 (served time ran +3.4 ms, then +5.4 ms, while the receivers wandered ±11 ms
@@ -512,12 +517,10 @@ which was measured on synthetic ticks, or to its skywave model, or to both. It i
 kept with the decoder term so that every WWV source's total is exactly what it
 was calibrated to. WWVB, like DCF77, has no WWV terms and moves with the chain.
 
-It was calibrated on WWV sources over Opus, so it carries whatever error sits in
-the terms those sources subtract and a DCF77 source does not -- the WWV decoder
-bias and the Opus delay -- and any asymmetry in the transatlantic paths it was
-measured over. Two DCF77 receivers in Belgium and France both read ahead of a
-GPS-disciplined server by a shared ~2.3 ms (2026-09-22). Which of those it is
-has not been separated yet, so nothing has been moved for it.
+Those WWV calibrations were all made over Opus, which this program no longer
+uses: the sum they fixed also held the 8 ms the delay model then charged for
+Opus (measured offline as a 5–10 ms bias). WWV over PCM is right to the extent
+that figure was, and the residual carries whatever it was out by.
 
 The part nothing in the stream can see is the delay inside the receiver —
 `radiod`'s demodulator and filters, its block framing, the server's handling —
@@ -829,8 +832,8 @@ address (two is common). A standby nobody is using should not hold one of them.
 
 ### The difference between the classes is the interesting number
 
-Every radio source shares the same chain delay, the same codec delay and the
-same decoder edge bias. Those terms **cancel exactly** in any comparison between
+Every radio source shares the same chain delay and, per station, the same
+decoder edge bias. Those terms **cancel exactly** in any comparison between
 receivers, so no number of receivers can measure them — which is why [the chain
 constant](#the-chain-constant-is-about-3-ms-too-large) has only ever been an
 estimate, and why the 3.4 ms bias at the top of this README could be stated but
@@ -1377,9 +1380,7 @@ upstream's. `tools/decodertest.cpp` (`ubersdr-ntp-decodertest`) generates all
 three stations and checks every timestamp and edge against the truth.
 
 `third_party/pcm_v4.hpp` is shared verbatim with `ka9q_ubersdr/clients` — keep it
-in step with the copies there. It has no Opus reader, because the C++ clients
-that share it are IQ clients and never negotiate Opus; `src/OpusV4Header.h` is
-that half, written here rather than patched in.
+in step with the copies there.
 
 `third_party/IXWebSocket` and `third_party/json.hpp` are vendored as-is.
 

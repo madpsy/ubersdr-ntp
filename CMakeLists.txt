@@ -10,7 +10,6 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(OPUS REQUIRED IMPORTED_TARGET opus)
 pkg_check_modules(CURL REQUIRED IMPORTED_TARGET libcurl)
 find_package(OpenSSL REQUIRED)
 find_package(Threads REQUIRED)
@@ -208,7 +207,6 @@ target_include_directories(ubersdr-ntp PRIVATE
 target_link_libraries(ubersdr-ntp PRIVATE
     clockdecoders
     ixwebsocket_vendored
-    PkgConfig::OPUS
     PkgConfig::CURL
     Threads::Threads
     # res_nsearch and ns_parserr, for the DNS TTL of an upstream NTP server's
@@ -221,7 +219,7 @@ target_compile_options(ubersdr-ntp PRIVATE -Wall -Wextra)
 # a container: a binary linked against a newer libstdc++ than the host it runs
 # on dies at startup on a GLIBCXX_ version error that names everything except
 # the actual problem. Linking them in removes that coupling outright, and costs
-# about a megabyte. libopus, libcurl and libssl remain dynamic -- they are
+# about a megabyte. libcurl and libssl remain dynamic -- they are
 # ordinary distribution packages with stable ABIs, and statically linking
 # OpenSSL would mean shipping our own view of the CA store and of every TLS
 # advisory.

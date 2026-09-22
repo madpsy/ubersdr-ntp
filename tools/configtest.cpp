@@ -412,7 +412,7 @@ void testMqttBlock() {
 }
 
 void testDcf77Tuning() {
-    std::printf("\nDCF77: chosen by its carrier, tuned on it, and always lossless\n");
+    std::printf("\nDCF77: chosen by its carrier and tuned on it; a leftover Opus setting is ignored\n");
 
     const Loaded r = load(R"({
       "defaults": { "format": "opus" },
@@ -424,13 +424,18 @@ void testDcf77Tuning() {
     check("77.5 kHz is DCF77, with the dial ON the carrier",
           d && broadcastFor(d->carrierHz, d->dialHz) == Broadcast::Dcf77 && d->dialHz == 77500,
           "%s", d ? std::to_string(d->dialHz).c_str() : r.why());
-    check("DCF77 is lossless whatever the defaults ask for",
-          d && d->format == AudioFormat::PcmV4);
+    // "format" went with Opus. A configuration that still asks for Opus must
+    // keep loading -- an unattended install cannot stop over it -- and say so.
+    bool warned = false;
+    for (const std::string& w : r.ok ? r.cfg.warnings : std::vector<std::string>{})
+        if (w.find("opus") != std::string::npos) warned = true;
+    check("a leftover \"format\": \"opus\" still loads, and warns that it is ignored",
+          r.ok && warned, "%s", r.why());
     check("and is named after what it listens to",
           d && d->name.rfind("dcf77-", 0) == 0, "%s", d ? d->name.c_str() : "");
-    check("60 kHz is still WWVB, 1 kHz below, and keeps its codec",
+    check("60 kHz is still WWVB, 1 kHz below",
           b && broadcastFor(b->carrierHz, b->dialHz) == Broadcast::Wwvb && b->dialHz == 59000 &&
-              b->format == AudioFormat::Opus && b->name.rfind("wwvb-", 0) == 0,
+              b->name.rfind("wwvb-", 0) == 0,
           "%s", b ? b->name.c_str() : "");
 
     const Loaded near = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500,"dial_hz":76500}]})");
@@ -438,6 +443,38 @@ void testDcf77Tuning() {
     const Loaded far = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500,"dial_hz":70000}]})");
     check("a dial 7.5 kHz off is refused, and says why", !far.ok &&
               std::string(far.why()).find("IQ passband") != std::string::npos, "%s", far.why());
+}
+
+void testMinMargin() {
+    std::printf("\nmin_margin: UberSDR's reduced-depth IQ, as the server defines it\n");
+
+    const Loaded def = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    check("absent is 0, the lossless stream",
+          def.ok && def.cfg.sources[0].minMarginDb == 0, "%s", def.why());
+
+    const Loaded ok = load(R"({"defaults":{"min_margin":26},
+                               "sources":[{"url":"http://r.example","carrier_hz":77500},
+                                          {"url":"http://r.example","carrier_hz":77500,"min_margin":0}]})");
+    check("26 dB is taken from defaults, and a source can put it back to lossless",
+          ok.ok && ok.cfg.sources[0].minMarginDb == 26 && ok.cfg.sources[1].minMarginDb == 0, "%s", ok.why());
+
+    const Loaded round = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500,"min_margin":26.4}]})");
+    check("whole dB, as the server rounds it",
+          round.ok && round.cfg.sources[0].minMarginDb == 26, "%s", round.why());
+
+    for (const char* bad : {"-26", "10", "14.9", "61"}) {
+        const Loaded r = load(std::string(R"({"sources":[{"url":"http://r.example","carrier_hz":77500,"min_margin":)") +
+                              bad + "}]}");
+        check((std::string("min_margin ") + bad + " is refused, and says what is served").c_str(),
+              !r.ok && std::string(r.why()).find("15 to 60") != std::string::npos, "%s", r.why());
+    }
+
+    const Loaded wwv = load(R"({"sources":[{"url":"http://r.example","carrier_hz":10000000,"min_margin":26}]})");
+    bool warned = false;
+    for (const std::string& w : wwv.ok ? wwv.cfg.warnings : std::vector<std::string>{})
+        if (w.find("min_margin") != std::string::npos) warned = true;
+    check("on a WWV source it loads, with a warning that audio is always lossless",
+          wwv.ok && warned, "%s", wwv.why());
 }
 
 int main() {
@@ -457,6 +494,7 @@ int main() {
     testValidation();
     testMqttBlock();
     testDcf77Tuning();
+    testMinMargin();
 
     // Tidy up: the files hold made-up passwords, but leaving a trail of
     // configuration files in /tmp on every build is untidy either way.

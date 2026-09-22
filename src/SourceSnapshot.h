@@ -136,7 +136,7 @@ struct SourceSnapshot {
     // --- radio ------------------------------------------------------------
     std::uint64_t carrierHz = 0;
     std::uint64_t dialHz = 0;
-    AudioFormat format = AudioFormat::Opus;
+    int minMarginDb = 0;       // reduced-depth IQ margin asked for; 0 lossless
 
     // link
     LinkState link = LinkState::Idle;
@@ -243,7 +243,6 @@ struct SourceSnapshot {
     double delaySec = 0.0;
     double propagationSec = 0.0;
     double networkSec = 0.0;
-    double codecSec = 0.0;
     double decoderSec = 0.0;   // the running decoder's edge bias (negative: early)
     double chainSec = 0.0;     // UberSDR's fixed RF-to-WebSocket delay
     double extraSec = 0.0;

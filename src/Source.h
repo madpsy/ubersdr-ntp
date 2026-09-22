@@ -32,7 +32,6 @@
 #include "Config.h"
 #include "OffsetEstimator.h"
 #include "TimeSource.h"
-#include "OpusV4Header.h"
 #include "Propagation.h"
 #include "SampleClock.h"
 #include "TimeContinuity.h"
@@ -49,8 +48,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-struct OpusDecoder;
 
 namespace ix { class WebSocket; }
 
@@ -169,20 +166,11 @@ private:
     std::atomic<bool> m_socketOpen{false};
     bool m_haveDescription = false;   // supervisor thread only
 
-    // Which codec the audio actually being decoded came through, for the delay
-    // model. -1 until the first frame: the configured format is then the best
-    // guess, but a session that negotiated Opus can be sent lossless frames.
-    int m_feedingOpus = -1;
-
     // The leap warning bit is taken from single frames, so one misread frame
     // would otherwise announce a leap second to every client.
     int m_leapFrames = 0;
 
     // audio decode
-    OpusV4HeaderDecoder m_opusHeader;
-    OpusDecoder* m_opus = nullptr;
-    int m_opusRate = 0;
-    std::vector<std::int16_t> m_opusPcm;
     std::unique_ptr<class PcmV4Reader> m_pcmv4;   // pimpl: keeps pcm_v4.hpp out of this header
     std::vector<float> m_mono;      // mono samples, or interleaved I/Q for DCF77
     std::vector<std::int16_t> m_silence;
@@ -212,7 +200,6 @@ private:
     // program's own sample count is constant while no audio goes missing, and
     // steps by exactly the missing duration when some does. See trackTimeline.
     bool m_tsHave = false;
-    bool m_tsWaitResync = false;
     std::uint64_t m_tsOriginNanos = 0;
     std::int64_t m_tsOriginSample = 0;
     double m_tsBaseline = 0.0;

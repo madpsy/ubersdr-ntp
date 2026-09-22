@@ -433,7 +433,8 @@ std::string renderStatusBlock(const StatusInput& in) {
 
         o << '\n' << s.name << ":  " << s.url << "  dial " << f2(s.dialHz / 1e6, 6)
           << " MHz (carrier " << s.carrierHz / 1e6 << " MHz), "
-          << formatName(s.format);
+          << (s.minMarginDb > 0 ? "reduced depth, " + std::to_string(s.minMarginDb) + " dB margin"
+                                : std::string("lossless"));
         if (s.sampleRate) o << " @ " << s.sampleRate << " Hz";
         o << '\n';
 
@@ -518,7 +519,6 @@ std::string renderStatusBlock(const StatusInput& in) {
         o << "    delay:  " << f2(s.delaySec * 1000.0, 1) << " ms total = "
           << f2(s.propagationSec * 1000.0, 1) << " propagation + "
           << f2(s.networkSec * 1000.0, 1) << " network + "
-          << f2(s.codecSec * 1000.0, 1) << " codec + "
           << f2(s.chainSec * 1000.0, 1) << " UberSDR chain + "
           << f2(s.decoderSec * 1000.0, 1) << " decoder bias + "
           << f2(s.extraSec * 1000.0, 1) << " configured\n";
@@ -682,7 +682,7 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     o["receiver_name"] = s.receiverName;
     o["carrier_hz"] = s.carrierHz;
     o["dial_hz"] = s.dialHz;
-    o["format"] = formatName(s.format);
+    o["min_margin_db"] = s.minMarginDb;
     o["weight"] = s.weight;
     {
         const auto used = std::find(combined.usedNames.begin(), combined.usedNames.end(),
@@ -802,7 +802,6 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     d["total_ms"] = s.delaySec * 1000.0;
     d["propagation_ms"] = s.propagationSec * 1000.0;
     d["network_ms"] = s.networkSec * 1000.0;
-    d["codec_ms"] = s.codecSec * 1000.0;
     d["chain_ms"] = s.chainSec * 1000.0;
     d["decoder_bias_ms"] = s.decoderSec * 1000.0;
     d["configured_ms"] = s.extraSec * 1000.0;

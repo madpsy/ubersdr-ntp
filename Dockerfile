@@ -3,14 +3,14 @@
 # Stage 1: build ubersdr-ntp
 #
 # ubuntu:24.04 for both stages, as build.sh uses for the release binaries:
-# libopus, libcurl and libssl are shared libraries, and the runtime must carry
+# libcurl and libssl are shared libraries, and the runtime must carry
 # the versions the build linked against.
 # ---------------------------------------------------------------------------
 FROM ubuntu:24.04 AS builder
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
         cmake ninja-build g++ pkg-config python3 \
-        libopus-dev libcurl4-openssl-dev libssl-dev \
+        libcurl4-openssl-dev libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
@@ -30,7 +30,7 @@ RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
 FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-        libopus0 libcurl4t64 libssl3t64 ca-certificates wget libcap2-bin \
+        libcurl4t64 libssl3t64 ca-certificates wget libcap2-bin \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin ntp
 
