@@ -56,9 +56,8 @@ fetch_description() {
         madpsy/ubersdr-ntp:latest -q -T 5 -O - http://ubersdr:8080/api/description 2>/dev/null
 }
 
-# On a fresh configuration only: if the receiver is within DCF77's range and
-# can tune 77.5 kHz, listen to DCF77 alone, with the WWV sources kept in the
-# file but disabled. Anything missing or unexpected leaves the WWV default.
+# On a fresh configuration only: DCF77 if the receiver is within its range and
+# can tune 77.5 kHz, otherwise WWV. Anything missing or unexpected is WWV.
 choose_station() {
     local desc gps lat lon minf km
     STATION="wwv"
@@ -96,18 +95,47 @@ choose_station() {
         echo "  The receiver does not report tuning down to 77.5 kHz — using WWV"
         return
     fi
-    sed -i -E \
-        -e 's/^(    \{ "name": "local-(5|10|15)",.*"carrier_hz": [0-9]+) \}/\1, "enabled": false }/' \
-        -e 's#^    // (, \{ "name": "dcf77",.*\})$#    \1#' \
-        "${CONFIG_FILE}"
-    if [[ "$(grep -c '"enabled": false }' "${CONFIG_FILE}")" != 3 ]] \
-       || ! grep -q '^    , { "name": "dcf77"' "${CONFIG_FILE}"; then
-        echo "  Could not edit ${CONFIG_FILE} for DCF77 — fetching it again, with WWV"
-        curl -fsSL "${REPO_RAW}/config.addon.json" -o "${CONFIG_FILE}"
+    STATION="dcf77"
+    echo "  Within range and the receiver covers LF — using DCF77 instead of WWV"
+}
+
+# The radio sources for a station, one per line, as they go in the config.
+station_sources() {
+    local url="http://ubersdr:8080"
+    case "$1" in
+        dcf77)
+            echo "    { \"name\": \"dcf77\",    \"url\": \"${url}\", \"carrier_hz\": 77500 }"
+            ;;
+        *)
+            echo "    { \"name\": \"local-5\",  \"url\": \"${url}\", \"carrier_hz\": 5000000 },"
+            echo "    { \"name\": \"local-10\", \"url\": \"${url}\", \"carrier_hz\": 10000000 },"
+            echo "    { \"name\": \"local-15\", \"url\": \"${url}\", \"carrier_hz\": 15000000 }"
+            ;;
+    esac
+}
+
+# Replace the block config.addon.json marks with "// >>> station" and
+# "// <<< station" by the chosen station's sources. The markers are comments,
+# so the downloaded file is valid as it stands and stays WWV if they are not
+# found exactly once each.
+write_sources() {
+    local block tmp
+    if [[ "$(grep -c '^    // >>> station$' "${CONFIG_FILE}")" != 1 \
+          || "$(grep -c '^    // <<< station$' "${CONFIG_FILE}")" != 1 ]]; then
+        echo "  ${CONFIG_FILE} has no station block to fill in — leaving it on WWV"
+        STATION="wwv"
         return
     fi
-    STATION="dcf77"
-    echo "  Within range and the receiver covers LF — using DCF77, with WWV disabled"
+    block="$(station_sources "${STATION}")"
+    tmp="${CONFIG_FILE}.tmp"
+    # Through the environment, not -v: -v would interpret backslashes, and
+    # not every awk accepts a newline in one.
+    BLOCK="${block}" awk '
+        /^    \/\/ >>> station$/ { print "    // The station install.sh chose for this receiver."; print ENVIRON["BLOCK"]; skip = 1; next }
+        /^    \/\/ <<< station$/ { skip = 0; next }
+        !skip
+    ' "${CONFIG_FILE}" > "${tmp}"
+    mv "${tmp}" "${CONFIG_FILE}"
 }
 
 # ---------------------------------------------------------------------------
@@ -150,6 +178,7 @@ else
     curl -fsSL "${REPO_RAW}/config.addon.json" -o "${CONFIG_FILE}"
     echo "Saved ${CONFIG_FILE}"
     choose_station
+    write_sources
 fi
 # Readable by the container's own user, which is not this one.
 chmod 755 "${CONFIG_DIR}"

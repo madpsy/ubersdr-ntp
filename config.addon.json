@@ -345,9 +345,14 @@
     //   "enabled"         false keeps the entry but does not connect it.
     //
     //   and "format", "verify_tls", "auto_delay" as under "defaults".
+
+    // >>> station
+    // install.sh replaces everything from here to "<<< station" on a first
+    // install, with WWV or DCF77 depending on where the receiver is.
     { "name": "local-5",  "url": "http://ubersdr:8080", "carrier_hz": 5000000 },
     { "name": "local-10", "url": "http://ubersdr:8080", "carrier_hz": 10000000 },
     { "name": "local-15", "url": "http://ubersdr:8080", "carrier_hz": 15000000 }
+    // <<< station
 
     // A remote receiver, for when the local one cannot hear the station.
     // Use a receiver you have permission to use -- this is a long-lived
