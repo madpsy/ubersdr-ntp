@@ -38,6 +38,7 @@
 #include "TimeContinuity.h"
 #include "clock/WwvDecoder.h"
 #include "clock/WwvbDecoder.h"
+#include "clock/Dcf77Decoder.h"
 
 #include <atomic>
 #include <condition_variable>
@@ -124,10 +125,15 @@ private:
     void updateDelayModel();    // caller holds m_mu
     void recordRtt(double rttSec);  // caller holds m_mu
     void probeRtt();
-    void onPong(const std::string& payload);
+    void onJsonPong();
     void recordWsRtt(double rttSec);
 
     SourceConfig m_cfg;
+    // What is being listened to, from the tuning (Config.h, broadcastFor). DCF77
+    // is taken as IQ -- two channels a frame -- and everything else as mono audio.
+    const Broadcast m_broadcast;
+    const bool m_iq;
+    const int m_channels;
     std::string m_sessionId;
 
     std::thread m_thread;
@@ -140,6 +146,10 @@ private:
     std::mutex m_wake;
     std::condition_variable m_wakeCv;
     std::atomic<bool> m_reacquire{false};
+    // The receiver sent a version 1-3 frame: it predates protocol version 4 and
+    // nothing this daemon can ask for will change that. Set by the audio path,
+    // acted on by the supervisor (see run()).
+    std::atomic<bool> m_serverTooOld{false};
     std::string m_reacquireWhy;     // under m_mu
 
     // Guards the pointer, not the socket. Only the supervisor ever calls
@@ -174,12 +184,18 @@ private:
     int m_opusRate = 0;
     std::vector<std::int16_t> m_opusPcm;
     std::unique_ptr<class PcmV4Reader> m_pcmv4;   // pimpl: keeps pcm_v4.hpp out of this header
-    std::vector<float> m_mono;
+    std::vector<float> m_mono;      // mono samples, or interleaved I/Q for DCF77
     std::vector<std::int16_t> m_silence;
 
     // clock decoder
     std::unique_ptr<clockdec::WwvDecoder> m_wwv;
     std::unique_ptr<clockdec::WwvbDecoder> m_wwvb;
+    std::unique_ptr<clockdec::Dcf77Decoder> m_dcf77;
+    // DCF77: the timing source last logged, and the one being seen and since
+    // when, so a change is logged once it has held (WebSocket thread).
+    int m_loggedTimingPm = -1;
+    int m_timingSeen = -1;
+    double m_timingSeenAt = 0.0;
     int m_decoderRate = 0;
     bool m_rateRefused = false;
     // The last station tag a WWV/WWVH decoder held, so the next one can start
@@ -229,6 +245,10 @@ private:
     double m_leapWarnAt = -1e18;          // daemon clock: last frame with the warning believed
     std::deque<double> m_rttProbes;
     std::deque<double> m_wsRttProbes;
+    // When the outstanding JSON ping went out (monotonic seconds), 0 when none
+    // is outstanding, or kPingUntimed when the next pong must not be timed.
+    // Under m_mu. See the ping in run().
+    double m_jsonPingSentAt = 0.0;
 };
 
 } // namespace ubersdr_ntp

@@ -39,6 +39,7 @@ enum class ClockStation : int {
     Wwv     = 1,
     Wwvh    = 2,
     Wwvb    = 3,
+    Dcf77   = 4,
 };
 
 // Why locked() currently says no (WS-7 acquisition telemetry). A tag on the
@@ -139,6 +140,24 @@ struct ClockDecoderDiagnostics {
     int windowSize = 0;        // Config::window
     float voteQuality = 0.0f;  // lockConfidence() raw 0..1
     std::uint8_t refusalReason = 0;  // ClockLockRefusal
+
+    // DCF77 only (NaN / false / 0 from the others): its two demodulators.
+    bool pmLocked = false;     // the phase-modulation correlator is tracking
+    float pmSnrDb = std::numeric_limits<float>::quiet_NaN();  // last second's PM correlation SNR
+    bool timingFromPm = false; // the reported second edges are PM's, not AM's
+    // AM's second edge minus PM's, smoothed over the seconds both measured. The
+    // one check the AM timing has: ~0 on a healthy path.
+    float amMinusPmMs = std::numeric_limits<float>::quiet_NaN();
+    float carrierOffsetHz = std::numeric_limits<float>::quiet_NaN();
+    // Where the last minute's time came from: 0 none yet, 1 AM only, 2 PM only,
+    // 3 both and they agreed, 4 both valid and they DISAGREED (refused).
+    std::uint8_t lastFrameFrom = 0;
+    // PM locks refused because they put the second somewhere AM, decoding
+    // valid minutes at the time, did not: interference that correlated.
+    int pmRefusedLocks = 0;
+    // The last PM correlation needed the interference high-pass: y carried
+    // more than twice its high-passed power, i.e. a strong tone near the carrier.
+    bool pmInterference = false;
 };
 
 // A complete broadcast timestamp decoded from a single frame. minute/hour are

@@ -167,10 +167,12 @@ constexpr double kDelayUncertaintyFraction = 0.15;
 // the others. See the use site.
 constexpr double kWeightDispersionFloorSec = 0.001;
 
-// Marks a ping payload as ours. IXWebSocket sends its own keepalive pings on a
-// timer and those come back as pongs too; without a tag we would time a round
-// trip whose start we never recorded.
-const char* const kPingPrefix = "ubersdr-ntp:";
+// m_jsonPingSentAt's "do not time the next pong" marker. See the ping in run().
+constexpr double kPingUntimed = -1.0;
+
+// The longest JSON ping/pong round trip that counts as a measurement. The
+// server answers at once; a pong this late crossed a stall, not the path.
+constexpr double kMaxPongSec = 10.0;
 
 std::string makeUuidV4() {
     // The server requires a canonical lowercase v4 UUID and binds it to this
@@ -310,6 +312,9 @@ std::string describeClose(unsigned code, bool remote) {
 
 Source::Source(SourceConfig cfg)
     : m_cfg(std::move(cfg)),
+      m_broadcast(broadcastFor(m_cfg.carrierHz, m_cfg.dialHz)),
+      m_iq(m_broadcast == Broadcast::Dcf77),
+      m_channels(m_iq ? 2 : 1),
       m_sessionId(makeUuidV4()),
       m_clock(12000) {
     m_snap.name = m_cfg.name;
@@ -319,7 +324,8 @@ Source::Source(SourceConfig cfg)
     m_snap.dialHz = m_cfg.dialHz;
     m_snap.format = m_cfg.format;
     m_snap.weight = m_cfg.weight;
-    m_snap.station = m_cfg.dialHz < kWwvbCeilingHz ? "wwvb"
+    m_snap.station = m_broadcast == Broadcast::Dcf77 ? "dcf77"
+                   : m_broadcast == Broadcast::Wwvb ? "wwvb"
                    : wwvOnlyCarrier(m_cfg.carrierHz) ? "wwv" : "unknown";
     m_linkSince = monotonicNow();
 }
@@ -404,6 +410,11 @@ void Source::supervise() {
     // into the next attempt inherits the rejection.
     constexpr double kBackoffMin = 2.0;
     constexpr double kBackoffMax = 30.0;
+    // A receiver too old to speak protocol version 4 will not start speaking it
+    // on the next attempt, and every attempt takes a listener slot on a
+    // receiver that is probably not ours. Half an hour is rare enough to cost
+    // its operator nothing and still picks up an upgrade the same evening.
+    constexpr double kTooOldRetrySec = 1800.0;
     constexpr double kJitterFraction = 0.25;
     // Backoff resets once a connection has PROVED itself, not merely opened. A
     // receiver that accepts the WebSocket and then drops it a second later --
@@ -489,6 +500,8 @@ void Source::supervise() {
             // A request that arrived while no connection was up is already
             // satisfied by the one about to be made.
             m_reacquire.store(false);
+            // Asked afresh each time: the operator may have upgraded.
+            m_serverTooOld.store(false);
             m_linkSince = monotonicNow();
         }
 
@@ -570,9 +583,6 @@ void Source::supervise() {
                     if (msg->binary) onBinary(msg->str);
                     else onText(msg->str);
                     break;
-                case ix::WebSocketMessageType::Pong:
-                    onPong(msg->str);
-                    break;
                 default:
                     break;
             }
@@ -635,14 +645,31 @@ void Source::supervise() {
                     consecutiveFailures = 0;
                 }
                 if (now - lastPing >= 30.0) {
+                    // The JSON keepalive the UberSDR session timer watches, and
+                    // also the network round trip, timed from here to the pong.
+                    //
+                    // It has to be this one and not an RFC 6455 ping. A proxy
+                    // that terminates the WebSocket answers control frames
+                    // itself -- gorilla does by default, and so do nginx and
+                    // Cloudflare -- so a protocol-level pong times the path to
+                    // the PROXY. Through tunnel.ubersdr.org that measured
+                    // 13.4 ms to a receiver whose JSON pong took 33.7, and the
+                    // missing half of the relay's leg read as a source 10 ms
+                    // late. The JSON ping is an ordinary message: every proxy
+                    // passes it on and only UberSDR itself can answer it. On a
+                    // direct connection the two agree (30.5 and 30.6 ms), so
+                    // nothing calibrated against the old figure moves.
+                    //
+                    // The pong carries no echo of its ping, so which ping it
+                    // answers is inferred: one outstanding at a time, and if
+                    // the last one was never answered, a pong for it may still
+                    // be in flight -- the next pong is then left untimed rather
+                    // than matched to the wrong ping.
+                    {
+                        std::lock_guard<std::mutex> lk(m_mu);
+                        m_jsonPingSentAt = m_jsonPingSentAt > 0.0 ? kPingUntimed : monotonicNow();
+                    }
                     ws->send("{\"type\":\"ping\"}");
-                    // And a protocol-level ping carrying the time it was sent.
-                    // RFC 6455 requires the peer to echo a ping's payload, so
-                    // the pong dates itself and the round trip needs no state
-                    // here beyond what is in the frame. This is the measurement
-                    // that matters: it goes to whatever is at the far end of
-                    // the connection the AUDIO arrives on.
-                    ws->ping(kPingPrefix + std::to_string(now));
                     lastPing = now;
                 }
 
@@ -655,6 +682,8 @@ void Source::supervise() {
                     lastRttProbe = now;
                     probeRtt();
                 }
+
+                if (m_serverTooOld.load()) break;   // nothing it sends can be decoded
 
                 if (m_reacquire.exchange(false)) {
                     std::string why;
@@ -697,6 +726,24 @@ void Source::supervise() {
         // backoff here would leave it in Backoff for half a minute saying it
         // was retrying something it has been told not to do.
         if (!m_active.load()) continue;
+
+        if (m_serverTooOld.load()) {
+            const double delay = kTooOldRetrySec * backoffDelay() / backoff;   // same jitter
+            const std::string why = "the receiver runs UberSDR older than 0.1.63, which "
+                                    "cannot send protocol version 4; asking again in " +
+                                    std::to_string(static_cast<int>(delay / 60.0)) + " minutes";
+            {
+                std::lock_guard<std::mutex> lk(m_mu);
+                m_snap.link = LinkState::Backoff;
+                m_snap.linkDetail = why;
+                m_linkSince = monotonicNow();
+            }
+            LOG_WARN(tag, "holding off: %s", why.c_str());
+            std::unique_lock<std::mutex> lk(m_wake);
+            m_wakeCv.wait_for(lk, std::chrono::duration<double>(delay),
+                              [this] { return !m_running.load() || !m_active.load(); });
+            continue;
+        }
 
         {
             std::lock_guard<std::mutex> lk(m_mu);
@@ -846,23 +893,14 @@ bool Source::fetchDescription() {
     }
 }
 
-void Source::onPong(const std::string& payload) {
-    // Ours, and still parseable? IXWebSocket's own keepalive pongs are not.
-    const std::size_t plen = std::char_traits<char>::length(kPingPrefix);
-    if (payload.size() <= plen || payload.compare(0, plen, kPingPrefix) != 0) return;
-
-    double sentAt = 0.0;
-    try {
-        sentAt = std::stod(payload.substr(plen));
-    } catch (const std::exception&) {
-        return;
-    }
-    const double rtt = monotonicNow() - sentAt;
-    // A pong that claims to predate its ping, or that took longer than the
-    // session would survive, is not a measurement of anything.
-    if (!(rtt > 0.0) || rtt > 30.0) return;
-
+void Source::onJsonPong() {
+    const double now = monotonicNow();
     std::lock_guard<std::mutex> lk(m_mu);
+    const double sentAt = m_jsonPingSentAt;
+    m_jsonPingSentAt = 0.0;
+    if (!(sentAt > 0.0)) return;   // unsolicited, or deliberately untimed
+    const double rtt = now - sentAt;
+    if (!(rtt > 0.0) || rtt > kMaxPongSec) return;
     recordWsRtt(rtt);
 }
 
@@ -889,14 +927,27 @@ void Source::probeRtt() {
 std::string Source::buildWsUrl() const {
     std::ostringstream u;
     u << httpToWs(m_cfg.url) << "/ws"
-      << "?frequency=" << m_cfg.dialHz
-      << "&mode=usb"
-      // The passband has to reach 2.2 kHz or the WWV/WWVH second tick — which
-      // is recovered entirely from its 2000/2200 Hz audio image — is filtered
-      // away, and the decoder sits in `acquiring` for ever with nothing to say
-      // why. 0-3000 is what the frontend's own clock panel asks for.
-      << "&bandwidthLow=0&bandwidthHigh=3000"
-      << "&format=" << (m_cfg.format == AudioFormat::Opus ? "opus" : "pcm-zstd")
+      << "?frequency=" << m_cfg.dialHz;
+    if (m_iq) {
+        // DCF77: the whole 12 kHz of complex baseband, which is exactly the
+        // server's own IQ preset, so the mode change moves no filter. IQ is
+        // always lossless; min_margin=0 says so explicitly rather than relying
+        // on the parameter's absence meaning it.
+        u << "&mode=iq&bandwidthLow=-6000&bandwidthHigh=6000"
+          << "&format=pcm-zstd&min_margin=0";
+    } else {
+        u << "&mode=usb"
+          // The passband has to reach 2.2 kHz or the WWV/WWVH second tick —
+          // which is recovered entirely from its 2000/2200 Hz audio image — is
+          // filtered away, and the decoder sits in `acquiring` for ever with
+          // nothing to say why. 0-3000 is what the frontend's own clock panel
+          // asks for.
+          << "&bandwidthLow=0&bandwidthHigh=3000"
+          // Lossless at full quality, as IQ is: min_margin=0 says so rather
+          // than leaving it to the parameter's absence.
+          << (m_cfg.format == AudioFormat::Opus ? "&format=opus" : "&format=pcm-zstd&min_margin=0");
+    }
+    u
       // Version 4 for both: it is the only version whose Opus frames carry a
       // self-describing header, and the lossless path at version 4 is the
       // predictive codec rather than anything zstd. The query parameter is
@@ -955,6 +1006,8 @@ void Source::onText(const std::string& msg) {
             LOG_WARN(m_cfg.name.c_str(), "server error: %s", e.c_str());
             std::lock_guard<std::mutex> lk(m_mu);
             m_snap.linkDetail = e;
+        } else if (type == "pong") {
+            onJsonPong();
         } else if (type == "status") {
             if (j.contains("sampleRate") && j["sampleRate"].is_number_integer()) {
                 LOG_DEBUG(m_cfg.name.c_str(), "status: %d Hz, mode %s, %.6f MHz",
@@ -1032,9 +1085,9 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
             // the header survived and its timestamp can still be trusted. No
             // count means the header itself failed, and the next timestamp is
             // not to be read as a gap (see trackTimeline).
-            if (h.sampleCount > 0 && h.channels == 1 && h.sampleRate == m_decoderRate) {
-                trackTimeline(h.timestampNanos, h.sampleRate, h.sampleCount);
-                concealLost(h.sampleCount);
+            if (h.sampleCount > 0 && h.channels == m_channels && h.sampleRate == m_decoderRate) {
+                trackTimeline(h.timestampNanos, h.sampleRate, h.sampleCount / h.channels);
+                concealLost(h.sampleCount / h.channels);
             } else {
                 m_tsHave = false;
                 concealLost(0);
@@ -1047,17 +1100,25 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
             m_snap.noiseDb = h.noise;
             m_feedingOpus = 0;
         }
-        if (h.channels != 1) {
-            // Two channels means an IQ mode, which this is never tuned to.
-            // Feeding interleaved I/Q to a decoder expecting mono would look
-            // like a signal and decode to nothing.
+        if (h.channels != m_channels) {
+            // Interleaved I/Q fed to a decoder expecting mono would look like a
+            // signal and decode to nothing, and mono fed to the DCF77 decoder
+            // has no phase to decode. Either is the server not tuning the mode
+            // asked for, so it is said, once in a while, rather than guessed at.
+            std::lock_guard<std::mutex> lk(m_mu);
+            if (m_snap.decodeErrors++ % 200 == 0) {
+                LOG_ERROR(m_cfg.name.c_str(), "receiver sent %d-channel audio where %d was asked for (%s)",
+                          h.channels, m_channels, m_channels == 2 ? "mode=iq" : "mode=usb");
+            }
             return;
         }
+        // Frames, not int16 values: an IQ frame carries two per sample.
+        const int frames = h.sampleCount / h.channels;
         // ensureDecoder before the tracker, as on the Opus path: a rate change
         // restarts the sample count the tracker is measuring against.
         if (!ensureDecoder(h.sampleRate)) return;
-        trackTimeline(h.timestampNanos, h.sampleRate, h.sampleCount);
-        feedSamples(m_pcmv4->dec.samples(), h.sampleCount, h.sampleRate, arrivalSec);
+        trackTimeline(h.timestampNanos, h.sampleRate, frames);
+        feedSamples(m_pcmv4->dec.samples(), frames, h.sampleRate, arrivalSec);
         return;
     }
 
@@ -1068,6 +1129,7 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
                       "server sent a version 1-3 PCM frame: it is older than 0.1.63 and "
                       "cannot serve protocol version 4");
         }
+        m_serverTooOld.store(true);
         return;
     }
 
@@ -1159,7 +1221,8 @@ void Source::feedSilence(int count, int rate) {
     // In pieces of at most a second, so a long gap does not allocate its whole
     // length and the decoders see blocks the size they are used to.
     const int chunk = std::max(1, rate);
-    if (m_silence.size() < static_cast<std::size_t>(chunk)) m_silence.assign(chunk, 0);
+    const std::size_t need = static_cast<std::size_t>(chunk) * m_channels;
+    if (m_silence.size() < need) m_silence.assign(need, 0);
     while (count > 0) {
         const int n = std::min(count, chunk);
         feedSamples(m_silence.data(), n, rate, 0.0, false);
@@ -1289,11 +1352,11 @@ void Source::discardTiming(const char* why) {
 }
 
 bool Source::ensureDecoder(int rate) {
-    if (m_decoderRate == rate && (m_wwv || m_wwvb)) return true;
+    if (m_decoderRate == rate && (m_wwv || m_wwvb || m_dcf77)) return true;
     if (m_decoderRate == rate && m_rateRefused) return false;   // said once, not per packet
 
     // The decoders decimate to a fixed series rate — 200 Hz for WWV/WWVH,
-    // 100 Hz for WWVB — so a rate that is not a multiple of it decimates
+    // 100 Hz for WWVB and DCF77 — so a rate that is not a multiple of it decimates
     // unevenly and drifts, and the result is a decoder that simply never locks.
     // Every UberSDR audio mode clears this (12000 and 24000 both divide by
     // 200); refusing loudly beats decoding wrongly.
@@ -1305,6 +1368,7 @@ bool Source::ensureDecoder(int rate) {
         m_rateRefused = true;
         m_wwv.reset();
         m_wwvb.reset();
+        m_dcf77.reset();
         m_samplesWritten = 0;
         m_tsHave = false;
         m_clock.reset();
@@ -1335,6 +1399,7 @@ bool Source::ensureDecoder(int rate) {
 
     m_wwv.reset();
     m_wwvb.reset();
+    m_dcf77.reset();
     m_decoderRate = rate;
     m_samplesWritten = 0;
     m_lastFrameSamples = rate / 50;
@@ -1356,11 +1421,12 @@ bool Source::ensureDecoder(int rate) {
         m_snap.clockState = "nosignal";
     }
 
-    // WWV/WWVH and WWVB are genuinely different decoders — a 100 Hz BCD
-    // subcarrier against pulse-width modulation on the carrier's own amplitude
-    // — so this is decided from the dial, not offered as a setting. WWV and
-    // WWVH share one decoder and it identifies which it is hearing itself.
-    const bool wwvb = m_cfg.dialHz < kWwvbCeilingHz;
+    // WWV/WWVH, WWVB and DCF77 are genuinely different decoders — a 100 Hz BCD
+    // subcarrier, pulse-width modulation on the carrier's own amplitude, and
+    // that plus a spread-spectrum phase code on IQ — so this is decided from
+    // the tuning (broadcastFor), not offered as a setting. WWV and WWVH share
+    // one decoder and it identifies which it is hearing itself.
+    const bool wwvb = m_broadcast == Broadcast::Wwvb;
 
     // The plausibility gate. A deep fade zero-biases the same bits in every
     // frame of the voter's window, so the misread is unanimous and no
@@ -1370,7 +1436,16 @@ bool Source::ensureDecoder(int rate) {
     // being measured is milliseconds.
     auto reference = [] { return hostNowFields(static_cast<long long>(realtimeNow() * 1000.0)); };
 
-    if (wwvb) {
+    if (m_iq) {
+        // The carrier's place in the baseband: 0 unless dial_hz moved it.
+        const double offsetHz = static_cast<double>(m_cfg.carrierHz) - static_cast<double>(m_cfg.dialHz);
+        m_dcf77 = std::make_unique<clockdec::Dcf77Decoder>(rate, offsetHz);
+        m_dcf77->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
+        m_dcf77->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
+        m_dcf77->onFrame = [this](const clockdec::ClockFrameInfo& f) { onClockFrame(f); };
+        m_dcf77->onTime = [this](const clockdec::ClockTimeInfo& t) { onClockTime(t); };
+        m_dcf77->setPlausibility(reference, 24 * 60);
+    } else if (wwvb) {
         m_wwvb = std::make_unique<clockdec::WwvbDecoder>(rate);
         m_wwvb->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
         m_wwvb->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
@@ -1406,8 +1481,8 @@ bool Source::ensureDecoder(int rate) {
                       (m_stationMemory == clockdec::ClockStation::Wwvh ? "WWVH" : "WWV");
     }
 
-    LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz%s", wwvb ? "WWVB" : "WWV/WWVH", rate,
-             stationNote.c_str());
+    LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz%s",
+             m_iq ? "DCF77 (AM + PM, IQ)" : wwvb ? "WWVB" : "WWV/WWVH", rate, stationNote.c_str());
     return true;
 }
 
@@ -1425,18 +1500,22 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     // observed against a count that includes them, which is the point.
     if (observeArrival) m_clock.observe(m_samplesWritten, arrivalSec);
 
-    if (m_mono.size() < static_cast<std::size_t>(count)) m_mono.resize(count);
-    for (int i = 0; i < count; ++i) m_mono[i] = pcm[i] * (1.0f / 32768.0f);
+    // `count` is frames; an IQ frame is two int16s, I then Q.
+    const std::size_t values = static_cast<std::size_t>(count) * m_channels;
+    if (m_mono.size() < values) m_mono.resize(values);
+    for (std::size_t i = 0; i < values; ++i) m_mono[i] = pcm[i] * (1.0f / 32768.0f);
 
-    if (m_wwv) m_wwv->process(m_mono.data(), static_cast<std::size_t>(count));
+    if (m_dcf77) m_dcf77->process(m_mono.data(), static_cast<std::size_t>(count));
+    else if (m_wwv) m_wwv->process(m_mono.data(), static_cast<std::size_t>(count));
     else m_wwvb->process(m_mono.data(), static_cast<std::size_t>(count));
 
     // Diagnostics are assembled on call from state the decoder already holds,
     // so this costs nothing on the sample path and keeps the status report
     // current without a second timer reaching into the decoder.
-    const auto d = m_wwv ? m_wwv->diagnostics() : m_wwvb->diagnostics();
-    const auto st = m_wwv ? m_wwv->station() : m_wwvb->station();
-    const auto consumed = m_wwv ? m_wwv->samplesConsumed() : m_wwvb->samplesConsumed();
+    const auto d = m_dcf77 ? m_dcf77->diagnostics() : m_wwv ? m_wwv->diagnostics() : m_wwvb->diagnostics();
+    const auto st = m_dcf77 ? m_dcf77->station() : m_wwv ? m_wwv->station() : m_wwvb->station();
+    const auto consumed = m_dcf77 ? m_dcf77->samplesConsumed()
+                        : m_wwv ? m_wwv->samplesConsumed() : m_wwvb->samplesConsumed();
 
     if (m_wwv) {
         if (st == clockdec::ClockStation::Unknown) {
@@ -1459,6 +1538,29 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     m_snap.windowSize = d.windowSize;
     m_snap.voteQuality = d.voteQuality;
     m_snap.samplesConsumed = consumed;
+    if (m_dcf77) {
+        m_snap.pmLocked = d.pmLocked;
+        m_snap.pmSnrDb = d.pmSnrDb;
+        m_snap.timingFromPm = d.timingFromPm;
+        m_snap.amMinusPmMs = d.amMinusPmMs;
+        m_snap.carrierOffsetHz = d.carrierOffsetHz;
+        static const char* const kFrom[] = {"", "am", "pm", "both", "conflict"};
+        m_snap.frameFrom = kFrom[std::min<int>(d.lastFrameFrom, 4)];
+        m_snap.pmRefusedLocks = d.pmRefusedLocks;
+        m_snap.pmInterference = d.pmInterference;
+        // Which of the two is timing the second is the most useful thing the
+        // log can say about a DCF77 source -- once it has held for half a
+        // minute. On a marginal path PM comes and goes by the second, and a
+        // line each time is noise in a log meant to be read after months.
+        const int timing = d.phaseLocked ? static_cast<int>(d.timingFromPm) : -1;
+        const double now = monotonicNow();
+        if (timing != m_timingSeen) { m_timingSeen = timing; m_timingSeenAt = now; }
+        if (timing >= 0 && timing != m_loggedTimingPm && now - m_timingSeenAt >= 30.0) {
+            LOG_INFO(m_cfg.name.c_str(), "second edges from %s for the last 30 s%s",
+                     timing ? "PM" : "AM", timing ? "" : " (phase modulation not tracking)");
+            m_loggedTimingPm = timing;
+        }
+    }
     switch (static_cast<clockdec::ClockLockRefusal>(d.refusalReason)) {
         case clockdec::ClockLockRefusal::QualityFloor: m_snap.refusal = "quality_floor"; break;
         case clockdec::ClockLockRefusal::Plausibility: m_snap.refusal = "plausibility"; break;
@@ -1466,11 +1568,15 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
         case clockdec::ClockLockRefusal::Contested:    m_snap.refusal = "contested"; break;
         default: m_snap.refusal = "none"; break;
     }
-    const char* station = "unknown";
+    // DCF77 is the only thing on 77.5 kHz, as WWV is on 20 and 25 MHz: the tag
+    // is the carrier's, and does not blink to "unknown" while a new decoder
+    // looks for it.
+    const char* station = m_dcf77 ? "dcf77" : "unknown";
     switch (st) {
         case clockdec::ClockStation::Wwv:  station = "wwv"; break;
         case clockdec::ClockStation::Wwvh: station = "wwvh"; break;
         case clockdec::ClockStation::Wwvb: station = "wwvb"; break;
+        case clockdec::ClockStation::Dcf77: station = "dcf77"; break;
         default: break;
     }
     if (m_snap.station != station) {
@@ -1515,6 +1621,7 @@ void Source::resetStream(const char* why) {
     m_tsWaitResync = false;
     m_wwv.reset();
     m_wwvb.reset();
+    m_dcf77.reset();
 
     std::lock_guard<std::mutex> lk(m_mu);
     m_haveAnchor = false;
@@ -1892,13 +1999,14 @@ void Source::updateDelayModel() {
     // tag is used the moment it is available.
     GeoPoint tx;
     bool lf = false;
-    if (m_snap.station == "wwvh") tx = wwvhSite();
-    else if (m_snap.station == "wwvb" || m_cfg.dialHz < kWwvbCeilingHz) { tx = wwvbSite(); lf = true; }
+    if (m_broadcast == Broadcast::Dcf77) { tx = dcf77Site(); lf = true; }
+    else if (m_snap.station == "wwvh") tx = wwvhSite();
+    else if (m_snap.station == "wwvb" || m_broadcast == Broadcast::Wwvb) { tx = wwvbSite(); lf = true; }
     else tx = wwvSite();
 
     double prop = 0.0;
     if (m_snap.receiverLocation.valid) {
-        // 60 kHz gets the groundwave, not F-layer hops. See Propagation.h.
+        // 60 and 77.5 kHz get the groundwave, not F-layer hops. See Propagation.h.
         const double d = greatCircleMeters(m_snap.receiverLocation, tx);
         prop = lf ? lfDelaySeconds(d) : skywaveDelaySeconds(d);
         m_snap.pathDescription = lf ? describeLfPath(m_snap.receiverLocation, tx)
@@ -1928,10 +2036,11 @@ void Source::updateDelayModel() {
     // measuring the right thing. A TCP handshake times the path to whatever
     // accepted the SYN, and most UberSDR instances are reached through a tunnel
     // that terminates TCP near the client -- one measured here answered in 13 ms
-    // for an origin 91 ms away. A ping down the audio connection cannot be
-    // answered by the tunnel: timing an application-level ping through the same
-    // connection, which only the origin can reply to, agreed with the protocol
-    // ping to 0.1 ms.
+    // for an origin 91 ms away. The ping has to be an APPLICATION ping, the JSON
+    // one the server answers itself: a proxy that terminates the WebSocket
+    // answers RFC 6455 pings on its own, and tunnel.ubersdr.org now does --
+    // 13.4 ms by protocol ping against 33.7 by JSON ping, on a receiver where
+    // they once agreed to 0.1 ms. See the ping in run().
     //
     // The handshake is the cleaner ruler where it is valid -- the kernel answers
     // a SYN, while a ping waits for the server's event loop, which costs a few
@@ -1961,12 +2070,19 @@ void Source::updateDelayModel() {
     // The decoder's own edge bias, by which decoder is running -- chosen from
     // the dial exactly as ensureDecoder chooses it. Negative: an edge reported
     // early makes the offset read large, so it is taken back off.
-    const double decoder = m_cfg.dialHz < kWwvbCeilingHz ? 0.0 : kWwvDecoderEdgeBiasSec;
+    // DCF77's edges are exact to the test's resolution whichever demodulator
+    // is timing them (tools/dcf77test), so it has none either.
+    const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec : 0.0;
 
     m_snap.propagationSec = prop;
     m_snap.networkSec = net;
     m_snap.codecSec = codec;
     m_snap.decoderSec = decoder;
+    // Measured on USB sessions. A DCF77 source is an IQ session, which radiod
+    // serves from a different preset; whether its framing costs the same is
+    // not known yet, and the class delta on a DCF77 source is what will say.
+    // Applied as it stands until then: a separate IQ figure wants twenty
+    // settled minutes of that delta behind it, not a guess.
     m_snap.chainSec = kUberSdrChainDelaySec;
     m_snap.extraSec = m_cfg.extraDelayMs / 1000.0;
     m_snap.delaySec = prop + net + codec + decoder + kUberSdrChainDelaySec + m_snap.extraSec;
@@ -2060,8 +2176,16 @@ SourceSnapshot Source::snapshot() const {
         // far -- a passband too narrow to pass the tick image -- is invisible
         // from "not locked" and obvious from "no tick".
         s.notReadyReason =
-            s.link != LinkState::Streaming ? "no audio: the link is " + std::string(linkStateName(s.link))
-          : !s.toneDetected                ? "no tick: nothing at 1000 Hz to time a second from"
+            s.link != LinkState::Streaming
+              ? "no audio: the link is " + std::string(linkStateName(s.link)) +
+                    (s.linkDetail.empty() ? "" : " (" + s.linkDetail + ")")
+          : !s.toneDetected
+              // What "heard" means depends on the decoder: WWV's is the 1 kHz
+              // second tick; WWVB and DCF77 are timed off their carriers.
+              ? (m_broadcast == Broadcast::Wwv
+                     ? std::string("no tick: nothing at 1000 Hz to time a second from")
+                     : std::string("no carrier: the transmitter is not heard at ") +
+                           (m_broadcast == Broadcast::Dcf77 ? "77.5" : "60") + " kHz")
           : !s.phaseLocked                 ? "no edge: the tick is heard but not yet tracked"
           : !s.anchored                    ? "no frame: edges are tracked but no minute has decoded"
           : s.refusal != "none"            ? "frames refused: " + s.refusal

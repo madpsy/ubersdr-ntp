@@ -1,4 +1,4 @@
-// ubersdr-ntp — an NTP server disciplined by WWV/WWVH/WWVB heard over UberSDR.
+// ubersdr-ntp — an NTP server disciplined by WWV/WWVH/WWVB/DCF77 heard over UberSDR.
 //
 // Connects to one or more UberSDR receivers, tunes each to a time-signal
 // frequency, decodes the broadcast time code in process, and serves the result
@@ -82,7 +82,7 @@ void onSignal(int sig) {
 void usage() {
     using ubersdr_ntp::kVersion;
     std::printf(
-        "ubersdr-ntp %s — an NTP server disciplined by WWV/WWVH/WWVB over UberSDR\n"
+        "ubersdr-ntp %s — an NTP server disciplined by WWV/WWVH/WWVB/DCF77 over UberSDR\n"
         "\n"
         "Usage:\n"
         "  ubersdr-ntp --config FILE [overrides]\n"
@@ -95,7 +95,7 @@ void usage() {
         "                           e.g. --source https://sdr.example.org@10\n"
         "                           May be repeated. The dial is derived as 1 kHz below\n"
         "                           the carrier, which is the tuning WWV, WWVH and WWVB\n"
-        "                           all want.\n"
+        "                           all want; @0.0775 is DCF77, tuned on the carrier as IQ.\n"
         "      --ntp-source HOST    An upstream NTP server, as a second class of source.\n"
         "                           e.g. --ntp-source time.cloudflare.com, or HOST:PORT.\n"
         "                           May be repeated.\n"
@@ -106,8 +106,8 @@ void usage() {
         "                                    (default) — failover is then instant\n"
         "                           cold     do not connect at all until the primary fails\n"
         "      --password PW        Bypass password applied to every --source\n"
-        "      --format FMT         opus (default) or pcm-v4 (lossless, ~4x the bandwidth,\n"
-        "                           and no codec delay to calibrate out)\n"
+        "      --format FMT         pcm-v4 (default: lossless, no codec delay to\n"
+        "                           calibrate out) or opus (~4x less bandwidth, +8 ms)\n"
         "\n"
         "Overrides (these win over the config file):\n"
         "      --port N             NTP port (default 123, which is privileged)\n"
@@ -148,10 +148,12 @@ bool parseSourceSpec(const std::string& spec, ubersdr_ntp::SourceConfig& out, st
     char* end = nullptr;
     const double v = std::strtod(freq.c_str(), &end);
     if (end == freq.c_str() || v <= 0.0) { err = "not a frequency: " + freq; return false; }
-    // Anything under 1000 is taken as MHz. That covers 10, 9.999 and 0.06 (for
-    // WWVB's 60 kHz) and cannot be confused with a figure in Hz, since no
-    // time-signal carrier this decodes is below 1 kHz.
-    out.carrierHz = static_cast<std::uint64_t>(v < 1000.0 ? v * 1e6 : v);
+    // Anything under 1000 is taken as MHz. That covers 10, 9.999, 0.06 (for
+    // WWVB's 60 kHz) and 0.0775 (DCF77), and cannot be confused with a figure
+    // in Hz, since no time-signal carrier this decodes is below 1 kHz. Rounded,
+    // not truncated: DCF77 is recognised by its carrier exactly, and a decimal
+    // MHz figure is not always exact in binary.
+    out.carrierHz = static_cast<std::uint64_t>(std::llround(v < 1000.0 ? v * 1e6 : v));
     return true;
 }
 
@@ -370,7 +372,7 @@ int main(int argc, char** argv) {
     LOG_INFO(kTag, "ubersdr-ntp %s starting (User-Agent: %s)", kVersion, kUserAgent);
     for (const std::string& w : cfg.warnings) LOG_WARN(kTag, "%s", w.c_str());
     for (const SourceConfig& s : cfg.sources) {
-        LOG_INFO(kTag, "radio  %-14s %s  dial %.6f MHz (carrier %.3f MHz) %s%s%s",
+        LOG_INFO(kTag, "radio  %-14s %s  dial %.6f MHz (carrier %g MHz) %s%s%s",
                  s.name.c_str(), s.url.c_str(), s.dialHz / 1e6, s.carrierHz / 1e6,
                  formatName(s.format),
                  s.enabled ? "" : " [DISABLED]",

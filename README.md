@@ -1,6 +1,6 @@
 # ubersdr-ntp
 
-An NTP server disciplined by WWV, WWVH or WWVB, heard over one or more
+An NTP server disciplined by WWV, WWVH, WWVB or DCF77, heard over one or more
 [UberSDR](https://ubersdr.org) receivers.
 
 It connects to a receiver's audio WebSocket, tunes it to a time-signal
@@ -156,6 +156,7 @@ need no receiver and no network, and are built alongside the daemon:
 
 ```bash
 ./build-native/ubersdr-ntp-decodertest   # the DSP: synthesised WWV/WWVH/WWVB
+./build-native/ubersdr-ntp-dcf77test     # DCF77 AM + PM, synthesised and a real recording
 ./build-native/ubersdr-ntp-clocktest     # offset/rate estimator, sample clock, Selector
 ./build-native/ubersdr-ntp-ntptest       # the NTP client, against a fake server
 ./build-native/ubersdr-ntp-configtest    # the configuration reader
@@ -302,13 +303,15 @@ immediately instead of waiting for the next interval.
 
 Give it the **transmitter's carrier** — `carrier_hz: 10000000` for the 10 MHz
 outlet — and it tunes USB 1 kHz below, with the passband open to 3 kHz. Do not
-subtract the kilohertz yourself.
+subtract the kilohertz yourself. DCF77 is the exception: it is tuned on the
+carrier, as IQ.
 
 | Station | Carrier | Dial it tunes | Why |
 |---|---|---|---|
 | WWV / WWVH | 2.5, 5, 10, 15 MHz | carrier − 1 kHz | Puts the RF carrier at 1000 Hz audio, the 100 Hz BCD subcarrier at 900/1100 Hz, and the seconds tick at its 2000 Hz (WWV) / 2200 Hz (WWVH) image |
 | WWV only | 20, 25 MHz | carrier − 1 kHz | 25 MHz is an experimental broadcast: real, but intermittent and lower power |
 | WWVB | 60 kHz | 59 kHz | Puts the 60 kHz carrier at ~1000 Hz audio, where the PWM rides on its amplitude |
+| DCF77 | 77.5 kHz | 77.5 kHz, **IQ ±6 kHz** | The carrier at 0 Hz in complex baseband, so its phase is there to be read; always lossless |
 
 **The passband must reach 2.2 kHz**, which is why it asks for 0–3 kHz and why
 you should not narrow it. The WWV/WWVH second edge is recovered *entirely* from
@@ -332,24 +335,90 @@ European path. So it is made to be steady:
   (`WWV?` / `WWVH?`, with the ratio on hover) rather than a blank. Every
   change is logged with the ratio behind it.
 
-WWVB is chosen automatically for any dial below 1 MHz: it is a genuinely
+WWVB is chosen automatically for any other dial below 1 MHz: it is a genuinely
 different decoder — pulse-width modulation on the carrier's own amplitude
 against a 100 Hz BCD subcarrier — not a setting.
 
+### DCF77: amplitude and phase, both at once
+
+`carrier_hz: 77500` is DCF77, from Mainflingen, and nothing else about it needs
+setting. It is taken as UberSDR's `iq` mode — 12 kHz of complex baseband, which
+every receiver offers publicly and always sends lossless (`format` is forced to
+`pcm-v4`; the URL says `min_margin=0`) — because half of DCF77 is in the
+carrier's **phase**, and a demodulated audio channel keeps none.
+
+The station sends its time code twice over. The **AM** is the classic one: the
+carrier cut to 15% for 0.1 s (a 0) or 0.2 s (a 1) at the start of every second,
+second 59 left alone to mark the minute. The **PM** is a 512-chip pseudo-random
+phase code at ±15.6°, from 200 ms to 993 ms of every second, inverted for a 1 —
+spread spectrum, and correlated here to find the second to tens of
+microseconds and to hold on through noise that buries the AM. Both run every
+second, and each checks the other:
+
+- **Timing** comes from PM whenever its correlator is tracking, from AM
+  otherwise. The log says which each time it changes, and the status page
+  shows it with the two edges' difference — AM's edge minus PM's is the one
+  check AM timing has, and reads a fraction of a millisecond on a healthy path.
+- **The minute** is decoded twice, from PM's bits and from AM's, each through
+  its own parity checks. Both valid and the same: taken. One valid: taken from
+  that one — which is AM carrying on when PM fades, or PM when the AM cut is
+  lost in the noise. Both valid and *different*: nothing is certified from it,
+  and the page says `refused: AM and PM read different times`.
+- **Where the minute starts** is found by either: AM's uncut second 59, or the
+  sixteen seconds (59, 0–14) PM always sends as a fixed pattern. Each then
+  vetoes the other's contradicting reads.
+
+The code is in CET/CEST and names the minute *about to begin*; it is converted
+to UTC before it is voted on, so the CET/CEST changeover is a non-event, and a
+leap second (a 0 in second 59, an uncut second 60) is handled as WWVB's is.
+
+Which way round the phase reads is learnt from those fixed sixteen seconds, not
+assumed: a KiwiSDR recording reads the opposite way to PTB's description taken
+literally, and whether a receiver's I/Q is conjugated is its own business.
+
+Interference is expected at LF, and three things keep it from deciding
+anything. The carrier is only looked for within ±3 Hz of 77.5 kHz — it is an
+atomic standard, so only the receiver's own clock can move it, and 20 ppm is
+1.6 Hz — which stops a strong line nearby being taken for it. A burst whose
+phase carries more low-frequency power than the chips can account for is
+correlated through a zero-phase high-pass, so a steady tone near the carrier
+neither flips PM bits nor passes as noise; the status page says when this is
+happening. And a PM lock that puts the second somewhere AM — while decoding
+valid minutes — does not, is refused rather than allowed to throw away AM's
+count of seconds, and the refusals are counted on the page.
+
+`tools/dcf77test.cpp` synthesises all of that — noise down to 24 dB-Hz, a
+carrier off DC, a tone twice the carrier's strength 10 Hz from it, five-second
+fades at the end of a minute, AM with no PM, PM with no AM, inverted I/Q, a leap
+second, the changeover, and AM and PM that disagree — and then decodes
+`tools/testdata/dcf77_live.wav`, five minutes of real DCF77 from a KiwiSDR
+35 km from the transmitter. On that recording AM and PM agree on every minute,
+PM's edges sit on a straight line to better than the 0.08 ms sample grid can
+show, AM's edges fall 0.2 ms after PM's, and the time read is 09:20 UTC on
+Sunday 2026-05-24, which is what the recording's own README shows. Live, on an
+UberSDR 290 km from the transmitter, both read every minute alike -- a
+five-second fade apart, which both refused -- and AM's edges sat 0.1 to 0.3 ms
+after PM's.
+
+One thing is not known yet: the UberSDR chain constant below was measured on USB
+sessions, and IQ is served from a different radiod preset. The class delta on a
+DCF77 source is what will say whether it holds, and it is applied unchanged
+until that has been measured properly.
+
 ## Audio format
 
-**Opus is the default** and it works: measured against synthetic WWV through an
-encode/decode round trip at exactly the server's settings (12 kHz, 24 kbps,
-`APPLICATION_VOIP`, complexity 5), the decoder still reaches quality-100 lock at
-10, 6 and 3 dB SNR, with the second edge landing a consistent 5–10 ms late. That
-is a *bias*, not jitter — it did not move between clean and noisy signals — and
-the delay model accounts for it.
+**PCM v4 is the default**: the predictive lossless codec, asked for at full
+quality (`min_margin=0`, the same as DCF77's IQ). No codec delay to account for,
+so one fewer constant in the delay model, at about four times the bandwidth of
+Opus. (The query parameter on the wire is still spelt `pcm-zstd` for
+compatibility with older servers; version 4 carries no zstd at all.)
 
-`"format": "pcm-v4"` is the predictive lossless codec instead: about four times
-the bandwidth, and no codec delay to account for. Worth it on a receiver on your
-own network, rarely worth it over the internet. (The query parameter on the wire
-is still spelt `pcm-zstd` for compatibility with older servers; version 4
-carries no zstd at all.)
+`"format": "opus"` works too, for a slow or metered link: measured against
+synthetic WWV through an encode/decode round trip at exactly the server's
+settings (12 kHz, 24 kbps, `APPLICATION_VOIP`, complexity 5), the decoder still
+reaches quality-100 lock at 10, 6 and 3 dB SNR, with the second edge landing a
+consistent 5–10 ms late. That is a *bias*, not jitter — it did not move between
+clean and noisy signals — and the delay model accounts for it (8 ms).
 
 ## The delay model
 
@@ -362,10 +431,10 @@ audio stream measures:
 | Term | Typical | How it is obtained |
 |---|---|---|
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
-| Network | 5–100 ms | Measured, as half the round trip of a WebSocket ping down the audio connection itself |
+| Network | 5–100 ms | Measured, as half the round trip of a JSON ping that the receiver itself answers, down the audio connection |
 | Codec | 8 ms (Opus), 0 (PCM v4) | A measured constant |
-| UberSDR chain | 12.6 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. Calibrated against the NTP class — see below |
-| Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB) | A measured constant, from `tools/decodertest.cpp` |
+| UberSDR chain | 14.1 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. Calibrated against the NTP class — see below |
+| Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB, DCF77) | A measured constant, from `tools/decodertest.cpp` and `tools/dcf77test.cpp` |
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
 
 The network term is measured over the **WebSocket**, not with an HTTP request,
@@ -375,10 +444,14 @@ at the receiver. One measured here answered its handshake in 12 ms for an origin
 94 ms away, which cost 40 ms of delay budget and put its offset 39 ms from a
 receiver on the same band it should have agreed with to a millisecond.
 
-A ping down the audio connection cannot be answered by the tunnel. That is
-verified rather than assumed: an application-level ping through the same
-connection, which only the receiver can reply to, agreed with the protocol ping
-to 0.1 ms.
+The ping is UberSDR's own JSON `{"type":"ping"}`, timed to its `pong`, and not
+a WebSocket protocol ping. A proxy that terminates the WebSocket answers protocol
+pings itself, and `tunnel.ubersdr.org` does: through it, one receiver's protocol
+ping came back in 13.4 ms while its JSON ping took 33.7 — and the half of that
+difference missing from the delay model read as a source 10 ms late. The JSON
+ping is an ordinary message that every proxy passes on and only the receiver can
+answer. On a receiver served directly the two agree (30.5 and 30.6 ms), so
+nothing calibrated against the old measurement moves.
 
 Every source is measured this way, including the ones reached directly, and that
 is deliberate. The handshake is the cleaner ruler where it is valid — a SYN is
@@ -411,6 +484,22 @@ put UTC about 1 ms late. A per-path error does not hold that steady across hours
 and two receivers; a shared constant does. So the chain constant was lowered
 from 13.6 ms to **12.6 ms** (2026-09-17). After the change the Difference should
 sit near zero; if it settles somewhere else, that is the next correction.
+
+That move was later withdrawn, and the constant is **14.1 ms**. The 12.6 had been
+fitted while the propagation model was a strict lower bound, so the reference
+carried a one-signed deficit of its own; 11.5 settled hours of class delta on a
+receiver 2516 km away put it back at 14.1 (2026-09-20), and 64 further minutes,
+with the crystal's rate shared across classes and a second upstream checking the
+first, centred on zero (mean +0.11 ms, sd 0.49). Anything under about twenty
+minutes of the smoothed delta describes the last disturbance rather than the
+constant: two of the three moves of it were read off windows that short.
+
+It was calibrated on WWV sources over Opus, so it carries whatever error sits in
+the terms those sources subtract and a DCF77 source does not -- the WWV decoder
+bias and the Opus delay -- and any asymmetry in the transatlantic paths it was
+measured over. Two DCF77 receivers in Belgium and France both read ahead of a
+GPS-disciplined server by a shared ~2.3 ms (2026-09-22). Which of those it is
+has not been separated yet, so nothing has been moved for it.
 
 The part nothing in the stream can see is the delay inside the receiver —
 `radiod`'s demodulator and filters, its block framing, the server's handling —
@@ -1259,6 +1348,12 @@ needs a diff rather than a `cp`:
   costs about 19 ms of propagation on an eastern-US path);
 - leap-second (61-second) minutes, and the WWVB DST bits.
 
+`src/clock/Dcf77Decoder.*` was written here, from PTB's description of the
+time code and phase modulation and Hetzel's EFTF 1988 paper, and feeds the same
+voter. `tools/testdata/dcf77_live.wav` is the recording from
+[KiwiSDR_DCF77_Decoder](https://github.com/karastoyanov/KiwiSDR_DCF77_Decoder)
+(GPL-3.0), made through a public KiwiSDR near Mainflingen.
+
 The voter's calibration constants and `kNominalDelaySamples` are still
 upstream's. `tools/decodertest.cpp` (`ubersdr-ntp-decodertest`) generates all
 three stations and checks every timestamp and edge against the truth.
@@ -1270,8 +1365,8 @@ that half, written here rather than patched in.
 
 `third_party/IXWebSocket` and `third_party/json.hpp` are vendored as-is.
 
-Format facts throughout are per NIST SP 432 (WWV/WWVH) and NIST SP 250-67
-(WWVB).
+Format facts throughout are per NIST SP 432 (WWV/WWVH), NIST SP 250-67
+(WWVB), and PTB's DCF77 time-code and phase-modulation pages (DCF77).
 
 ## Licence
 

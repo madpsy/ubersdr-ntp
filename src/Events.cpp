@@ -115,7 +115,7 @@ const std::vector<EventTypeInfo>& eventTypes() {
         {EventType::LinkDown, "link_down", "Receiver disconnected", "radio", S::Warning,
          "The audio stream from a receiver stopped, or a connection to it failed."},
         {EventType::StationChanged, "station_changed", "Station identified", "radio", S::Info,
-         "The decoder decided which transmitter it is hearing (WWV, WWVH or WWVB), or "
+         "The decoder decided which transmitter it is hearing (WWV, WWVH, WWVB or DCF77), or "
          "changed its mind."},
         {EventType::TimeRefused, "time_refused", "Decoded time refused", "radio", S::Warning,
          "A receiver decoded a time whole seconds or more from where its own history puts it "

@@ -432,7 +432,7 @@ std::string renderStatusBlock(const StatusInput& in) {
         }
 
         o << '\n' << s.name << ":  " << s.url << "  dial " << f2(s.dialHz / 1e6, 6)
-          << " MHz (carrier " << f2(s.carrierHz / 1e6, 3) << " MHz), "
+          << " MHz (carrier " << s.carrierHz / 1e6 << " MHz), "
           << formatName(s.format);
         if (s.sampleRate) o << " @ " << s.sampleRate << " Hz";
         o << '\n';
@@ -746,6 +746,20 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     dec["window_size"] = s.windowSize;
     dec["vote_quality"] = s.voteQuality;
     dec["refusal"] = s.refusal;
+    if (s.station == "dcf77") {
+        // DCF77 runs two demodulators; this is what each is doing.
+        auto num = [](double v) { return std::isfinite(v) ? json(v) : json(nullptr); };
+        json d;
+        d["pm_locked"] = s.pmLocked;
+        d["pm_snr_db"] = num(s.pmSnrDb);
+        d["timing"] = s.timingFromPm ? "pm" : "am";
+        d["am_minus_pm_ms"] = num(s.amMinusPmMs);
+        d["carrier_offset_hz"] = num(s.carrierOffsetHz);
+        d["frame_from"] = s.frameFrom.empty() ? json(nullptr) : json(s.frameFrom);
+        d["pm_refused_locks"] = s.pmRefusedLocks;
+        d["pm_interference"] = s.pmInterference;
+        dec["dcf77"] = std::move(d);
+    }
     dec["audio_seconds"] = s.sampleRate ? static_cast<double>(s.samplesConsumed) / s.sampleRate : 0.0;
     dec["last_quality"] = s.lastQuality;
     dec["last_decoded_utc"] = s.lastDecodedUtc;

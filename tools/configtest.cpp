@@ -411,6 +411,35 @@ void testMqttBlock() {
           "%s", r.ok ? r.cfg.mqtt.ingestUrl.c_str() : r.why());
 }
 
+void testDcf77Tuning() {
+    std::printf("\nDCF77: chosen by its carrier, tuned on it, and always lossless\n");
+
+    const Loaded r = load(R"({
+      "defaults": { "format": "opus" },
+      "sources": [ { "url": "http://r.example", "carrier_hz": 77500 },
+                   { "url": "http://r.example", "carrier_hz": 60000 } ]
+    })");
+    const SourceConfig* d = r.ok && r.cfg.sources.size() == 2 ? &r.cfg.sources[0] : nullptr;
+    const SourceConfig* b = r.ok && r.cfg.sources.size() == 2 ? &r.cfg.sources[1] : nullptr;
+    check("77.5 kHz is DCF77, with the dial ON the carrier",
+          d && broadcastFor(d->carrierHz, d->dialHz) == Broadcast::Dcf77 && d->dialHz == 77500,
+          "%s", d ? std::to_string(d->dialHz).c_str() : r.why());
+    check("DCF77 is lossless whatever the defaults ask for",
+          d && d->format == AudioFormat::PcmV4);
+    check("and is named after what it listens to",
+          d && d->name.rfind("dcf77-", 0) == 0, "%s", d ? d->name.c_str() : "");
+    check("60 kHz is still WWVB, 1 kHz below, and keeps its codec",
+          b && broadcastFor(b->carrierHz, b->dialHz) == Broadcast::Wwvb && b->dialHz == 59000 &&
+              b->format == AudioFormat::Opus && b->name.rfind("wwvb-", 0) == 0,
+          "%s", b ? b->name.c_str() : "");
+
+    const Loaded near = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500,"dial_hz":76500}]})");
+    check("a dial 1 kHz off still leaves the carrier in the IQ passband", near.ok, "%s", near.why());
+    const Loaded far = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500,"dial_hz":70000}]})");
+    check("a dial 7.5 kHz off is refused, and says why", !far.ok &&
+              std::string(far.why()).find("IQ passband") != std::string::npos, "%s", far.why());
+}
+
 int main() {
     std::printf("ubersdr-ntp configuration test\n");
 
@@ -427,6 +456,7 @@ int main() {
     testClockBlock();
     testValidation();
     testMqttBlock();
+    testDcf77Tuning();
 
     // Tidy up: the files hold made-up passwords, but leaving a trail of
     // configuration files in /tmp on every build is untidy either way.

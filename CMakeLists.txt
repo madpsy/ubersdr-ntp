@@ -53,6 +53,7 @@ target_compile_options(ixwebsocket_vendored PRIVATE -w)
 add_library(clockdecoders STATIC
     src/clock/WwvDecoder.cpp
     src/clock/WwvbDecoder.cpp
+    src/clock/Dcf77Decoder.cpp
     src/clock/TimeFrameVoter.cpp)
 target_include_directories(clockdecoders PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(clockdecoders PRIVATE -w)
@@ -63,6 +64,16 @@ target_compile_options(clockdecoders PRIVATE -w)
 add_executable(ubersdr-ntp-decodertest tools/decodertest.cpp)
 target_link_libraries(ubersdr-ntp-decodertest PRIVATE clockdecoders Threads::Threads)
 target_compile_options(ubersdr-ntp-decodertest PRIVATE -Wall -Wextra)
+
+# Offline DCF77 test: synthesised AM+PM complex baseband (noise, carrier offset,
+# AM-only, PM-only, inverted I/Q, leap second, CET/CEST change, AM and PM that
+# disagree), then the real recording in tools/testdata if it is there. Not
+# installed.
+add_executable(ubersdr-ntp-dcf77test tools/dcf77test.cpp)
+target_link_libraries(ubersdr-ntp-dcf77test PRIVATE clockdecoders Threads::Threads)
+target_compile_options(ubersdr-ntp-dcf77test PRIVATE -Wall -Wextra)
+target_compile_definitions(ubersdr-ntp-dcf77test PRIVATE
+    DCF77_TESTDATA="${CMAKE_CURRENT_SOURCE_DIR}/tools/testdata/dcf77_live.wav")
 
 # Offline test of the daemon's clock: the offset/rate estimator against a
 # drifting crystal, a step and outliers; the sample-clock fit on a steady clock

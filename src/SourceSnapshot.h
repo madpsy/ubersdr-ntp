@@ -181,6 +181,20 @@ struct SourceSnapshot {
     bool leapPending = false;
     int dut1Tenths = 0;
 
+    // DCF77's two demodulators (Dcf77Decoder.h); false / NaN / empty for WWV
+    // and WWVB. timingFromPm says whose edges the offset is being taken from,
+    // amMinusPmMs is the one check the AM timing has, and frameFrom which of
+    // the two the last minute's time was read from: "am", "pm", "both", or
+    // "conflict" when both read a valid time and they were not the same.
+    bool pmLocked = false;
+    double pmSnrDb = std::numeric_limits<double>::quiet_NaN();
+    bool timingFromPm = false;
+    double amMinusPmMs = std::numeric_limits<double>::quiet_NaN();
+    double carrierOffsetHz = std::numeric_limits<double>::quiet_NaN();
+    std::string frameFrom;
+    int pmRefusedLocks = 0;
+    bool pmInterference = false;
+
     // The continuity check on decoded times (Source.cpp, admitDecodedTime):
     // UTC does not jump, so a decoded time that does has been misread. Empty
     // while every decode agrees with the source's own history; otherwise what

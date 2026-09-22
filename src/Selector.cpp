@@ -85,6 +85,7 @@ constexpr double kMaxDisagreementSec = 0.030;
 std::string refidFor(const std::string& station) {
     if (station == "wwvh") return "WWVH";
     if (station == "wwvb") return "WWVB";
+    if (station == "dcf77") return "DCF";   // RFC 5905's code for LF radio DCF77
     return "WWV";
 }
 

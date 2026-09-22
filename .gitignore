@@ -7,3 +7,5 @@ src/IndexHtml.inc
 # Your actual configuration, which holds receiver passwords.
 config.json
 *.log
+# The crystal frequency the daemon writes while running (ntp.drift_file).
+/drift

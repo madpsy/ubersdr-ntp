@@ -20,7 +20,7 @@ namespace {
 constexpr const char* kTag = "mqtt";
 
 // Shown on this addon's device card in Home Assistant.
-constexpr const char* kModel = "WWV/WWVH/WWVB stratum-1 NTP server";
+constexpr const char* kModel = "WWV/WWVH/WWVB/DCF77 stratum-1 NTP server";
 
 // Well inside the receiver's offline_after_sec (300 s by default), past which
 // it marks the addon offline and every entity goes unavailable.

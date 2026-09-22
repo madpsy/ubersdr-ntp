@@ -380,6 +380,8 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
         o["frames_in_window"] = s.framesInWindow;
         o["window_size"] = s.windowSize;
         o["refusal"] = s.refusal;
+        // DCF77: whose second edges the offset is taken from, "pm" or "am".
+        if (s.station == "dcf77") o["timing"] = s.timingFromPm ? "pm" : "am";
         o["last_quality"] = s.lastQuality;
         o["have_offset"] = s.haveOffset;
         o["offset_ms"] = s.hostOffsetSec * 1000.0;

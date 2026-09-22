@@ -61,8 +61,9 @@
 namespace ubersdr_ntp {
 
 enum class AudioFormat {
-    Opus,      // format=opus  — the default. Lossy, ~24 kbps, adds a constant delay.
-    PcmV4,     // format=pcm-zstd&version=4 — the predictive lossless codec.
+    Opus,      // format=opus  — lossy, ~24 kbps, adds a constant delay.
+    PcmV4,     // format=pcm-zstd&version=4&min_margin=0 — the default: the
+               // predictive lossless codec, asked for at full quality.
                // The query parameter is still spelt "pcm-zstd" for compatibility;
                // version 4 carries no zstd at all.
 };
@@ -78,12 +79,13 @@ struct SourceConfig {
 
     // The transmitter's carrier. The dial is derived as carrier - 1 kHz, which
     // is the tuning WWV/WWVH and WWVB all want: it puts the carrier at 1000 Hz
-    // audio in USB.
+    // audio in USB. 77500 is DCF77, which is tuned to the carrier itself in IQ
+    // mode (see kDcf77CarrierHz).
     std::uint64_t carrierHz = 10000000;
     // An explicit dial, for a receiver that needs one. 0 means derive it.
     std::uint64_t dialHz = 0;
 
-    AudioFormat format = AudioFormat::Opus;
+    AudioFormat format = AudioFormat::PcmV4;
 
     // Delay model — see the file comment.
     bool autoDelay = true;
@@ -366,13 +368,35 @@ struct Config {
 };
 
 // The dial for a carrier: 1 kHz below it, which is what puts the carrier at
-// 1000 Hz audio in USB for WWV, WWVH and WWVB alike.
+// 1000 Hz audio in USB for WWV, WWVH and WWVB alike -- and the carrier itself
+// for DCF77, which is taken as IQ with the carrier at 0 Hz (see below).
 std::uint64_t dialForCarrier(std::uint64_t carrierHz);
 
+// DCF77, Mainflingen. Unlike the NIST stations it is decoded from IQ, not from
+// USB audio: its phase modulation is the precise half of the signal and a
+// demodulated audio channel keeps no phase. UberSDR's "iq" mode is 12 kHz of
+// complex baseband, always lossless (the server sends pcm-v4 for IQ whatever
+// was asked), so the dial goes ON the carrier and the carrier sits at DC.
+inline constexpr std::uint64_t kDcf77CarrierHz = 77500;
+// How far the dial may sit from the carrier and leave it inside that 12 kHz.
+inline constexpr std::uint64_t kDcf77MaxDialOffsetHz = 5000;
+
 // Below this the dial is taken to be WWVB, which is a different decoder rather
-// than a setting. Matches wwvbCeilingHz in ka9q_ubersdr's clock extension and
-// WWVB_CEILING_HZ in the frontend panel.
+// than a setting -- except DCF77's carrier, which broadcastFor takes first. The
+// ceiling matches wwvbCeilingHz in ka9q_ubersdr's clock extension and
+// WWVB_CEILING_HZ in its frontend panel, but that extension has no DCF77
+// decoder: it would take a 77.5 kHz dial as WWVB.
 inline constexpr std::uint64_t kWwvbCeilingHz = 1000000;
+
+// Which broadcast, and so which decoder, a source is. Decided from the tuning,
+// never offered as a setting: they are different signals, not options. DCF77
+// by its carrier, exactly; below kWwvbCeilingHz otherwise, WWVB; above, WWV or
+// WWVH, which one decoder tells apart itself.
+enum class Broadcast { Wwv, Wwvb, Dcf77 };
+inline Broadcast broadcastFor(std::uint64_t carrierHz, std::uint64_t dialHz) {
+    if (carrierHz == kDcf77CarrierHz) return Broadcast::Dcf77;
+    return dialHz < kWwvbCeilingHz ? Broadcast::Wwvb : Broadcast::Wwv;
+}
 
 // Carriers only WWV transmits on. WWVH shares 2.5, 5, 10 and 15 MHz with it,
 // so only on these two does the dial alone say which station is heard.

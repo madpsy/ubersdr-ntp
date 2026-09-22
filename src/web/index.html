@@ -384,12 +384,14 @@ const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s == null ? "" : s)
   .replace(/[&<>"]/g, (c) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;" }[c]));
 
-const ms = (v, p = 1) => (v == null || !isFinite(v)) ? "—" : v.toFixed(p) + " ms";
+// Two decimals by default: ten microseconds, which DCF77's phase modulation
+// resolves and a single decimal threw away.
+const ms = (v, p = 2) => (v == null || !isFinite(v)) ? "—" : v.toFixed(p) + " ms";
 // A sign always: "34 ms slow" and "34 ms fast" are opposite faults, and the
 // sign is the half that says which. A true minus, because these sit in a
 // column and a hyphen does not line up.
-const signed = (v) => (v == null || !isFinite(v))
-  ? "—" : (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(1) + " ms";
+const signed = (v, p = 2) => (v == null || !isFinite(v))
+  ? "—" : (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(p) + " ms";
 // A jump in time, as the daemon says it: "-4 min", "+4 h 0 min", "-1.00 s".
 function jumpText(sec) {
   const sign = sec < 0 ? "−" : "+", a = Math.abs(sec);
@@ -419,8 +421,25 @@ function stageTone(stage, state) {
 //
 // Falls back to the bare refid whenever no radio source is in the answer, which
 // is the failover case: an upstream has an address, not a station.
+// DCF77's two demodulators in one line: which one is timing the second, how
+// well PM is correlating, whether AM's edges agree with it, and which of the
+// two the last minute's time was read from.
+function dcf77Text(p) {
+  const from = { both: "AM and PM, agreeing", pm: "PM only", am: "AM only",
+                 conflict: "<b>refused: AM and PM read different times</b>" };
+  return "timing from <b>" + (p.timing === "pm" ? "PM" : "AM") + "</b>, PM " +
+    (p.pm_locked ? "tracking" : "searching") +
+    (p.pm_snr_db != null ? " at " + p.pm_snr_db.toFixed(1) + " dB" : "") +
+    (p.pm_interference ? " (strong interference near the carrier: correlating high-passed)" : "") +
+    (p.am_minus_pm_ms != null ? ", AM edge " + (p.am_minus_pm_ms >= 0 ? "+" : "−") +
+      Math.abs(p.am_minus_pm_ms).toFixed(2) + " ms from PM's" : "") +
+    (p.carrier_offset_hz != null ? ", carrier " + p.carrier_offset_hz.toFixed(2) + " Hz off the dial" : "") +
+    ", last minute from " + (p.frame_from ? from[p.frame_from] || esc(p.frame_from) : "none yet") +
+    (p.pm_refused_locks ? ", " + p.pm_refused_locks + " PM lock(s) refused for contradicting AM (interference?)" : "");
+}
+
 function stationMix(d) {
-  const label = { wwv: "WWV", wwvh: "WWVH", wwvb: "WWVB" };
+  const label = { wwv: "WWV", wwvh: "WWVH", wwvb: "WWVB", dcf77: "DCF77" };
   const counts = new Map();
   for (const s of d.sources || []) {
     if (s.kind !== "radio" || !s.in_use) continue;
@@ -728,11 +747,11 @@ function paintClock(ts) {
       ? "the computer or phone showing this page"
       : "the computer or phone showing this page, not the server";
     $("devclock").title = "Your device's own clock, compared with the broadcast time above, " +
-      "to the likely error of the measurement (at most ±" + ms(est.err) + "; see below). " +
+      "to the likely error of the measurement (at most ±" + ms(est.err, 1) + "; see below). " +
       "Nothing to do with the server: the times shown on this page do not use it.";
     try { Flow.browser({ rtt: est.delay, err: est.err, likely, device, within }); } catch (x) {}
-    $("linknote").textContent = "browser latency " + ms(est.delay) + " round trip, corrected: " +
-      (likely == null ? "" : "likely within ±" + ms(likely) + ", ") + "at most ±" + ms(est.err);
+    $("linknote").textContent = "browser latency " + ms(est.delay, 1) + " round trip, corrected: " +
+      (likely == null ? "" : "likely within ±" + ms(likely, 1) + ", ") + "at most ±" + ms(est.err, 1);
     $("linknote").title = "The displayed time is advanced by half the measured round trip " +
       "between this browser and the server, which is exact only if the delay is the same " +
       "both ways. No measurement can tell how the round trip splits, so \"at most\" is " +
@@ -776,22 +795,25 @@ function setCountdown(overSec, backSec) {
 
 function paintCountdowns() {
   const now = performance.now();
-  const draw = (id, anchor, verb) => {
-    const el = $(id);
-    if (!el) return;
-    if (!anchor) { el.textContent = ""; return; }
-    const left = anchor.sec - (now - anchor.at) / 1000;
-    // Ceiling, not rounding: "in 3s" should mean up to three seconds away, and
-    // should read 3, 2, 1 rather than spending two ticks on the same number.
-    el.textContent = left > 0.5
-      ? verb + " in " + Math.ceil(left) + "s"
-      // Past its own deadline and the server has not confirmed the swap. That
-      // is a real state, not a rounding artefact: failing over also needs the
-      // secondary to be usable, and it may not be yet.
-      : verb + " imminent";
+  // Each countdown is drawn in the sync pill here and, for failing back, on the
+  // primary's boxes in the signal path (flow.js), which carry .fl-cdback.
+  const draw = (els, anchor, verb) => {
+    for (const el of els) {
+      if (!el) continue;
+      if (!anchor) { el.textContent = ""; continue; }
+      const left = anchor.sec - (now - anchor.at) / 1000;
+      // Ceiling, not rounding: "in 3s" should mean up to three seconds away, and
+      // should read 3, 2, 1 rather than spending two ticks on the same number.
+      el.textContent = left > 0.5
+        ? verb + " in " + Math.ceil(left) + "s"
+        // Past its own deadline and the server has not confirmed the swap. That
+        // is a real state, not a rounding artefact: failing over also needs the
+        // secondary to be usable, and it may not be yet.
+        : verb + " imminent";
+    }
   };
-  draw("cdover", cdOver, "failing over");
-  draw("cdback", cdBack, "failing back");
+  draw([$("cdover")], cdOver, "failing over");
+  draw([$("cdback"), ...document.querySelectorAll(".fl-cdback")], cdBack, "failing back");
 }
 
 // Every 250 ms rather than every second: a 1 Hz timer that is not aligned with
@@ -1002,7 +1024,10 @@ function onTick(d) {
           : "") + "</td>" +
       '<td><span class="pill ' + (s.link === "streaming" ? "ok" : "bad") + '">' +
         esc(s.link) + "</span></td>" +
-      "<td>" + stationText(s.station, s.tick_band_ratio_db) + "</td>" +
+      "<td>" + stationText(s.station, s.tick_band_ratio_db) +
+        // DCF77 times the second from PM when it can and AM when it cannot.
+        (s.timing ? ' <span class="note" title="which demodulator is timing the second">· ' +
+          (s.timing === "pm" ? "PM" : "AM") + "</span>" : "") + "</td>" +
       '<td><span class="pill ' + stageTone(stage, s.state) + '">' + esc(stage) + "</span></td>" +
       '<td class="n">' + (s.tone_detected ? s.tone_snr_db.toFixed(1) + " dB" : "—") + "</td>" +
       '<td><div class="bar" title="' + s.frames_in_window + " of " + s.window_size +
@@ -1105,7 +1130,8 @@ function onStatus(d) {
         : "no — " + esc(x.not_used_reason || "not yet considered")],
       ["Receiver", esc(x.receiver_name || "(unnamed)") + " — " + esc(x.url)],
       ["Tuning", (x.dial_hz / 1e6).toFixed(6) + " MHz dial for the " +
-        (x.carrier_hz / 1e6).toFixed(3) + " MHz carrier, USB 0–3 kHz, " + esc(x.format) +
+        (x.carrier_hz / 1e6).toFixed(4) + " MHz carrier, " +
+        (dec.station === "dcf77" ? "IQ ±6 kHz" : "USB 0–3 kHz") + ", " + esc(x.format) +
         (a.sample_rate ? " at " + a.sample_rate + " Hz" : "")],
       ["Link", esc(l.state) + (l.detail ? " (" + esc(l.detail) + ")" : "") +
         " for " + dur(l.age_seconds) + ", audio " + dur(l.last_audio_age_seconds) + " ago, " +
@@ -1116,7 +1142,8 @@ function onStatus(d) {
         ? a.baseband_power_dbfs.toFixed(1) + " dBFS baseband, noise " +
           a.noise_dbfs.toFixed(1) + " dBFS, SNR " + a.snr_db.toFixed(1) + " dB"
         : "not reported"],
-      ["Acquisition", "tick " + dec.tone_snr_db.toFixed(1) + " dB " +
+      ["Acquisition", (dec.station === "dcf77" || dec.station === "wwvb" ? "carrier " : "tick ") +
+        dec.tone_snr_db.toFixed(1) + " dB " +
         (dec.tone_detected ? "(detected)" : "(NOT detected)") + ", edge " +
         (dec.phase_locked ? "locked" : "unlocked") +
         (dec.delay_est_ms != null ? " at " + dec.delay_est_ms.toFixed(1) + " ms" : "") +
@@ -1128,6 +1155,7 @@ function onStatus(d) {
           ? ", station " + stationText(dec.station, dec.tick_band_ratio_db) +
             " (tick " + signedDb(dec.tick_band_ratio_db) + ")"
           : "")],
+      ...(dec.dcf77 ? [["DCF77", dcf77Text(dec.dcf77)]] : []),
       ["Last decode", dec.last_decoded_utc
         ? esc(dec.last_decoded_utc) + " at quality " + dec.last_quality + "%, " +
           dur(dec.last_decode_age_seconds) + " ago"
@@ -1351,8 +1379,10 @@ function niceTicks(lo, hi, count) {
 function fmtVal(v, unit, step) {
   if (v == null || !isFinite(v)) return "—";
   const a = Math.abs(v);
+  // Axis ticks by their step; a value read off the chart to 10 us, which is
+  // what the offsets carry -- "-590 ms" hid everything past the millisecond.
   const p = step != null ? Math.max(0, Math.min(3, -Math.floor(Math.log10(step) + 1e-9))) :
-    a >= 100 ? 0 : a >= 1 ? 1 : 2;
+    a >= 10000 ? 0 : a >= 1 ? 2 : 3;
   return (v < 0 ? "−" : "") + a.toFixed(p) + (unit ? " " + unit : "");
 }
 

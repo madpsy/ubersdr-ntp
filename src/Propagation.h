@@ -40,6 +40,7 @@ struct GeoPoint {
 GeoPoint wwvSite();    // Fort Collins, Colorado
 GeoPoint wwvhSite();   // Kekaha, Kauai, Hawaii
 GeoPoint wwvbSite();   // Fort Collins, Colorado
+GeoPoint dcf77Site();  // Mainflingen, Germany
 
 // Great-circle distance in metres.
 double greatCircleMeters(const GeoPoint& a, const GeoPoint& b);
@@ -126,6 +127,12 @@ double skywaveDelaySeconds(double distanceMeters, double virtualHeightM = kVirtu
 // interfere. The waveguide path is only about 0.1 ms longer than the surface
 // one at those ranges, so the mode choice stays well inside the delay
 // uncertainty; the 350 km height did not.
+//
+// DCF77 at 77.5 kHz is the same kind of path and gets the same model. Its
+// service area is inside about 2000 km, where the groundwave is what an edge
+// decoder -- or the PM correlator -- locks to; the night-time skywave that
+// fades it across Britain arrives off a ~90 km D/E layer, which on a 700 km
+// path is some 75 us longer, well inside the budget.
 inline constexpr double kLfGroundIndex = 1.0003;
 double lfDelaySeconds(double distanceMeters);
 

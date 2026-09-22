@@ -23,6 +23,7 @@ const STATIONS = {
   wwv:  { name: "WWV",  where: "Fort Collins, Colorado" },
   wwvh: { name: "WWVH", where: "Kekaha, Kauaʻi, Hawaii" },
   wwvb: { name: "WWVB", where: "Fort Collins, Colorado" },
+  dcf77: { name: "DCF77", where: "Mainflingen, Germany" },
   unknown: { name: "WWV / WWVH", where: "station not identified yet" },
 };
 
@@ -36,8 +37,8 @@ const esc = (s) => String(s == null ? "" : s)
   .replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fin = (v) => v != null && isFinite(v);
 const num = (v, p = 1) => fin(v) ? v.toFixed(p) : "—";
-const sgn = (v, p = 1) => fin(v) ? (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(p) : "—";
-const msv = (v, p = 1) => fin(v) ? num(v, p) + " ms" : "—";
+const sgn = (v, p = 2) => fin(v) ? (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(p) : "—";
+const msv = (v, p = 2) => fin(v) ? num(v, p) + " ms" : "—";
 const freq = (hz) => !fin(hz) || !hz ? "" : hz < 1e6 ? (hz / 1e3).toFixed(0) + " kHz"
   : (hz / 1e6).toFixed(hz % 1e6 ? 1 : 0) + " MHz";
 
@@ -90,13 +91,20 @@ function model(d) {
   const served = d.offset_ms;
   const radio = d.sources.filter((s) => s.kind !== "ntp");
   const peers = d.sources.filter((s) => s.kind === "ntp");
+  // Failing back is the primary class coming back, so its countdown goes on
+  // the primary's own time signals -- the ones it will come back on. The
+  // figure is written by paintCountdowns() in index.html, which interpolates
+  // it smoothly between ticks; see setCountdown there.
+  const k = d.clock || {};
+  const backPill = k.failback_in_seconds != null ? ["", "warn fl-cdback"] : null;
 
   // Column 0, radio: one box per transmitter, however many receivers hear it.
   const stations = {};
   for (const s of radio) {
     const st = status[s.name] || {};
     let id = s.station && STATIONS[s.station] ? s.station : "unknown";
-    if (id === "unknown" && st.carrier_hz && st.carrier_hz < 1e6) id = "wwvb";
+    if (id === "unknown" && st.carrier_hz === 77500) id = "dcf77";
+    else if (id === "unknown" && st.carrier_hz && st.carrier_hz < 1e6) id = "wwvb";
     (stations[id] = stations[id] || []).push(s);
   }
   for (const [id, list] of Object.entries(stations)) {
@@ -107,6 +115,7 @@ function model(d) {
       key: "st:" + id, kind: "rf", state: heard.length ? "live" : "down", serving: list.some((s) => s.in_use),
       title: STATIONS[id].name, tag: freqs.join(" · ") || "HF",
       sub: list.every((s) => s.link === "stopped") ? "no receiver running" : STATIONS[id].where,
+      pill: k.primary === "radio" && heard.length ? backPill : null,
       kf: heard.length + "/" + list.length, kl: "heard",
       body: metrics([
         ["heard by", heard.length + " of " + list.length],
@@ -124,6 +133,7 @@ function model(d) {
       key: "ref:" + s.name, kind: "ntp", state: ok ? "live" : "down", serving: s.in_use,
       title: n.refid || "?", tag: ok ? "stratum " + (n.stratum - 1) : "unknown",
       sub: !ok ? "no reply yet" : n.stratum === 1 ? "reference clock" : "upstream server",
+      pill: k.primary === "ntp" && ok ? backPill : null,
       kf: msv(n.root_distance_ms, 2), kl: "root dist",
       body: metrics([["root dist", msv(n.root_distance_ms, 2)]]),
     });
@@ -139,6 +149,11 @@ function model(d) {
     const station = STATIONS[s.station] ? STATIONS[s.station].name : "?";
     const vs = s.have_offset ? s.offset_ms - served : null;
     const km = /([\d,.]+) km/.exec(dl.path || "");
+    // The propagation model says which it assumed: groundwave (LF, or HF close
+    // in) or skywave hops. The link is labelled by that, not always "sky".
+    const ground = /groundwave/.test(dl.path || "");
+    // DCF77 times the second from PM when it can and AM when it cannot.
+    const dcf = (st.decoder || {}).dcf77;
     cols[1].push({
       key: "src:" + s.name, kind: "ws", state, serving: s.in_use, title: s.name,
       tag: station + (st.carrier_hz ? " " + freq(st.carrier_hz) : ""),
@@ -150,18 +165,24 @@ function model(d) {
       body: metrics([
         ["vs served", s.have_offset ? sgn(vs) + " ms" : "—", toneOf(vs, 10, 50)],
         ["tick SNR", s.tone_detected ? num(s.tone_snr_db) + " dB" : "—"],
+        dcf && ["timing from", dcf.timing === "pm" ? "PM" : "AM"],
+        dcf && ["PM", !dcf.pm_locked ? "searching"
+          : fin(dcf.pm_snr_db) ? num(dcf.pm_snr_db) + " dB" : "tracking"],
         ["decode", s.last_quality ? s.last_quality + "%" : "—"],
         ["frames voted", s.window_size ? s.frames_in_window + " / " + s.window_size : "—"],
-        ["sky path", km ? km[1] + " km" : "—"],
+        [ground ? "ground path" : "sky path", km ? km[1] + " km" : "—"],
         ["network", fin(dl.network_ms) && s.link === "streaming" ? num(dl.network_ms) + " ms" : "—"],
       ]) + spark(s.name),
     });
     const id = s.station && STATIONS[s.station] ? s.station
+      : st.carrier_hz === 77500 ? "dcf77"
       : (st.carrier_hz && st.carrier_hz < 1e6 ? "wwvb" : "unknown");
     L.push({ from: "st:" + id, to: "src:" + s.name, kind: "rf",
              state: s.tone_detected ? "live" : "down", serving: s.in_use,
              label: fin(dl.propagation_ms) && dl.propagation_ms > 0
-               ? "sky " + num(dl.propagation_ms) + " ms" : "" });
+               ? (ground ? "ground " : "sky ") +
+                 // Two decimals when short, so a 0.98 ms groundwave hop does not read 1.0.
+                 num(dl.propagation_ms, dl.propagation_ms < 10 ? 2 : 1) + " ms" : "" });
     L.push({ from: "src:" + s.name, to: "core", kind: "ws", serving: s.in_use,
              state: s.link !== "streaming" ? "down" : state,
              label: s.link === "streaming" && fin(dl.network_ms) ? "net " + num(dl.network_ms) + " ms" : "",
@@ -192,7 +213,7 @@ function model(d) {
   }
 
   // Column 2: this daemon.
-  const k = d.clock || {}, cd = k.class_delta || {};
+  const cd = k.class_delta || {};
   // Ticks are sent on the second boundary and can land a hair either side.
   const sec = Math.floor(d.unix + 0.05) % 60;
   cols[2].push({
@@ -252,11 +273,11 @@ function model(d) {
   cols[3].push({
     key: "web", kind: "out", state: !linkOk ? "down" : b ? "live" : "standby",
     title: "This browser", short: "Browser", tag: "HTTP", sub: "the event stream and /api/time",
-    kf: b ? msv(b.rtt) : "—", kl: b ? "round trip" : linkOk ? "measuring" : "offline",
+    kf: b ? msv(b.rtt, 1) : "—", kl: b ? "round trip" : linkOk ? "measuring" : "offline",
     body: metrics([
-      ["round trip", b ? msv(b.rtt) : "—"],
-      ["likely", b && fin(b.likely) ? "±" + msv(b.likely) : "—"],
-      ["at most", b ? "±" + msv(b.err) : "—"],
+      ["round trip", b ? msv(b.rtt, 1) : "—"],
+      ["likely", b && fin(b.likely) ? "±" + msv(b.likely, 1) : "—"],
+      ["at most", b ? "±" + msv(b.err, 1) : "—"],
       ["your clock", dev, b && Math.abs(b.device) > Math.max(20, b.within) ? (Math.abs(b.device) < 500 ? "fl-warn" : "fl-bad") : ""],
     ]),
   });
@@ -559,6 +580,9 @@ function render() {
   if (s !== shape) { shape = s; build(m); }
   paint(m);
   layout();
+  // Fill the failback pills now rather than on the page's next 250 ms paint,
+  // so a freshly drawn box never flashes an empty one.
+  if (typeof paintCountdowns === "function") paintCountdowns();
 
   const radio = tick.sources.filter((x) => x.kind !== "ntp");
   const peers = tick.sources.filter((x) => x.kind === "ntp");

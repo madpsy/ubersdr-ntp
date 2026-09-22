@@ -20,6 +20,8 @@ double rad(double deg) { return deg * kPi / 180.0; }
 GeoPoint wwvSite()  { return GeoPoint{ 40.67806, -105.04667, true }; }
 GeoPoint wwvbSite() { return GeoPoint{ 40.67806, -105.04667, true }; }
 GeoPoint wwvhSite() { return GeoPoint{ 21.98750, -159.76306, true }; }
+// DCF77's primary antenna. The backup is 350 m away, about 1 us of flight time.
+GeoPoint dcf77Site() { return GeoPoint{ 50.015528, 9.008515, true }; }
 
 double greatCircleMeters(const GeoPoint& a, const GeoPoint& b) {
     if (!a.valid || !b.valid) return 0.0;

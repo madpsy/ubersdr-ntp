@@ -248,12 +248,12 @@
   // propagation path as well as the frequency.
   // =====================================================================
   "defaults": {
-    // "opus" (default) is about 24 kbps and adds a constant ~8 ms that the
-    // delay model already accounts for. "pcm-v4" is the predictive lossless
-    // codec at roughly four times the bandwidth and no codec delay at all —
-    // worth it on a receiver on your own network, rarely worth it over the
-    // internet.
-    "format": "opus",
+    // "pcm-v4" (default) is the predictive lossless codec, asked for at full
+    // quality (min_margin=0, as DCF77's IQ always is): no codec delay at all,
+    // at roughly four times the bandwidth of Opus. "opus" is about 24 kbps and
+    // adds a constant ~8 ms that the delay model accounts for -- the choice for
+    // a receiver on a slow or metered link.
+    "format": "pcm-v4",
     "verify_tls": true,
     "auto_delay": true
   },
@@ -313,6 +313,23 @@
     // automatically for any dial below 1 MHz — it is a genuinely different
     // decoder, not a setting:
     // { "name": "wwvb", "url": "http://ubersdr.local:8080", "carrier_hz": 60000 }
+
+    // DCF77, for a receiver in Europe. The German time signal: 50 kW on
+    // 77.5 kHz longwave from Mainflingen, near Frankfurt, run by PTB. Its
+    // groundwave carries reliably to about 2000 km, which is most of Europe --
+    // the UK and Ireland, Scandinavia, Iberia, Italy, eastern Europe -- and it
+    // is often heard further at night. Longwave does not die at night the way
+    // HF does, which makes it a good partner for a WWV source. The receiver has
+    // to cover LF: an RX888 or a KiwiSDR does, many HF-only SDRs stop above it,
+    // and a station with QRM at LF will do better elsewhere.
+    //
+    // Recognised by its carrier, exactly, and tuned ON it in IQ mode rather
+    // than 1 kHz below in USB: its phase modulation is what times the second
+    // to tens of microseconds, and an audio channel keeps no phase. IQ is
+    // always lossless, so "format" is ignored. Its amplitude modulation is
+    // decoded alongside as the check and the fallback (see "DCF77" in the
+    // README):
+    // { "name": "dcf77", "url": "http://ubersdr.local:8080", "carrier_hz": 77500 }
 
     // WWV's two extra outlets. 20 MHz is WWV only; 25 MHz is an experimental
     // broadcast — real, but intermittent and lower power:

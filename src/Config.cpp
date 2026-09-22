@@ -67,6 +67,7 @@ bool parseSecondaryMode(const std::string& s, SecondaryMode& out) {
 }
 
 std::uint64_t dialForCarrier(std::uint64_t carrierHz) {
+    if (carrierHz == kDcf77CarrierHz) return carrierHz;
     return carrierHz > 1000 ? carrierHz - 1000 : 0;
 }
 
@@ -411,12 +412,28 @@ bool Config::finalise(std::string& err) {
             return false;
         }
 
+        const Broadcast bc = broadcastFor(s.carrierHz, s.dialHz);
+        if (bc == Broadcast::Dcf77) {
+            const std::uint64_t off = s.dialHz > s.carrierHz ? s.dialHz - s.carrierHz
+                                                             : s.carrierHz - s.dialHz;
+            if (off > kDcf77MaxDialOffsetHz) {
+                err = "source \"" + (s.name.empty() ? std::string("dcf77") : s.name) +
+                      "\": dial_hz " + std::to_string(s.dialHz) + " puts the DCF77 carrier " +
+                      std::to_string(off) + " Hz off, outside the 12 kHz IQ passband; "
+                      "leave dial_hz out and it goes on the carrier";
+                return false;
+            }
+            // IQ is lossless whatever is asked for, and the delay model and the
+            // status page should say what is actually arriving.
+            s.format = AudioFormat::PcmV4;
+        }
+
         if (s.name.empty()) {
             // Named after what it listens to, which is what anyone reading the
             // log wants to see anyway.
             std::ostringstream os;
-            os << (s.dialHz < kWwvbCeilingHz ? "wwvb" : "wwv");
-            if (s.dialHz >= kWwvbCeilingHz) os << (s.carrierHz / 1000000) << "M";
+            os << (bc == Broadcast::Dcf77 ? "dcf77" : bc == Broadcast::Wwvb ? "wwvb" : "wwv");
+            if (bc == Broadcast::Wwv) os << (s.carrierHz / 1000000) << "M";
             os << "-" << ++autoName;
             s.name = os.str();
         }
