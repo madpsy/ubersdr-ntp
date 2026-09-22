@@ -132,7 +132,11 @@ double skywaveDelaySeconds(double distanceMeters, double virtualHeightM = kVirtu
 // service area is inside about 2000 km, where the groundwave is what an edge
 // decoder -- or the PM correlator -- locks to; the night-time skywave that
 // fades it across Britain arrives off a ~90 km D/E layer, which on a 700 km
-// path is some 75 us longer, well inside the budget.
+// path is some 90 us longer, well inside the budget. That is one hop over a
+// curved Earth; the flat-Earth figure of about 75 us understates it, and more
+// so with distance -- it falls towards 25 us at 2000 km, where the curved one
+// holds near 65 us. The skywave only ever arrives later, so ignoring it
+// biases a night-time path late, never early.
 inline constexpr double kLfGroundIndex = 1.0003;
 double lfDelaySeconds(double distanceMeters);
 
