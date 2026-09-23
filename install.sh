@@ -39,9 +39,10 @@ die() { echo "error: $*" >&2; exit 1; }
 # ---------------------------------------------------------------------------
 
 # DCF77's primary antenna at Mainflingen (Propagation.cpp, dcf77Site), and the
-# reach of its groundwave. Inside that, DCF77 is the better station: longwave
-# does not die at night the way HF does, and its phase modulation times the
-# second far more finely than WWV's audio ticks.
+# reach of its groundwave. Inside that, DCF77 is added to WWV rather than
+# replacing it: longwave does not die at night the way HF does, and its phase
+# modulation times the second far more finely than WWV's audio ticks, while
+# WWV keeps the clock going if the LF side is lost.
 DCF77_LAT=50.015528
 DCF77_LON=9.008515
 DCF77_RANGE_KM=2000
@@ -56,8 +57,9 @@ fetch_description() {
         madpsy/ubersdr-ntp:latest -q -T 5 -O - http://ubersdr:8080/api/description 2>/dev/null
 }
 
-# On a fresh configuration only: DCF77 if the receiver is within its range and
-# can tune 77.5 kHz, otherwise WWV. Anything missing or unexpected is WWV.
+# On a fresh configuration only: DCF77 and WWV if the receiver is within
+# DCF77's range and can tune 77.5 kHz, otherwise WWV alone. Anything missing or
+# unexpected is WWV alone.
 choose_station() {
     local desc gps lat lon minf km
     STATION="wwv"
@@ -96,22 +98,19 @@ choose_station() {
         return
     fi
     STATION="dcf77"
-    echo "  Within range and the receiver covers LF — using DCF77 instead of WWV"
+    echo "  Within range and the receiver covers LF — using DCF77 as well as WWV"
 }
 
 # The radio sources for a station, one per line, as they go in the config.
+# WWV always; DCF77 in front of it when the receiver is in range.
 station_sources() {
     local url="http://ubersdr:8080"
-    case "$1" in
-        dcf77)
-            echo "    { \"name\": \"dcf77\",    \"url\": \"${url}\", \"carrier_hz\": 77500, \"extra_delay_ms\": 0.0 }"
-            ;;
-        *)
-            echo "    { \"name\": \"local-5\",  \"url\": \"${url}\", \"carrier_hz\": 5000000, \"extra_delay_ms\": 0.0 },"
-            echo "    { \"name\": \"local-10\", \"url\": \"${url}\", \"carrier_hz\": 10000000, \"extra_delay_ms\": 0.0 },"
-            echo "    { \"name\": \"local-15\", \"url\": \"${url}\", \"carrier_hz\": 15000000, \"extra_delay_ms\": 0.0 }"
-            ;;
-    esac
+    if [[ "$1" == "dcf77" ]]; then
+        echo "    { \"name\": \"dcf77\",    \"url\": \"${url}\", \"carrier_hz\": 77500, \"extra_delay_ms\": 0.0 },"
+    fi
+    echo "    { \"name\": \"local-5\",  \"url\": \"${url}\", \"carrier_hz\": 5000000, \"extra_delay_ms\": 0.0 },"
+    echo "    { \"name\": \"local-10\", \"url\": \"${url}\", \"carrier_hz\": 10000000, \"extra_delay_ms\": 0.0 },"
+    echo "    { \"name\": \"local-15\", \"url\": \"${url}\", \"carrier_hz\": 15000000, \"extra_delay_ms\": 0.0 }"
 }
 
 # Replace the block config.addon.json marks with "// >>> station" and

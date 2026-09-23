@@ -211,9 +211,8 @@ scripts and `config/config.json`. Out of the box it listens to the local
 receiver on WWV's 5, 10 and 15 MHz, with `time.cloudflare.com` as its network
 reference. On a first install it reads the receiver's own location from
 `/api/description`, and if that is within 2000 km of Mainflingen and the
-receiver tunes down to 77.5 kHz it listens to DCF77 alone instead: the WWV
-sources are removed from the file, and the commented examples show how to add
-them back. `config.addon.json` documents every setting, including why adding
+receiver tunes down to 77.5 kHz it adds DCF77 alongside the WWV sources;
+further away it stays on WWV alone. `config.addon.json` documents every setting, including why adding
 more upstreams is worth it. The addon container is on the receiver's
 own Docker network, which UberSDR's default `timeout_bypass_ips` exempts from
 session limits, so it needs no password. Edit `config/config.json` and

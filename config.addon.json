@@ -355,7 +355,8 @@
 
     // >>> station
     // install.sh replaces everything from here to "<<< station" on a first
-    // install, with WWV or DCF77 depending on where the receiver is.
+    // install: WWV always, and DCF77 as well if the receiver is within its
+    // range and covers LF.
     { "name": "local-5",  "url": "http://ubersdr:8080", "carrier_hz": 5000000, "extra_delay_ms": 0.0 },
     { "name": "local-10", "url": "http://ubersdr:8080", "carrier_hz": 10000000, "extra_delay_ms": 0.0 },
     { "name": "local-15", "url": "http://ubersdr:8080", "carrier_hz": 15000000, "extra_delay_ms": 0.0 }
