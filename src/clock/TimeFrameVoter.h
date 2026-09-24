@@ -68,6 +68,11 @@ using ClockFieldMap = std::vector<ClockBitWeight>;
 // Emitted once per classified second (drives the alignment display).
 struct ClockSecondInfo {
     int64_t edgeSample = 0;      // sample index (total consumed) of the second edge
+    // The same edge before it was rounded to a whole sample, where the decoder
+    // resolves it finer; NaN where it does not. A whole sample is 83 us at 12
+    // kHz, and a timing chain good to microseconds shows the rounding as
+    // one-sample steps in the offset whenever the edge sits near a half sample.
+    double edgeSampleExact = std::numeric_limits<double>::quiet_NaN();
     // True when this second carried its own timing evidence. False for WWV/WWVH's
     // minute hole (second 0 has no subcarrier pulse) and sub-threshold seconds,
     // and for WWVB seconds whose carrier drop was not found (coasted). edgeSample
@@ -108,6 +113,7 @@ struct ClockTimeInfo {
     int minute = -1, hour = -1, doy = -1, year2 = -1;
     float quality = 0.0f;            // voter lockConfidence, 0..1
     int64_t lastEdgeSample = 0;      // sample index of the most recent second edge
+    double lastEdgeSampleExact = std::numeric_limits<double>::quiet_NaN();  // unrounded; see ClockSecondInfo
     int lastEdgeSecondOfFrame = -1;  // second-of-frame of that edge
     ClockStation station = ClockStation::Unknown;
 };

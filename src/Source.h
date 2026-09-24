@@ -117,7 +117,7 @@ private:
     // should observe the block's arrival, which is what it returns.
     bool timeBlock(std::uint64_t stampNanos, int rate, double arrivalSec, double dmrSec);
     // Daemon time at a sample index, by whichever clock the mode uses.
-    bool hostTimeAt(std::int64_t sample, double& hostSec) const;
+    bool hostTimeAt(double sample, double& hostSec) const;
     void resetStream(const char* why);
 
     // Decoder callbacks.

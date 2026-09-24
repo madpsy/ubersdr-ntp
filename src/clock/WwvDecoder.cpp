@@ -270,6 +270,7 @@ struct WwvDecoder::Impl {
     std::int64_t anchorSec0 = 0;     // secIndex whose second-of-frame == 0
     std::int64_t nextFrameStartK = 0;
     std::int64_t lastEdgeSample = 0;
+    double lastEdgeSampleExact = std::numeric_limits<double>::quiet_NaN();
     int lastEdgeSecondOfFrame = -1;
 
     // Cross-frame voter.
@@ -703,8 +704,8 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
     // the estimate converges on the mean of those shifts -- minus their jitter
     // and 5 ms quantisation.
     const double reportDelay = edgeDelayCount > 0 ? edgeDelayEst : delayEst;
-    const std::int64_t edgeSample = static_cast<std::int64_t>(std::llround(
-        (static_cast<double>(startJ) + reportDelay - kNominalDelaySamples) * decim));
+    const double edgeExact = (static_cast<double>(startJ) + reportDelay - kNominalDelaySamples) * decim;
+    const std::int64_t edgeSample = static_cast<std::int64_t>(std::llround(edgeExact));
 
     // Slip detection, BEFORE this second is emitted. The per-frame skeleton
     // check below only runs once a minute, and every second until then would
@@ -730,12 +731,14 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
     }
 
     lastEdgeSample = edgeSample;
+    lastEdgeSampleExact = edgeExact;
     lastEdgeSecondOfFrame = secOfFrame;
 
     // Emit the classified second (drives the alignment display).
     if (owner && owner->onSecond) {
         ClockSecondInfo info;
         info.edgeSample = edgeSample;
+        info.edgeSampleExact = edgeExact;
         info.edgeMeasured = timed;
         info.symbol = static_cast<ClockSymbol>(sym);
         info.confidence = conf;
@@ -951,6 +954,7 @@ void WwvDecoder::Impl::feedPendingFrames() {
                 t.year2  = voter.votedField(TimeFrameVoter::FieldYear);
                 t.quality = voter.lockConfidence();
                 t.lastEdgeSample = lastEdgeSample;
+                t.lastEdgeSampleExact = lastEdgeSampleExact;
                 t.lastEdgeSecondOfFrame = lastEdgeSecondOfFrame;
                 t.station = station;
                 owner->onTime(t);
@@ -1052,7 +1056,8 @@ void WwvDecoder::Impl::reset() {
     curFill = 0; secStarted = false; secStartJ = 0; aScale = 1e-6;
     recs.clear(); recBase = 0; secIndex = 0;
     anchored = false; anchorSec0 = 0; nextFrameStartK = 0;
-    lastEdgeSample = 0; lastEdgeSecondOfFrame = -1;
+    lastEdgeSample = 0; lastEdgeSampleExact = std::numeric_limits<double>::quiet_NaN();
+    lastEdgeSecondOfFrame = -1;
     if (!stationPinned) station = ClockStation::Unknown;
     samplesConsumed = 0;
     voter.reset();

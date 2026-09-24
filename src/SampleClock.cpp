@@ -221,10 +221,10 @@ ClockFit SampleClock::fit() const {
     return m_fit;
 }
 
-bool SampleClock::hostTimeAt(std::int64_t sample, double& hostSec) const {
+bool SampleClock::hostTimeAt(double sample, double& hostSec) const {
     std::lock_guard<std::mutex> lk(m_mu);
     if (!m_fit.valid) return false;
-    hostSec = m_fit.anchorSec + m_fit.secPerSample * static_cast<double>(sample);
+    hostSec = m_fit.anchorSec + m_fit.secPerSample * sample;
     return true;
 }
 
@@ -258,21 +258,22 @@ void CaptureClock::observe(std::int64_t firstSample, double captureSec) {
     while (m_marks.size() > 1 && firstSample - m_marks.front().sample > keep) m_marks.pop_front();
 }
 
-bool CaptureClock::hostTimeAt(std::int64_t sample, double& hostSec) const {
+bool CaptureClock::hostTimeAt(double sample, double& hostSec) const {
     std::lock_guard<std::mutex> lk(m_mu);
     if (m_marks.empty() || m_rate <= 0) return false;
 
     // The marks are in sample order: the nearest is at the lower bound or just
     // before it.
     auto it = std::lower_bound(m_marks.begin(), m_marks.end(), sample,
-                               [](const Mark& m, std::int64_t s) { return m.sample < s; });
+                               [](const Mark& m, double s) { return static_cast<double>(m.sample) < s; });
     const Mark* best = nullptr;
     if (it != m_marks.end()) best = &*it;
     if (it != m_marks.begin()) {
         const Mark& prev = *std::prev(it);
-        if (!best || sample - prev.sample <= best->sample - sample) best = &prev;
+        if (!best || sample - static_cast<double>(prev.sample) <= static_cast<double>(best->sample) - sample)
+            best = &prev;
     }
-    const double dist = static_cast<double>(sample - best->sample) / m_rate;
+    const double dist = (sample - static_cast<double>(best->sample)) / m_rate;
     if (std::fabs(dist) > kMaxExtrapolateSec) return false;
     // At the stream's nominal rate: radiod's clock is the GPSDO, and over the
     // fraction of a second to the nearest mark the daemon crystal's tens of ppm

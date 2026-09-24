@@ -1467,7 +1467,7 @@ bool Source::timeBlock(std::uint64_t stampNanos, int rate, double arrivalSec, do
     return false;   // the arrival fit is not used for this source
 }
 
-bool Source::hostTimeAt(std::int64_t sample, double& hostSec) const {
+bool Source::hostTimeAt(double sample, double& hostSec) const {
     return m_timing == TimingMode::Capture ? m_capture.hostTimeAt(sample, hostSec)
                                            : m_clock.hostTimeAt(sample, hostSec);
 }
@@ -1854,7 +1854,11 @@ void Source::onClockTime(const clockdec::ClockTimeInfo& t) {
     // formed from the anchor yet either -- so the anchor waits for the next
     // minute rather than going in unchecked.
     double edgeHostSec = 0.0;
-    if (!hostTimeAt(t.lastEdgeSample, edgeHostSec)) return;
+    // At the decoder's own resolution, not rounded to a whole sample: see
+    // ClockSecondInfo::edgeSampleExact.
+    const double edgeAt = std::isfinite(t.lastEdgeSampleExact) ? t.lastEdgeSampleExact
+                                                               : static_cast<double>(t.lastEdgeSample);
+    if (!hostTimeAt(edgeAt, edgeHostSec)) return;
 
     // Composed exactly as the reference front end does: the voted frame's
     // second 0, plus whole seconds to the edge this timestamp is anchored to.
@@ -1983,7 +1987,9 @@ void Source::onClockSecond(const clockdec::ClockSecondInfo& i) {
     // When the sample carrying this edge was observed here, on the daemon clock
     // the fit is taken on and the offset is measured against.
     double hostSec = 0.0;
-    if (!hostTimeAt(i.edgeSample, hostSec)) return;
+    const double edgeAt = std::isfinite(i.edgeSampleExact) ? i.edgeSampleExact
+                                                           : static_cast<double>(i.edgeSample);
+    if (!hostTimeAt(edgeAt, hostSec)) return;
 
     std::lock_guard<std::mutex> lk(m_mu);
     if (!m_haveAnchor) return;

@@ -528,7 +528,7 @@ struct WwvbDecoder::Impl {
 
         int sof = -1;
         updateSync(sym, conf, edgeSample, sof);
-        emitSecond(edgeSample, curEdgeMeasured, sym, conf, sof, w, best);
+        emitSecond(edgeSample, trkEdge, curEdgeMeasured, sym, conf, sof, w, best);
 
         if (anchored && sof >= 0)
             recordFrameSecond(sof, sym, conf);
@@ -539,6 +539,7 @@ struct WwvbDecoder::Impl {
             ti.doy = votedDoy; ti.year2 = votedYear;
             ti.quality = votedQuality;
             ti.lastEdgeSample = edgeSample;
+            ti.lastEdgeSampleExact = trkEdge;
             ti.lastEdgeSecondOfFrame = sof;
             ti.station = ClockStation::Wwvb;
             owner->onTime(ti);
@@ -770,11 +771,12 @@ struct WwvbDecoder::Impl {
 
     // ---- callbacks & state -----------------------------------------------
 
-    void emitSecond(int64_t edgeSample, bool measured, ClockSymbol sym, float conf, int sof,
+    void emitSecond(int64_t edgeSample, double edgeExact, bool measured, ClockSymbol sym, float conf, int sof,
                     const std::array<float, kEnvRateHz>& w, int best) {
         if (!owner->onSecond) return;
         ClockSecondInfo si;
         si.edgeSample = edgeSample;
+        si.edgeSampleExact = edgeExact;
         si.edgeMeasured = measured;
         si.symbol = sym;
         si.confidence = conf;

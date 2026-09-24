@@ -176,6 +176,9 @@ struct Result {
     std::string why;
     int labels = 0, wrong = 0;
     std::vector<double> pmErrMs, amErrMs;
+    // PM edges again, at the decoder's own resolution rather than rounded to a
+    // whole sample (ClockSecondInfo::edgeSampleExact).
+    std::vector<double> pmExactErrMs;
     ClockDecoderDiagnostics diag;
     std::vector<std::uint8_t> from;
 };
@@ -220,6 +223,8 @@ Result run(const Scenario& sc) {
         if (!s || std::fabs(s->t - t) > 0.1) return;
         const auto d = dec.diagnostics();
         (d.timingFromPm ? r.pmErrMs : r.amErrMs).push_back((t - s->t) * 1000.0);
+        if (d.timingFromPm && std::isfinite(i.edgeSampleExact))
+            r.pmExactErrMs.push_back((i.edgeSampleExact / sc.rate - s->t) * 1000.0);
     };
     dec.onTime = [&](const ClockTimeInfo& t) {
         if (!haveFrame) return;
@@ -301,6 +306,21 @@ Result run(const Scenario& sc) {
         double w = 0;
         for (std::size_t i = 5; i < r.pmErrMs.size(); ++i) w = std::max(w, std::fabs(r.pmErrMs[i]));
         if (w > 0.25) fail(r, "PM edge error " + std::to_string(w) + " ms");
+    }
+    // The unrounded edge (ClockSecondInfo::edgeSampleExact) must be unbiased:
+    // its signed mean error within 20 us, wherever on the sample grid the true
+    // edge falls. Rounding to a whole sample hides a bias on a grid whose edges
+    // sit on samples, so the rounded edge cannot show it; this can. A half-
+    // sample convention error in the correlation put it at +33 us at 12 kHz.
+    if (sc.expectPmTiming && r.pmExactErrMs.size() > 5) {
+        double m = 0, v = 0;
+        const std::size_t n = r.pmExactErrMs.size() - 5;
+        for (std::size_t i = 5; i < r.pmExactErrMs.size(); ++i) m += r.pmExactErrMs[i];
+        m /= static_cast<double>(n);
+        for (std::size_t i = 5; i < r.pmExactErrMs.size(); ++i) v += (r.pmExactErrMs[i] - m) * (r.pmExactErrMs[i] - m);
+        if (std::getenv("DCF77_STATS"))
+            std::printf("    unrounded PM edge: bias %+.4f ms, sd %.4f ms\n", m, std::sqrt(v / static_cast<double>(n)));
+        if (std::fabs(m) > 0.020) fail(r, "unrounded PM edges biased " + std::to_string(m * 1000.0) + " us");
     }
     // AM timing is the fallback and is judged as one: past the tracker's first
     // twenty seconds, 99% of edges inside 2.5 ms and no bias worth the name.

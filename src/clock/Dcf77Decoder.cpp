@@ -237,6 +237,7 @@ struct EdgeTracker {
 // fourteen seconds before it.
 struct SecRec {
     int64_t edge = 0;
+    double edgeExact = std::numeric_limits<double>::quiet_NaN();   // before rounding
     ClockSymbol am = ClockSymbol::Unknown;
     float amConf = 0.0f;
     int pmSign = 0;          // +1 / -1 raw correlation sign, 0 when no PM this second
@@ -548,8 +549,20 @@ struct Dcf77Decoder::Impl {
     }
     // One past the last sample whose high-passed prefix sum exists.
     int64_t prefixHi() const { return samplesConsumed - hpM; }
-    // Sum of y (or y^2) over [steadyStart, x), linearly interpolated.
-    double prefixAt(const std::vector<double>& p, double x) const {
+    // Sum of y (or y^2) up to instant x, linearly interpolated.
+    //
+    // Sample k is the signal AT instant k, so it stands for [k - 1/2, k + 1/2),
+    // and the running sum up to instant x is the prefix at x + 1/2. Taken as
+    // [k, k + 1), as this once was, every correlation peak -- and so every PM
+    // second edge -- came out half a sample late: 42 us at 12 kHz. Rounding the
+    // edge to a whole sample hid that on a synthetic grid whose edges sit on
+    // samples, and turned it into 83 us steps on the air whenever the true
+    // edge sat near half a sample. Measured by dcf77test on the unrounded edge,
+    // what is left is about 7 us early at both 12 and 24 kHz -- a fixed time,
+    // not a fraction of a sample, so a filter's (the slow DC removal on y is
+    // the likely one) -- and it is left uncorrected at that size.
+    double prefixAt(const std::vector<double>& p, double at) const {
+        const double x = at + 0.5;
         const double fl = std::floor(x);
         const int64_t k = static_cast<int64_t>(fl);
         const double a = p[static_cast<std::size_t>(k & mask)];
@@ -1061,6 +1074,7 @@ struct Dcf77Decoder::Impl {
 
         SecRec r;
         r.edge = static_cast<int64_t>(std::llround(edge));
+        r.edgeExact = edge;
         std::array<float, kEnvRateHz> w{};
         const int sofHere = anchored ? sofNext : -1;
         classifyAm(edge, sofHere >= 0 && sofHere < 59, r.am, r.amConf, w);
@@ -1207,6 +1221,7 @@ struct Dcf77Decoder::Impl {
             ti.doy = votedDoy; ti.year2 = votedYear;
             ti.quality = votedQuality;
             ti.lastEdgeSample = r.edge;
+            ti.lastEdgeSampleExact = r.edgeExact;
             ti.lastEdgeSecondOfFrame = sof;
             ti.station = ClockStation::Dcf77;
             owner->onTime(ti);
@@ -1509,6 +1524,7 @@ struct Dcf77Decoder::Impl {
         if (!owner->onSecond) return;
         ClockSecondInfo si;
         si.edgeSample = r.edge;
+        si.edgeSampleExact = r.edgeExact;
         si.edgeMeasured = measured;
         si.symbol = r.am;
         si.confidence = r.amConf;

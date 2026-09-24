@@ -98,8 +98,10 @@ public:
     void observe(std::int64_t endSample, double hostSec);
 
     // Host time at a sample index, or valid=false before there is enough to fit.
+    // Fractional: a decoder resolves an edge finer than a sample, and at 12 kHz
+    // a whole one is 83 us.
     ClockFit fit() const;
-    bool hostTimeAt(std::int64_t sample, double& hostSec) const;
+    bool hostTimeAt(double sample, double& hostSec) const;
 
     // Drops everything. For a reconnect: sample indices restart and the old
     // envelope describes a stream that no longer exists.
@@ -175,7 +177,7 @@ public:
     // Daemon time at which `sample` was captured, from the nearest mark, or
     // false when there is none within reach (none yet, or the sample is further
     // than kMaxExtrapolateSec from every mark).
-    bool hostTimeAt(std::int64_t sample, double& hostSec) const;
+    bool hostTimeAt(double sample, double& hostSec) const;
 
     void reset();
     std::size_t marks() const;
