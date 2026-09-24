@@ -239,7 +239,12 @@ private:
     long long m_anchorUtcMs = 0;
     double m_anchorSetAt = 0.0;
 
-    OffsetEstimator m_offsets;      // under m_mu
+    // Under m_mu. A radio source holds its level through a jitter spike; see
+    // OffsetEstimator.h.
+    OffsetEstimator m_offsets{[] { OffsetTuning t; t.holdJitterSpikes = true; return t; }()};
+    int m_loggedHolds = 0;          // holds already logged as started
+    bool m_loggedHeld = false;      // ...and whether one is in progress
+    int m_loggedTimeouts = 0;
 
     // The continuity check on decoded times (TimeContinuity.h), with this
     // source's own filtered offset as its history. Deliberately NOT reset by a

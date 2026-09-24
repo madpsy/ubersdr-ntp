@@ -2053,6 +2053,8 @@ void Source::recomputeOffset() {
     if (m_offsets.empty()) {
         m_snap.haveOffset = false;
         m_snap.offsetSamples = 0;
+        m_snap.offsetHeld = false;
+        m_snap.rejoinGapSec = 0.0;
         return;
     }
 
@@ -2077,6 +2079,29 @@ void Source::recomputeOffset() {
     m_snap.offsetRateSpanSec = e.rateSpanSec;
     m_snap.rateTermSec = e.rateTermSec;
     m_snap.jitterSec = e.jitterSec;
+    m_snap.offsetHeld = e.held;
+    m_snap.offsetHeldForSec = e.heldForSec;
+    m_snap.liveOffsetSec = e.liveOffsetSec;
+    m_snap.rejoinGapSec = e.rejoinGapSec;
+    m_snap.jitterBaselineSec = e.jitterBaselineSec;
+    m_snap.spikeThresholdSec = e.spikeThresholdSec;
+    m_snap.spikeHolds = e.holds;
+    m_snap.spikeHoldsTimedOut = e.holdsTimedOut;
+    if (e.holds > m_loggedHolds) {
+        LOG_WARN(m_cfg.name.c_str(),
+                 "jitter %.0f us against a usual %.0f us: holding the offset at its last calm "
+                 "level (live level %+.0f us from it)",
+                 e.jitterSec * 1e6, e.jitterBaselineSec * 1e6, (e.liveOffsetSec - e.offsetSec) * 1e6);
+        m_loggedHolds = e.holds;
+        m_loggedHeld = true;
+    } else if (m_loggedHeld && !e.held) {
+        LOG_INFO(m_cfg.name.c_str(), "%s; slewing out the %+.0f us between the held and live levels",
+                 e.holdsTimedOut > m_loggedTimeouts ? "jitter stayed high past the hold limit, taking the live level"
+                                                    : "hold ended",
+                 e.rejoinGapSec * 1e6);
+        m_loggedTimeouts = e.holdsTimedOut;
+        m_loggedHeld = false;
+    }
 
     // What this source claims to be worth. Independent terms:
     //   jitter          how much the measurements disagree with each other

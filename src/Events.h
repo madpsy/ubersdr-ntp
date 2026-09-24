@@ -76,6 +76,8 @@ enum class EventType {
     StationChanged,
     TimeRefused,
     TimeAdopted,
+    OffsetHeld,
+    OffsetReleased,
 
     // One upstream NTP server.
     UpstreamChanged,
@@ -164,6 +166,8 @@ private:
         bool refused = false;
         bool rejectingTime = false;     // inside a run of refused decoded times
         int timeAdoptions = 0;
+        bool offsetHeld = false;
+        int holdsTimedOut = 0;
         std::string kiss;
         int stratum = 0;
         std::string refid;

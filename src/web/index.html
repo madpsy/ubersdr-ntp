@@ -437,6 +437,25 @@ function stageTone(stage, state) {
 //
 // Falls back to the bare refid whenever no radio source is in the answer, which
 // is the failover case: an upstream has an address, not a station.
+// Holding the offset through a jitter spike: whether it is holding now, what
+// counts as a spike for this receiver, and how often it has happened.
+function spikeHoldText(h) {
+  const us = (v) => (v >= 0 ? "+" : "−") + Math.abs(v).toFixed(0) + " µs";
+  const now = h.held
+    ? "<b>holding</b> for " + dur(h.held_for_seconds) + " at the last calm level; live level " +
+      us(h.live_minus_served_us) + " from it"
+    : h.rejoin_gap_us && Math.abs(h.rejoin_gap_us) >= 1
+      ? "released; slewing out " + us(h.rejoin_gap_us)
+      : "following the live level";
+  const scale = h.threshold_ms != null
+    ? "holds when jitter passes " + jit(h.threshold_ms) + " (usual " + jit(h.jitter_baseline_ms) + ")"
+    : "learning this receiver's usual jitter (10 min)";
+  return now + '<br><span class="note">' + scale +
+    (h.holds ? "; " + h.holds + " hold(s) since start" +
+      (h.holds_timed_out ? ", " + h.holds_timed_out + " ended by the 10 min limit" : "") : "") +
+    "</span>";
+}
+
 // DCF77's two demodulators in one line: which one is timing the second, how
 // well PM is correlating, whether AM's edges agree with it, and which of the
 // two the last minute's time was read from.
@@ -1134,7 +1153,10 @@ function onTick(d) {
       '<td><div class="bar" title="' + s.frames_in_window + " of " + s.window_size +
         ' frames voted"><i style="width:' + votePct + '%"></i></div></td>' +
       '<td class="n">' + (s.last_quality ? s.last_quality + "%" : "—") + "</td>" +
-      '<td class="n">' + (s.have_offset ? signed(s.offset_ms) : "—") + "</td>" +
+      '<td class="n">' + (s.have_offset ? signed(s.offset_ms) : "—") +
+        (s.offset_held
+          ? ' <span class="pill warn" title="jitter spiked: the offset is held at its last calm level">held</span>'
+          : "") + "</td>" +
       '<td class="n">' + (s.have_offset ? ms(s.dispersion_ms) : "—") + "</td>" +
       '<td class="n">' + (s.have_offset ? jit(s.jitter_ms) : "—") + "</td>" +
       '<td class="n">' + s.samples + "</td></tr>";
@@ -1286,6 +1308,7 @@ function onStatus(d) {
           ", jitter " + jit(t.jitter_ms) + ", " + t.samples + " samples, newest " +
           dur(t.age_seconds) + " old"
         : "none yet"],
+      ...(t.spike_hold ? [["Spike hold", spikeHoldText(t.spike_hold)]] : []),
       ["Timing", timingText(tm)],
       ["Delay model", ms(dl.total_ms) + " total = " + ms(dl.propagation_ms) + " propagation + " +
         ms(dl.network_ms) + (captureTimed ? " network (not in the path) + " : " network + ") +

@@ -34,6 +34,10 @@ std::string offsetText(const SourceSnapshot& s) {
     return fmt(", offset %+.1f ± %.1f ms", s.offsetSec * 1000.0, s.dispersionSec * 1000.0);
 }
 
+std::string usText(double sec, bool sign = false) {
+    return fmt(sign ? "%+.0f µs" : "%.0f µs", sec * 1e6);
+}
+
 std::string duration(double sec) {
     if (sec < 90.0) return fmt("%.0f s", sec);
     if (sec < 5400.0) return fmt("%.0f min", sec / 60.0);
@@ -124,6 +128,13 @@ const std::vector<EventTypeInfo>& eventTypes() {
         {EventType::TimeAdopted, "time_adopted", "New decoded time taken", "radio", S::Warning,
          "A decoded time that contradicted a receiver's history held for long enough that "
          "the history was taken to be the wrong one, and replaced."},
+
+        {EventType::OffsetHeld, "offset_held", "Offset held", "radio", S::Notice,
+         "A receiver's jitter jumped far past its usual level, so its offset is held at the "
+         "last calm level instead of following the disturbance, until the jitter settles."},
+        {EventType::OffsetReleased, "offset_released", "Offset released", "radio", S::Info,
+         "A held offset follows the receiver again -- its jitter settled, or the hold reached "
+         "its ten-minute limit -- and the difference is slewed out over about a minute."},
 
         {EventType::UpstreamChanged, "upstream_changed", "Upstream reference changed", "ntp",
          S::Info,
@@ -323,6 +334,20 @@ void EventMonitor::observe(const Pass& p) {
                        " from its old history held long enough to replace it");
             }
             st.timeAdoptions = s.timeAdoptions;
+
+            if (s.offsetHeld && !st.offsetHeld) {
+                ev(EventType::OffsetHeld,
+                   "jitter " + usText(s.jitterSec) + " against a usual " + usText(s.jitterBaselineSec) +
+                       "; offset held at its last calm level");
+            } else if (!s.offsetHeld && st.offsetHeld) {
+                ev(EventType::OffsetReleased,
+                   s.spikeHoldsTimedOut > st.holdsTimedOut
+                       ? "jitter still high after the hold limit; following the live level, " +
+                             usText(s.rejoinGapSec, true) + " slewed out"
+                       : "jitter settled; " + usText(s.rejoinGapSec, true) + " slewed out");
+            }
+            st.offsetHeld = s.offsetHeld;
+            st.holdsTimedOut = s.spikeHoldsTimedOut;
         } else {
             if (!s.ntp.kissCode.empty() && s.ntp.kissCode != st.kiss) {
                 ev(EventType::KissOfDeath,

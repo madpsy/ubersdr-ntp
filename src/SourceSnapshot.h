@@ -221,6 +221,16 @@ struct SourceSnapshot {
     double hostOffsetSec = 0.0;
     double rawOffsetSec = 0.0;
     double jitterSec = 0.0;         // spread of the measurements in the window
+    // Radio: the level held through a jitter spike (OffsetEstimator.h).
+    // offsetSec is then the held level and liveOffsetSec the window's own.
+    bool offsetHeld = false;
+    double offsetHeldForSec = 0.0;
+    double liveOffsetSec = 0.0;
+    double rejoinGapSec = 0.0;      // after a hold: offsetSec - liveOffsetSec, being slewed out
+    double jitterBaselineSec = 0.0; // this source's usual jitter; 0 until known
+    double spikeThresholdSec = 0.0; // jitter that starts a hold; 0 until known
+    int spikeHolds = 0;
+    int spikeHoldsTimedOut = 0;
     double dispersionSec = 0.0;     // jitter + fit residual + delay uncertainty
     // What this source is worth RELATIVE TO THE OTHERS, which is not the same
     // number. dispersionSec is dominated by the delay model's uncertainty, and

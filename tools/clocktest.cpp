@@ -1144,6 +1144,125 @@ void testHostSlewGuard() {
     check("a 5 ppm correction is not a slew worth refusing", g.steady(now, &why), "%s", why.c_str());
 }
 
+// The DCF77 spike of 2026-09-24 04:40 UTC, m9psy-1: calm at 10-35 us of
+// jitter, then about a minute of PM edges scattered by hundreds of
+// microseconds, the decoder still locked and saying nothing. The two-minute
+// median followed the scatter -- 140 us down, then past where it started --
+// and with one radio source in use the served time followed the median.
+// Replayed here with a 70 s disturbance skewed to one side, which is what
+// moves a median; then the same machinery against the things it must NOT
+// hold on to for ever: a real step, and a path that has simply got noisier.
+struct SpikeRun {
+    double maxErrPlain = 0.0, maxErrHeld = 0.0;   // |offset - truth| from the disturbance on
+    double endErrHeld = 0.0, endGap = 0.0;
+    double endVsPlain = 0.0;                      // held minus plain at the end
+    int holds = 0, timedOut = 0, holdsBeforeEvent = 0;
+    bool heldAtEnd = false;
+    double peakJitter = 0.0;
+};
+
+SpikeRun runSpike(double eventAt, double eventLen, double after, double sigmaDuring,
+                  double biasDuring, double stepSec, unsigned seed) {
+    constexpr double kRate = -0.4e-6, t0 = 20000.0, o0 = 0.0012;
+    auto truth = [&](double t) {
+        return o0 + kRate * (t - t0) + (t - t0 >= eventAt + eventLen && stepSec != 0.0 ? stepSec : 0.0);
+    };
+    std::mt19937_64 rng(seed);
+    std::normal_distribution<double> calm(0.0, 12e-6), wild(0.0, 1.0);
+    OffsetTuning ht;
+    ht.holdJitterSpikes = true;
+    OffsetEstimator plain, held(ht);
+    SpikeRun r;
+    const int end = static_cast<int>(eventAt + eventLen + after);
+    for (int k = 0; k <= end; ++k) {
+        const double t = t0 + k;
+        const bool during = k >= eventAt && k < eventAt + eventLen;
+        // A clean step shows no extra scatter of its own: its jitter spike is
+        // the window straddling two levels.
+        const double y = stepSec != 0.0 ? truth(t) + calm(rng)
+                         : during ? truth(t) + biasDuring + sigmaDuring * wild(rng)
+                                  : truth(t) + calm(rng);
+        plain.add(t, y);
+        held.add(t, y);
+        const OffsetEstimate& a = plain.estimate();
+        const OffsetEstimate& b = held.estimate();
+        if (!b.valid) continue;
+        if (k < eventAt) { r.holdsBeforeEvent = b.holds; continue; }
+        r.peakJitter = std::max(r.peakJitter, b.jitterSec);
+        // A step is a change, not an error: judge only up to it.
+        if (stepSec == 0.0 || k < eventAt + eventLen) {
+            r.maxErrPlain = std::max(r.maxErrPlain, std::abs(a.offsetSec - truth(t)));
+            r.maxErrHeld = std::max(r.maxErrHeld, std::abs(b.offsetSec - truth(t)));
+        }
+    }
+    const OffsetEstimate& b = held.estimate();
+    r.endVsPlain = b.offsetSec - plain.estimate().offsetSec;
+    r.endErrHeld = b.offsetSec - truth(t0 + end);
+    r.endGap = b.offsetSec - b.liveOffsetSec;
+    r.holds = b.holds;
+    r.timedOut = b.holdsTimedOut;
+    r.heldAtEnd = b.held;
+    return r;
+}
+
+void testJitterSpikeHold() {
+    std::printf("\nOffsetEstimator: holding the level through a jitter spike (DCF77, 04:40)\n");
+
+    // 30 min calm, 75 s of edges scattered 200 us about a point 300 us early,
+    // then 10 min calm. The median holds until the disturbance is over half
+    // the window and then drops at once; this puts it and the jitter where
+    // they were live, about -150 us and 250-300 us.
+    const SpikeRun a = runSpike(1800, 75, 600, 200e-6, -300e-6, 0.0, 11);
+    check("no hold in 30 min of calm", a.holdsBeforeEvent == 0, "%d", a.holdsBeforeEvent);
+    check("the disturbance is a spike on the 04:40 scale", a.peakJitter > 200e-6,
+          "peak jitter %.0f us", a.peakJitter * 1e6);
+    check("without the hold the level follows it", a.maxErrPlain > 100e-6, "worst %.0f us",
+          a.maxErrPlain * 1e6);
+    check("with it the level stays put", a.maxErrHeld < 40e-6, "worst %.0f us", a.maxErrHeld * 1e6);
+    check("one hold, ended by calm rather than the limit", a.holds == 1 && a.timedOut == 0,
+          "holds %d, timed out %d", a.holds, a.timedOut);
+    check("...and the level is back on the live one", !a.heldAtEnd && std::abs(a.endGap) < 1e-6 &&
+          std::abs(a.endErrHeld) < 20e-6, "gap %+.1f us, error %+.1f us", a.endGap * 1e6,
+          a.endErrHeld * 1e6);
+    std::printf("        (worst error %.0f us without the hold, %.0f us with it)\n", a.maxErrPlain * 1e6,
+                a.maxErrHeld * 1e6);
+
+    // The same disturbance five minutes after a start: there is no usual
+    // jitter to judge it against yet, so nothing is held.
+    const SpikeRun w = runSpike(300, 75, 600, 200e-6, -300e-6, 0.0, 12);
+    check("no hold before ten minutes of jitter history", w.holds == 0, "holds %d", w.holds);
+
+    // A real step: the level moves 2 ms and stays. It may be held while the
+    // window straddles the two levels, but must end up exactly where the
+    // estimator without the hold is -- how well THAT follows a step is
+    // testStep's business, not this one's.
+    const SpikeRun st = runSpike(1800, 0, 400, 0.0, 0.0, 0.002, 13);
+    check("a real step is followed, not held", !st.heldAtEnd && std::abs(st.endVsPlain) < 1e-6,
+          "held %d, holds %d, %+.1f us from the estimator without the hold after 400 s",
+          st.heldAtEnd, st.holds, st.endVsPlain * 1e6);
+
+    // A path that has got noisier and stays that way: one hold, which gives
+    // way at the limit, and no second one while the noise lasts.
+    const SpikeRun n = runSpike(1800, 2400, 0, 300e-6, 0.0, 0.0, 14);
+    check("sustained noise: the hold gives way at its limit", n.holds == 1 && n.timedOut == 1 && !n.heldAtEnd,
+          "holds %d, timed out %d, held %d", n.holds, n.timedOut, n.heldAtEnd);
+    check("...and follows the live level afterwards", std::abs(n.endGap) < 1e-6, "gap %+.1f us",
+          n.endGap * 1e6);
+
+    // An HF source is judged on its own scale: two hours of WWV-like edges,
+    // 3 ms scatter and 2% on fades 50 ms out, trip nothing.
+    OffsetTuning ht;
+    ht.holdJitterSpikes = true;
+    OffsetEstimator hf(ht);
+    EdgeNoise noise(15, 0.003);
+    for (int k = 0; k <= 7200; ++k) {
+        hf.add(30000.0 + k, 0.004 + noise());
+        hf.estimate();
+    }
+    check("HF scatter on its own scale holds nothing", hf.estimate().holds == 0,
+          "holds %d, usual jitter %.2f ms", hf.estimate().holds, hf.estimate().jitterBaselineSec * 1e3);
+}
+
 int main() {
     std::printf("ubersdr-ntp clock test\n");
     testDrift();
@@ -1151,6 +1270,7 @@ int main() {
     testStep();
     testWander();
     testImplausibleRate();
+    testJitterSpikeHold();
     testSampleClock();
     testCaptureClock();
     testHostSlewGuard();

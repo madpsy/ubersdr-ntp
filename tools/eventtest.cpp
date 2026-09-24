@@ -427,9 +427,33 @@ void testTimeRefusal() {
     check("...once", !has(ev, "time_adopted:r1"), "%s", join(ev).c_str());
 }
 
+void testSpikeHold() {
+    std::printf("\nAn offset held through a jitter spike is one event, and its release another\n");
+    Harness h(makeConfig());
+    auto r = radio("r1");
+    r.ready = true;
+    const Combined c = serving(ServingClass::Primary, 1, 0);
+    h.step({r}, c);
+    r.offsetHeld = true;
+    r.jitterSec = 312e-6;
+    r.jitterBaselineSec = 15e-6;
+    auto ev = h.step({r}, c);
+    check("a hold is recorded", has(ev, "offset_held:r1"), "%s", join(ev).c_str());
+    int more = 0;
+    for (int i = 0; i < 5; ++i) for (const auto& e : h.step({r}, c)) more += e == "offset_held:r1";
+    check("...once, not once a pass", more == 0, "%d more", more);
+    r.offsetHeld = false;
+    r.rejoinGapSec = -130e-6;
+    ev = h.step({r}, c);
+    check("its release is recorded", has(ev, "offset_released:r1"), "%s", join(ev).c_str());
+    ev = h.step({r}, c);
+    check("...once", !has(ev, "offset_released:r1"), "%s", join(ev).c_str());
+}
+
 int main() {
     std::printf("ubersdr-ntp event monitor test\n");
     testQuietStartup();
+    testSpikeHold();
     testLockAndFailover();
     testMinimum();
     testCoastAndUnsync();

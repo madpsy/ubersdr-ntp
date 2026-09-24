@@ -32,6 +32,32 @@
 // Until there is enough history to measure the rate, none is assumed, and the
 // doubt that leaves is reported rather than hidden: the level carries up to
 // kUnmeasuredRatePpm times the distance it was carried forward.
+//
+// HOLDING THROUGH A JITTER SPIKE
+//
+// The median survives any disturbance that covers under half the level window,
+// and nothing that covers more. A radio path can be disturbed for longer than
+// a minute -- skywave on a long LF path at night scatters DCF77's PM edges by
+// hundreds of microseconds, still inside the PM tracker's one-chip tolerance,
+// so the decoder neither complains nor loses lock -- and then the level follows
+// the scatter, and with one radio source in use the served time follows the
+// level. Seen live on DCF77 at 1061 km, 04:40 UTC: jitter 14 us -> 312 us for
+// about a minute, level 140 us down and then 130 us past where it started.
+// Every sanity check further on (level shift at 10 ms, continuity at 0.5 s,
+// the Selector's cross-check with no second receiver) is blind to that.
+//
+// So a source can ask (OffsetTuning::holdJitterSpikes) for the level to be
+// held when its jitter jumps well past ITS OWN usual jitter: the last level
+// published while the jitter was calm, carried along the rate, until the
+// jitter has been calm again for a minute; then the gap between the held and
+// the live level is slewed out rather than stepped. The measurement is not
+// thrown away -- the live level and jitter are still reported, and the jitter
+// still feeds the dispersion, because a spike is a real doubt whichever of the
+// two levels is right. It is bounded: a hold that outlasts kMaxHoldSec gives
+// way to the live level, because a disturbance that long is a change, and a
+// daemon running for months must not be stuck on a level that has gone. Until
+// the source has ten minutes of its own jitter history there is no baseline to
+// judge a spike against, and nothing is held.
 
 #include <algorithm>
 #include <cstddef>
@@ -65,6 +91,11 @@ struct OffsetTuning {
     double blockSec = 60.0;
     int minBlockSamples = 5;
     int minBlocks = 5;
+
+    // Hold the level through a spike in the jitter (see above). Radio sources
+    // only: a peer polled every 64 s has too few samples for a jitter history
+    // worth judging against, and its own clock filter already does this job.
+    bool holdJitterSpikes = false;
 
     // A set suited to a source sampled once every `pollSec` seconds.
     //
@@ -105,6 +136,19 @@ struct OffsetEstimate {
     int rateSamples = 0;         // ...and how many samples survived trimming
     double rateTermSec = 0.0;    // how far the rate's uncertainty could move offsetSec
     int levelShifts = 0;         // times history was dropped for a step
+
+    // Holding through a jitter spike (OffsetTuning::holdJitterSpikes). While
+    // `held`, offsetSec is the last calm level carried along the rate and
+    // liveOffsetSec is what the window says; otherwise they differ only by a
+    // gap still being slewed out after a hold (rejoinGapSec).
+    double liveOffsetSec = 0.0;
+    bool held = false;
+    double heldForSec = 0.0;
+    double rejoinGapSec = 0.0;       // offsetSec - liveOffsetSec, shrinking
+    double jitterBaselineSec = 0.0;  // the source's usual jitter; 0 until known
+    double spikeThresholdSec = 0.0;  // jitter above this starts a hold; 0 until known
+    int holds = 0;                   // holds started
+    int holdsTimedOut = 0;           // ...that gave way to the live level at kMaxHoldSec
 
     double offsetAt(double daemonSec) const { return offsetSec + rate * (daemonSec - atSec); }
 };
@@ -152,6 +196,7 @@ public:
 private:
     struct Sample { double at; double offset; };
     void recompute();
+    void holdThroughSpikes();
 
     OffsetTuning m_t;
 
@@ -160,6 +205,20 @@ private:
     bool m_dirty = true;
     int m_levelShifts = 0;
     OffsetEstimate m_est;
+
+    // Spike hold; see holdThroughSpikes.
+    struct JitterRecord { double at; double jitter; };
+    std::deque<JitterRecord> m_jitterHistory;
+    double m_nextJitterRecordAt = 0.0;
+    bool m_haveCalm = false;
+    double m_calmAt = 0.0, m_calmOffset = 0.0;   // last level published while calm
+    bool m_holding = false;
+    double m_holdStart = 0.0;
+    double m_calmSince = -1.0;                   // while holding: calm again since
+    bool m_rearmOnCalm = false;                  // after a timeout: no hold until calm
+    double m_gap = 0.0, m_gapSlew = 0.0;         // being slewed out after a hold
+    double m_lastHoldAt = 0.0;
+    int m_holds = 0, m_holdsTimedOut = 0;
 
     // The system's rate, handed in from outside; see setRatePrior.
     double m_priorRate = 0.0;

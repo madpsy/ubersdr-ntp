@@ -407,6 +407,12 @@ std::string renderStatusBlock(const StatusInput& in) {
                   << formatDuration(s.offsetAgeSec) << " old)"
                   << ", worth " << f2(s.weightDispersionSec * 1000.0, 1)
                   << " ms against the others\n";
+                if (s.offsetHeld) {
+                    o << "            HELD for " << formatDuration(s.offsetHeldForSec)
+                      << " through a jitter spike (usual " << f2(s.jitterBaselineSec * 1e6, 0)
+                      << " us); live level " << f2((s.liveOffsetSec - s.offsetSec) * 1e6, 0)
+                      << " us from it\n";
+                }
                 o << "            rate " << f2(s.offsetRate * 1e6, 1) << " ppm";
                 if (s.offsetRateMeasured) {
                     o << " +/- " << f2(s.offsetRateUncertainty * 1e6, 1) << " over "
@@ -805,6 +811,20 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     t["rate_term_ms"] = s.rateTermSec * 1000.0;
     t["jitter_ms"] = s.jitterSec * 1000.0;
     t["dispersion_ms"] = s.dispersionSec * 1000.0;
+    if (s.kind == SourceKind::Radio) {
+        // Held through a jitter spike (OffsetEstimator.h). The thresholds are
+        // null until the source has enough of its own jitter to judge by.
+        json h;
+        h["held"] = s.offsetHeld;
+        h["held_for_seconds"] = s.offsetHeldForSec;
+        h["live_minus_served_us"] = (s.liveOffsetSec - s.offsetSec) * 1e6;
+        h["rejoin_gap_us"] = s.rejoinGapSec * 1e6;
+        h["jitter_baseline_ms"] = s.jitterBaselineSec > 0.0 ? json(s.jitterBaselineSec * 1000.0) : json(nullptr);
+        h["threshold_ms"] = s.spikeThresholdSec > 0.0 ? json(s.spikeThresholdSec * 1000.0) : json(nullptr);
+        h["holds"] = s.spikeHolds;
+        h["holds_timed_out"] = s.spikeHoldsTimedOut;
+        t["spike_hold"] = std::move(h);
+    }
     t["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
     t["ws_rtt_ms"] = s.wsRttMs;
     t["rtt_from_websocket"] = s.rttFromWs;

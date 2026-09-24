@@ -387,6 +387,7 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
         o["offset_ms"] = s.hostOffsetSec * 1000.0;
         o["dispersion_ms"] = s.dispersionSec * 1000.0;
         o["jitter_ms"] = s.jitterSec * 1000.0;
+        if (s.kind == SourceKind::Radio) o["offset_held"] = s.offsetHeld;
         o["weight_dispersion_ms"] = s.weightDispersionSec * 1000.0;
         o["samples"] = s.offsetSamples;
         o["in_use"] = std::find(c.usedNames.begin(), c.usedNames.end(), s.name) != c.usedNames.end();

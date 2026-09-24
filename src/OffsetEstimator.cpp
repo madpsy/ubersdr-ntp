@@ -48,6 +48,39 @@ constexpr double kStepFloorSec = 0.010;
 
 constexpr double kMadToSigma = 1.4826;
 
+// Holding through a jitter spike (OffsetEstimator.h). Sized from the one that
+// prompted it -- DCF77 at 1061 km, calm at 10-35 us with minutes peaking at 53,
+// then about a minute at 245-312 -- but every figure is against the source's
+// own usual jitter, so an HF source calm at 3 ms is judged on its own scale.
+//
+// The spike: five times the usual, and never under 100 us -- twice the worst
+// calm minute seen, so ordinary wander does not trip it, and under the 245 us
+// that the spike averaged over its worst minute.
+constexpr double kSpikeFactor = 5.0;
+constexpr double kSpikeFloorSec = 100e-6;
+// Calm: half of that. The gap between the two is hysteresis, so a jitter
+// hovering at the threshold does not start and end a hold every second; and
+// it is also what the held level is taken from -- a level published at under
+// half the threshold, before the disturbance had moved the median.
+constexpr double kCalmFraction = 0.5;
+// The usual jitter: the median of one reading every ten seconds over half an
+// hour, and none judged until there are ten minutes of them.
+constexpr double kBaselineEverySec = 10.0;
+constexpr double kBaselineWindowSec = 1800.0;
+constexpr std::size_t kBaselineMinRecords = 60;
+// A calm level older than this is not held: whatever has happened since is
+// no longer a spike.
+constexpr double kMaxCalmAgeSec = 300.0;
+// Calm for this long ends a hold: the disturbed samples have then mostly left
+// the two-minute window, and the median is the median of calm samples again.
+constexpr double kCalmToReleaseSec = 60.0;
+// A hold never outlasts this; see OffsetEstimator.h.
+constexpr double kMaxHoldSec = 600.0;
+// The gap left at the end of a hold is slewed out over a minute, and never
+// slower than 10 us a second.
+constexpr double kRejoinSec = 60.0;
+constexpr double kRejoinMinSlewSecPerSec = 10e-6;
+
 double median(std::vector<double> v) {
     const std::size_t mid = v.size() / 2;
     std::nth_element(v.begin(), v.begin() + static_cast<std::ptrdiff_t>(mid), v.end());
@@ -183,6 +216,16 @@ void OffsetEstimator::clear() {
     m_samples.clear();
     m_newestAt = 0.0;
     m_dirty = true;
+    // A cleared source is starting again, possibly on a different path or
+    // edge: its old jitter says nothing about its new one.
+    m_jitterHistory.clear();
+    m_nextJitterRecordAt = 0.0;
+    m_haveCalm = false;
+    m_holding = false;
+    m_calmSince = -1.0;
+    m_rearmOnCalm = false;
+    m_gap = m_gapSlew = 0.0;
+    m_lastHoldAt = 0.0;
 }
 
 const OffsetEstimate& OffsetEstimator::estimate() {
@@ -270,6 +313,98 @@ void OffsetEstimator::recompute() {
     // over the mean distance a sample was carried.
     m_est.rateTermSec = m_est.rateUncertainty * (carried / static_cast<double>(level.size()));
     m_est.valid = m_est.samples >= m_t.minLevelSamples;
+    m_est.liveOffsetSec = med;
+    m_est.holds = m_holds;
+    m_est.holdsTimedOut = m_holdsTimedOut;
+    if (m_t.holdJitterSpikes && m_est.valid) holdThroughSpikes();
+}
+
+// Runs once per recompute, after the live level and jitter are known, and may
+// replace m_est.offsetSec with a held or rejoining one. OffsetEstimator.h says
+// why; the constants above say how much.
+void OffsetEstimator::holdThroughSpikes() {
+    const double ref = m_est.atSec;
+    const double live = m_est.offsetSec;
+    const double jitter = m_est.jitterSec;
+    const double dt = m_lastHoldAt > 0.0 ? std::max(0.0, ref - m_lastHoldAt) : 0.0;
+    m_lastHoldAt = ref;
+
+    // The usual jitter. Not recorded while holding: a spike must not teach the
+    // baseline that spikes are usual. It is recorded after a hold that timed
+    // out, which is how a path that has genuinely got noisier stops tripping.
+    if (!m_holding && ref >= m_nextJitterRecordAt) {
+        m_jitterHistory.push_back({ref, jitter});
+        m_nextJitterRecordAt = ref + kBaselineEverySec;
+    }
+    while (!m_jitterHistory.empty() && m_jitterHistory.front().at < ref - kBaselineWindowSec) {
+        m_jitterHistory.pop_front();
+    }
+    const bool armed = m_jitterHistory.size() >= kBaselineMinRecords;
+    double threshold = 0.0, calm = 0.0;
+    if (armed) {
+        std::vector<double> js;
+        js.reserve(m_jitterHistory.size());
+        for (const JitterRecord& r : m_jitterHistory) js.push_back(r.jitter);
+        const double baseline = median(js);
+        threshold = std::max(kSpikeFloorSec, kSpikeFactor * baseline);
+        calm = kCalmFraction * threshold;
+        m_est.jitterBaselineSec = baseline;
+        m_est.spikeThresholdSec = threshold;
+    }
+
+    // What is left of the last hold's gap, slewed towards the live level.
+    if (m_gap != 0.0) {
+        const double step = m_gapSlew * dt;
+        m_gap = std::abs(m_gap) <= step ? 0.0 : m_gap - std::copysign(step, m_gap);
+    }
+    double published = live + m_gap;
+
+    if (!m_holding) {
+        if (armed && !m_rearmOnCalm && jitter > threshold && m_haveCalm &&
+            ref - m_calmAt <= kMaxCalmAgeSec) {
+            m_holding = true;
+            m_holdStart = ref;
+            m_calmSince = -1.0;
+            ++m_holds;
+        } else if (!armed || jitter <= calm) {
+            m_haveCalm = true;
+            m_calmAt = ref;
+            m_calmOffset = published;
+            m_rearmOnCalm = false;
+        }
+    }
+
+    if (m_holding) {
+        const double held = m_calmOffset + m_est.rate * (ref - m_calmAt);
+        if (jitter <= calm) {
+            if (m_calmSince < 0.0) m_calmSince = ref;
+        } else {
+            m_calmSince = -1.0;
+        }
+        const bool settled = m_calmSince >= 0.0 && ref - m_calmSince >= kCalmToReleaseSec;
+        const bool expired = ref - m_holdStart >= kMaxHoldSec;
+        if (settled || expired) {
+            m_holding = false;
+            m_gap = held - live;
+            m_gapSlew = std::max(kRejoinMinSlewSecPerSec, std::abs(m_gap) / kRejoinSec);
+            m_haveCalm = false;
+            if (!settled) {
+                ++m_holdsTimedOut;
+                m_rearmOnCalm = true;
+            }
+        } else {
+            // The held level is only as good as the rate carrying it.
+            m_est.rateTermSec += m_est.rateUncertainty * (ref - m_calmAt);
+            m_est.heldForSec = ref - m_holdStart;
+        }
+        published = held;
+    }
+
+    m_est.offsetSec = published;
+    m_est.held = m_holding;
+    m_est.rejoinGapSec = m_holding ? 0.0 : m_gap;
+    m_est.holds = m_holds;
+    m_est.holdsTimedOut = m_holdsTimedOut;
 }
 
 } // namespace ubersdr_ntp
