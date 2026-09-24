@@ -522,6 +522,18 @@ against its own and trusts capture times only while it has stayed within 20 ppm
 of its usual rate for thirteen seconds. The status page says which timing each
 source is on, and why.
 
+It also changes what the root dispersion has to claim. Every source carries the
+delay model's doubt, floored at 10 ms: that floor was set from WWV skywave paths
+timed by arrival, where the worst measured error was 9 ms. A DCF77 source that
+is capture-timed, timing from its phase modulation, and within the 2000 km
+groundwave service area has none of those terms in its path — the delay is
+geometry, the night-time skywave is at most ~90 µs later, and the RX888's own
+latency is 50–300 µs — so its floor is **1 ms** instead. On M9PSY-1 at 1061 km
+it measured within 0.03 ms of a GPS-fed stratum 1, with jitter spikes to 0.2 ms
+that the jitter term adds on top, so the served root dispersion is about 1.2 ms
+rather than 10.2. The 10 ms returns the moment any condition lapses: timing
+falls back to AM, the PM tracker unlocks, or capture timing pauses.
+
 ### Calibrating the chain constant against NTP
 
 The terms every source shares cannot be measured by comparing sources: two

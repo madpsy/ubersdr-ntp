@@ -224,6 +224,21 @@ constexpr double kDelayUncertaintyFloorSec = 0.010;
 // 15% it only overtakes the floor past about 67 ms of delay, i.e. on paths
 // longer than the ones the floor was measured on.
 constexpr double kDelayUncertaintyFraction = 0.15;
+// The floor above is the doubt in an HF skywave path timed by packet arrival,
+// with UberSDR's buffering inside it. None of that is in a DCF77 source that is
+// capture-timed and timed from its phase modulation on a groundwave path:
+// radiod stamps the samples at the RX888 (so no chain, network or buffering is
+// in the path), the groundwave delay is geometry at a known velocity (the
+// night-time skywave off the D/E layer is at most ~90 us later; Propagation.h),
+// and the PM correlator's edge is exact to the decoder test's resolution. What
+// is left is that skywave bias, the RX888's own latency (50-300 us, not yet
+// taken off in radiod) and the decoder's residual. Measured on M9PSY-1 at
+// 1061 km against a GPS-fed stratum 1 on 2026-09-24: within 0.03 ms smoothed
+// over 30 settled minutes, jitter spikes to 0.2 ms, which the jitter term
+// carries on top. 1 ms covers the unmeasured terms together about twice over.
+// Only inside the groundwave service area; past it the modes interfere.
+constexpr double kDelayUncertaintyFloorLfPmSec = 0.001;
+constexpr double kLfGroundwaveServiceM = 2000e3;
 
 // The smallest uncertainty a source may claim when it is being weighed against
 // the others. See the use site.
@@ -2112,8 +2127,15 @@ void Source::recomputeOffset() {
     //   delay           how wrong the delay model could be, which is the term
     //                   nothing can measure and therefore the one that usually
     //                   dominates
+    // The tight floor only while every condition that earns it holds: timing
+    // falling back to AM, or capture timing pausing, puts the 10 ms back at once.
+    const bool lfPmCapture = m_cfg.autoDelay && m_broadcast == Broadcast::Dcf77 &&
+                             m_snap.timingMode == "capture" && m_snap.pmLocked && m_snap.timingFromPm &&
+                             !m_snap.capturePaused && m_snap.receiverLocation.valid &&
+                             greatCircleMeters(m_snap.receiverLocation, dcf77Site()) <= kLfGroundwaveServiceM;
     const double delayUncertainty =
-        std::max(kDelayUncertaintyFloorSec, m_snap.delaySec * kDelayUncertaintyFraction);
+        std::max(lfPmCapture ? kDelayUncertaintyFloorLfPmSec : kDelayUncertaintyFloorSec,
+                 m_snap.delaySec * kDelayUncertaintyFraction);
     const double own = e.jitterSec + m_snap.clockResidualSec + m_snap.clockSlopeUncSec + e.rateTermSec;
     m_snap.dispersionSec = own + delayUncertainty;
 
