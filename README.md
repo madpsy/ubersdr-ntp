@@ -501,9 +501,15 @@ by arrival, as above.
 What that removes from the delay model is the network term and the chain
 constant: radiod's framing and processing, the multicast hop, the server and
 the WebSocket are all between the capture and the stamp's arrival, and none of
-it is modelled any more. What is left is propagation, the decoder's edge bias,
-and the RX888's own transfer latency (`kCaptureChainDelaySec`, estimated at
-50–300 µs, held at zero until it is measured against the GPS-fed reference).
+it is modelled any more. What is left is propagation and the decoder's edge
+bias. The RX888's own transfer latency (the A/D pipeline, the FX3's buffering,
+the last USB packet in flight; estimated at 50–300 µs) is taken off in radiod,
+which is the only place that knows which front end captured the samples:
+`RX888_CAPTURE_LATENCY_NS` in `ubersdr-radiod`'s capture-time patch, held at
+zero until it is measured. To measure it, read the class delta against a
+GPS-fed server with DCF77 capture-timed, over at least twenty settled minutes: a
+steady delta of −L ms means L ms more for radiod to take off. On 2026-09-24,
+thirteen minutes after a restart, it read −0.02 to +0.03 ms.
 There is no arrival fit either: each packet times its own samples exactly, so a
 sample is mapped through the packet nearest it, and when radiod re-anchors
 after losing samples at the USB the step applies from that packet on.

@@ -183,13 +183,14 @@ constexpr double kUberSdrChainDelaySec = 0.0094;
 // at all: every packet says when the RX888 captured its first sample, net of
 // radiod's channel filter delay, so radiod's framing and processing, the
 // multicast hop, the server, the WebSocket and the network are all outside the
-// measurement. What is left between the antenna and the stamp is the RX888's
-// own -- the A/D pipeline, the FX3's buffering, the last USB packet of a
-// transfer in flight -- which radiod's floor-of-arrivals anchor cannot see.
-// Estimated at 50-300 us and NOT yet measured, so zero rather than a guess:
-// calibrate it against the GPS-fed reference as the arrival chain was, on no
-// less than twenty settled minutes, and on DCF77, which has no WWV terms.
-constexpr double kCaptureChainDelaySec = 0.0;
+// measurement. The RX888's own latency -- the A/D pipeline, the FX3's
+// buffering, the last USB packet of a transfer in flight -- is taken off in
+// radiod (RX888_CAPTURE_LATENCY_NS, ubersdr-radiod's capture-time patch), not
+// here: it belongs to the front end, and only radiod knows which front end
+// captured the samples. So the stamps are the capture time itself and the
+// chain term is zero. Calibrate that constant from the class delta against a
+// GPS-fed server, on no less than twenty settled minutes and on DCF77, which
+// has no WWV terms; a steady delta of -L ms means L ms more to take off.
 
 // Capture timing: the longest capture-to-arrival interval believed. Real ones
 // are tens of milliseconds; past this the stamp is from another stream, or the
@@ -2263,7 +2264,7 @@ void Source::updateDelayModel() {
     // The same for an IQ session as a USB one: radiod's channel filter is a
     // linear-phase sinc whose delay is set by the block and overlap, not the
     // passband, so the iq and usb presets are delayed alike.
-    m_snap.chainSec = capture ? kCaptureChainDelaySec : kUberSdrChainDelaySec;
+    m_snap.chainSec = capture ? 0.0 : kUberSdrChainDelaySec;
     m_snap.extraSec = m_cfg.extraDelayMs / 1000.0;
     m_snap.delaySec = prop + net + decoder + m_snap.chainSec + m_snap.extraSec;
 }

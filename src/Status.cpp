@@ -540,7 +540,7 @@ std::string renderStatusBlock(const StatusInput& in) {
         o << "    delay:  " << f2(s.delaySec * 1000.0, 1) << " ms total = "
           << f2(s.propagationSec * 1000.0, 1) << " propagation + "
           << f2(s.networkSec * 1000.0, 1) << (captureTimed ? " network (not in the path) + " : " network + ")
-          << f2(s.chainSec * 1000.0, 1) << (captureTimed ? " RX888 capture + " : " UberSDR chain + ")
+          << f2(s.chainSec * 1000.0, 1) << (captureTimed ? " chain (in radiod's stamps) + " : " UberSDR chain + ")
           << f2(s.decoderSec * 1000.0, 1) << " decoder bias + "
           << f2(s.extraSec * 1000.0, 1) << " configured\n";
         o << "            " << s.pathDescription << '\n';
@@ -842,7 +842,7 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     d["configured_ms"] = s.extraSec * 1000.0;
     // How the samples were put on the daemon clock; see CaptureClock.
     // "network_ms" and "chain_ms" above read accordingly: with capture timing
-    // the network is not in the path and the chain is the RX888's own. Radio
+    // neither is in the path (radiod's stamps are net of the RX888's own). Radio
     // sources only: an NTP peer has no samples to time.
     if (s.kind == SourceKind::Radio) {
         json ct;

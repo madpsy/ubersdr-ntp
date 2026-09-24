@@ -1312,7 +1312,7 @@ function onStatus(d) {
       ["Timing", timingText(tm)],
       ["Delay model", ms(dl.total_ms) + " total = " + ms(dl.propagation_ms) + " propagation + " +
         ms(dl.network_ms) + (captureTimed ? " network (not in the path) + " : " network + ") +
-        ms(dl.chain_ms) + (captureTimed ? " RX888 capture " : " UberSDR chain ") +
+        ms(dl.chain_ms) + (captureTimed ? " chain (in radiod's stamps) " : " UberSDR chain ") +
         signed(dl.decoder_bias_ms) + " decoder bias + " +
         ms(dl.configured_ms) + " configured<br>" +
         '<span class="note">' + esc(dl.path) + "</span>"],
@@ -1571,7 +1571,10 @@ function makeChart(el, opts) {
   let legend = null;
   if (opts.legend) { legend = document.createElement("div"); legend.className = "legend"; el.appendChild(legend); }
 
-  let state = null, hoverIdx = null;
+  // hoverIdx is this chart's own crosshair; peerT, the bucket start hovered on
+  // another chart in the same card, so a moment can be read across all of them.
+  let state = null, hoverIdx = null, peerT = null;
+  const group = el.closest(".card");
 
   function render() {
     if (!state) return;
@@ -1664,9 +1667,11 @@ function makeChart(el, opts) {
     // The crosshair snaps to a bucket that at least one series has.
     const starts = [...new Set(series.flatMap((s) => s.points.map((p) => p[0])))].sort((a, b) => a - b);
     state.starts = starts;
-    if (hoverIdx != null && starts.length) {
-      hoverIdx = Math.max(0, Math.min(starts.length - 1, hoverIdx));
-      const t = starts[hoverIdx], x = Math.round(X(t + width / 2)) + 0.5;
+    if (hoverIdx != null && starts.length) hoverIdx = Math.max(0, Math.min(starts.length - 1, hoverIdx));
+    // This chart's own hover, or else the bucket hovered on a chart beside it.
+    const hoverT = hoverIdx != null && starts.length ? starts[hoverIdx] : peerT;
+    if (hoverT != null && hoverT >= x0 && hoverT < x1) {
+      const t = hoverT, x = Math.round(X(t + width / 2)) + 0.5;
       svgEl("line", { class: "xhair", x1: x, x2: x, y1: mT, y2: mT + ph }, svg);
       const rows = [];
       for (const s of series) {
@@ -1734,9 +1739,17 @@ function makeChart(el, opts) {
     }
     return best;
   }
-  svg.addEventListener("pointermove", (e) => { const i = idxAt(e.clientX); if (i !== hoverIdx) { hoverIdx = i; render(); } });
-  svg.addEventListener("pointerleave", () => { hoverIdx = null; render(); });
-  svg.addEventListener("blur", () => { hoverIdx = null; render(); });
+  // Tell the other charts in this card which bucket is hovered, or null.
+  function share() {
+    const t = hoverIdx != null && state && state.starts ? state.starts[hoverIdx] : null;
+    for (const id in charts) {
+      const c = charts[id];
+      if (c.el !== el && c.group === group) c.showPeer(t);
+    }
+  }
+  svg.addEventListener("pointermove", (e) => { const i = idxAt(e.clientX); if (i !== hoverIdx) { hoverIdx = i; render(); share(); } });
+  svg.addEventListener("pointerleave", () => { hoverIdx = null; render(); share(); });
+  svg.addEventListener("blur", () => { hoverIdx = null; render(); share(); });
   svg.addEventListener("keydown", (e) => {
     if (!state || !state.starts || !state.starts.length) return;
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
@@ -1744,6 +1757,7 @@ function makeChart(el, opts) {
     const n = state.starts.length;
     hoverIdx = hoverIdx == null ? n - 1 : hoverIdx + (e.key === "ArrowLeft" ? -1 : 1);
     render();
+    share();
   });
   new ResizeObserver(() => render()).observe(el);
 
@@ -1759,8 +1773,14 @@ function makeChart(el, opts) {
       }
       render();
     },
+    showPeer(t) {
+      if (t === peerT) return;
+      peerT = t;
+      if (hoverIdx == null) render();
+    },
     render,
     el,
+    group,
   };
 }
 

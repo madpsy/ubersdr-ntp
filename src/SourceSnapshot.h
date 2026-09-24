@@ -254,8 +254,8 @@ struct SourceSnapshot {
     double propagationSec = 0.0;
     double networkSec = 0.0;
     double decoderSec = 0.0;   // the running decoder's edge bias (negative: early)
-    double chainSec = 0.0;     // UberSDR's fixed RF-to-WebSocket delay, or with capture
-                               // timing the RX888's own transfer latency
+    double chainSec = 0.0;     // UberSDR's fixed RF-to-WebSocket delay; zero with capture
+                               // timing, whose stamps radiod has already corrected
     double extraSec = 0.0;
     std::string pathDescription;
 
