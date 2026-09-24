@@ -163,6 +163,12 @@ void sampleMetrics(MetricHistory& h, const std::vector<SourceSnapshot>& sources,
         if (s.ready && s.haveOffset) {
             h.add({base + "offset_ms", s.name + " offset", "ms", group, s.name}, unix,
                   s.hostOffsetSec * 1000.0);
+            // How tightly its own measurements agree (OffsetEstimator: 1.4826
+            // MAD about the rate line). In microseconds, because the spread is
+            // wide: a capture-timed DCF77 edge scatters by about one, an
+            // internet NTP server by hundreds.
+            h.add({base + "jitter_us", s.name + " jitter", "µs", group, s.name}, unix,
+                  s.jitterSec * 1e6);
         }
         // Against the median of its class, which is the agreement the
         // consensus judges it on. Only with someone to disagree with.

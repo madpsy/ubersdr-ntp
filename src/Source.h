@@ -97,7 +97,7 @@ private:
     void onText(const std::string& msg);
 
     // Audio path, all on the WebSocket thread.
-    void handleAudio(const std::uint8_t* pkt, std::size_t len, double arrivalSec);
+    void handleAudio(const std::uint8_t* pkt, std::size_t len, double arrivalSec, double dmrSec);
     // arrivalSec is the daemon clock. observeArrival=false for samples this
     // program synthesised (concealment, gap fill), which advance the timeline
     // but did not arrive at any particular instant.
@@ -107,6 +107,17 @@ private:
     bool ensureDecoder(int rate);   // false: no decoder can run at this rate
     void trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamples);
     void discardTiming(const char* why);   // caller does NOT hold m_mu
+
+    // Capture timing (CaptureClock in SampleClock.h). WebSocket thread.
+    enum class TimingMode { Pending, Capture, Arrival };
+    void setTiming(TimingMode mode, const std::string& why);
+    void onServerClockId(const std::string& clockId);
+    // Times the block about to be fed. With capture timing it records the
+    // block's capture mark itself; otherwise it says whether the arrival fit
+    // should observe the block's arrival, which is what it returns.
+    bool timeBlock(std::uint64_t stampNanos, int rate, double arrivalSec, double dmrSec);
+    // Daemon time at a sample index, by whichever clock the mode uses.
+    bool hostTimeAt(std::int64_t sample, double& hostSec) const;
     void resetStream(const char* why);
 
     // Decoder callbacks.
@@ -209,6 +220,14 @@ private:
     std::uint64_t m_gapFills = 0;
 
     SampleClock m_clock;
+
+    // Capture timing, WebSocket thread. m_timing is decided per connection
+    // from the receiver's clock id; see onServerClockId.
+    TimingMode m_timing = TimingMode::Pending;
+    double m_timingPendingSince = 0.0;   // monotonic, first audio while pending
+    CaptureClock m_capture;
+    HostSlewGuard m_slew;                // host-wide in truth, but cheap per source
+    bool m_captureTrusted = true;        // for logging the transitions
 
     // The UTC anchor a `time` event leaves behind, extended one second per
     // `second` event. Reset whenever lock is lost, because an anchor that

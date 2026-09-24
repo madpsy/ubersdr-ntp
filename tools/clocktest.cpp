@@ -1060,6 +1060,90 @@ void testTimeContinuity() {
     }
 }
 
+// CaptureClock maps samples through the packet nearest them, exactly: a
+// packet's stamp is the capture time of its first sample, so no fit and no
+// jitter -- and a step in the stamps (radiod re-anchoring after it lost
+// samples) applies from that packet on, without disturbing the samples before.
+void testCaptureClock() {
+    std::printf("\ncapture clock\n");
+    const int rate = 12000;
+    const int frame = 240;   // 20 ms
+    CaptureClock c(rate);
+    double t = 0.0;
+    check("no marks: no time", !c.hostTimeAt(0, t));
+
+    const double t0 = 1000.0;
+    for (int i = 0; i < 100; ++i) c.observe(static_cast<std::int64_t>(i) * frame, t0 + i * 0.020);
+    bool ok = c.hostTimeAt(0, t);
+    check("first sample of the first packet", ok && std::fabs(t - t0) < 1e-9, "%.9f", t - t0);
+    ok = c.hostTimeAt(50 * frame + 120, t);
+    check("mid-packet: its packet's capture plus the offset at the stream rate",
+          ok && std::fabs(t - (t0 + 1.0 + 0.010)) < 1e-9, "%.9f", t - (t0 + 1.010));
+
+    // radiod lost 4.045 ms of samples at the USB and re-anchored: from packet
+    // 100 on, every sample was captured that much later than the count says.
+    const double lost = 0.004045;
+    for (int i = 100; i < 200; ++i) c.observe(static_cast<std::int64_t>(i) * frame, t0 + i * 0.020 + lost);
+    ok = c.hostTimeAt(150 * frame, t);
+    check("after a re-anchor: the step applies at once",
+          ok && std::fabs(t - (t0 + 3.0 + lost)) < 1e-9, "%.6f ms", (t - (t0 + 3.0)) * 1e3);
+    ok = c.hostTimeAt(60 * frame, t);
+    check("before it: untouched", ok && std::fabs(t - (t0 + 1.2)) < 1e-9, "%.6f ms", (t - (t0 + 1.2)) * 1e3);
+
+    // Packets with no capture time leave a gap; a sample in it extrapolates
+    // from the nearest mark.
+    CaptureClock g(rate);
+    g.observe(0, t0);
+    g.observe(10 * frame, t0 + 0.200);
+    ok = g.hostTimeAt(3 * frame, t);
+    check("in a short gap: from the nearer mark", ok && std::fabs(t - (t0 + 0.060)) < 1e-9);
+    check("far from every mark: no time",
+          !g.hostTimeAt(10 * frame + static_cast<std::int64_t>(3.0 * rate), t));
+
+    // A sample index that goes backwards is a new stream.
+    g.observe(0, t0 + 50.0);
+    ok = g.hostTimeAt(0, t);
+    check("a new stream replaces the old marks", ok && std::fabs(t - (t0 + 50.0)) < 1e-9 && g.marks() == 1);
+}
+
+// HostSlewGuard: capture times are trusted while the host clock runs at its
+// usual rate against the daemon clock, and not while it is being slewed, nor
+// for kExposureSec after, while the slew still sits in radiod's anchor window.
+void testHostSlewGuard() {
+    std::printf("\nhost slew guard\n");
+    HostSlewGuard g;
+    // The crystal runs -12 ppm against a disciplined host clock: that is the
+    // usual rate, not a slew.
+    const double crystal = -12e-6;
+    double dmr = 0.0, now = 0.0;
+    std::string why;
+    auto run = [&](double seconds, double hostRate) {
+        for (double s = 0; s < seconds; s += 1.0) {
+            now += 1.0;
+            dmr += crystal - hostRate;
+            g.sample(now, dmr);
+        }
+    };
+    check("nothing measured yet: not steady", !g.steady(now, &why), "%s", why.c_str());
+    run(30.0, 0.0);
+    check("a crystal's rate, from the start: steady", g.steady(now, &why), "%s", why.c_str());
+    run(300.0, 0.0);
+    check("five minutes steady", g.steady(now) && std::fabs(g.deviationPpm()) < 1.0, "%.2f ppm",
+          g.deviationPpm());
+
+    run(60.0, 500e-6);   // the host's NTP client slews at 500 ppm for a minute
+    check("while slewed: not steady", !g.steady(now, &why), "%s", why.c_str());
+    run(10.0, 0.0);
+    check("just after: still not trusted (radiod's window still holds it)", !g.steady(now, &why), "%s",
+          why.c_str());
+    run(30.0, 0.0);
+    check("half a minute after: steady again -- the slew did not become the baseline",
+          g.steady(now, &why), "%s (%.2f ppm)", why.c_str(), g.deviationPpm());
+
+    run(60.0, 5e-6);     // an ordinary disciplined correction
+    check("a 5 ppm correction is not a slew worth refusing", g.steady(now, &why), "%s", why.c_str());
+}
+
 int main() {
     std::printf("ubersdr-ntp clock test\n");
     testDrift();
@@ -1068,6 +1152,8 @@ int main() {
     testWander();
     testImplausibleRate();
     testSampleClock();
+    testCaptureClock();
+    testHostSlewGuard();
     testSelector();
     testAlwaysMode();
     testStratumFromUpstream();

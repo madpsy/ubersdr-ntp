@@ -10,10 +10,13 @@
 #include <ixwebsocket/IXWebSocket.h>
 
 #include <curl/curl.h>
+#include <openssl/evp.h>
 
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <cstring>
+#include <fstream>
 #include <random>
 #include <unistd.h>
 #include <functional>
@@ -87,7 +90,16 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // PCM is right only as far as that figure was, and this carries its error too.
 // Until a receiver that hears WWV and DCF77 together splits them, this is the
 // sum, kept with the decoder term where the status page shows it.
-constexpr double kWwvResidualSec = 0.0047;
+//
+// Zero from 2026-09-24, pending exactly that measurement. With capture timing
+// nothing between the antenna and the sample index treats WWV differently from
+// DCF77 -- the same radiod path, the same capture stamps, no chain term -- so no
+// mechanism is known that needs it, and the one WWV-over-PCM reading (K3FEF,
+// 2026-09-22, against Cloudflare) put it nearer +2.3 ms than +4.7. The terms it
+// could really belong to, the decoder bias on live ticks and the skywave model,
+// are to be measured as themselves: WWV against DCF77 on one receiver, both
+// capture-timed, over twenty settled minutes by day and by night.
+constexpr double kWwvResidualSec = 0.0;
 
 // The delay from RF reaching the SDR to the audio leaving UberSDR's WebSocket:
 // radiod's demodulator and filters, its block framing, the server's handling.
@@ -166,6 +178,31 @@ constexpr double kWwvResidualSec = 0.0047;
 // lower, and WWV keeps its total through kWwvResidualSec. WWVB, the other
 // source with no WWV terms, moves with DCF77.
 constexpr double kUberSdrChainDelaySec = 0.0094;
+
+// With capture timing (CaptureClock, SampleClock.h) the chain is not modelled
+// at all: every packet says when the RX888 captured its first sample, net of
+// radiod's channel filter delay, so radiod's framing and processing, the
+// multicast hop, the server, the WebSocket and the network are all outside the
+// measurement. What is left between the antenna and the stamp is the RX888's
+// own -- the A/D pipeline, the FX3's buffering, the last USB packet of a
+// transfer in flight -- which radiod's floor-of-arrivals anchor cannot see.
+// Estimated at 50-300 us and NOT yet measured, so zero rather than a guess:
+// calibrate it against the GPS-fed reference as the arrival chain was, on no
+// less than twenty settled minutes, and on DCF77, which has no WWV terms.
+constexpr double kCaptureChainDelaySec = 0.0;
+
+// Capture timing: the longest capture-to-arrival interval believed. Real ones
+// are tens of milliseconds; past this the stamp is from another stream, or the
+// host clock stepped between capture and arrival.
+constexpr double kMaxCaptureLagSec = 1.0;
+// How long to wait, with audio flowing, for the receiver to say which clock its
+// stamps are on before falling back to the arrival fit.
+constexpr double kTimingPendingSec = 5.0;
+// Capture timing: how close a step in the stamps must come to whole frames to
+// be audio lost on the way here rather than radiod re-anchoring. The stamps
+// are exact to the nanosecond; whole RX888 transfers are 4.045 ms, which no
+// small multiple of brings within this of a 20 ms frame.
+constexpr double kCaptureFrameToleranceSec = 50e-6;
 
 // Floor on how well the delay model can be trusted, whatever it computed. The
 // receiver's own buffering between radiod and the WebSocket is inside this and
@@ -340,7 +377,8 @@ Source::Source(SourceConfig cfg)
       m_iq(m_broadcast == Broadcast::Dcf77),
       m_channels(m_iq ? 2 : 1),
       m_sessionId(makeUuidV4()),
-      m_clock(12000) {
+      m_clock(12000),
+      m_capture(12000) {
     m_snap.name = m_cfg.name;
     m_snap.url = m_cfg.url;
     m_snap.enabled = m_cfg.enabled;
@@ -1030,6 +1068,7 @@ void Source::onText(const std::string& msg) {
         } else if (type == "pong") {
             onJsonPong();
         } else if (type == "status") {
+            onServerClockId(j.value("clockId", std::string()));
             if (j.contains("sampleRate") && j["sampleRate"].is_number_integer()) {
                 LOG_DEBUG(m_cfg.name.c_str(), "status: %d Hz, mode %s, %.6f MHz",
                           j["sampleRate"].get<int>(), j.value("mode", "?").c_str(),
@@ -1051,14 +1090,17 @@ void Source::onBinary(const std::string& msg) {
     // has why). A step or a slew of the host clock reaches neither the fit nor
     // any offset already measured, so neither needs handling here.
     const double arrival = daemonNow();
+    // And how far the host clock is from it right now, for turning a capture
+    // stamp on the host clock into the daemon clock (see timeBlock).
+    const double dmr = daemonMinusRealtime();
 
-    handleAudio(reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size(), arrival);
+    handleAudio(reinterpret_cast<const std::uint8_t*>(msg.data()), msg.size(), arrival, dmr);
 }
 
 // ---------------------------------------------------------------------------
 // Audio
 
-void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arrivalSec) {
+void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arrivalSec, double dmrSec) {
     {
         std::lock_guard<std::mutex> lk(m_mu);
         m_snap.packets++;
@@ -1128,7 +1170,8 @@ void Source::handleAudio(const std::uint8_t* pkt, std::size_t len, double arriva
         // count the tracker is measuring against.
         if (!ensureDecoder(h.sampleRate)) return;
         trackTimeline(h.timestampNanos, h.sampleRate, frames);
-        feedSamples(m_pcmv4->dec.samples(), frames, h.sampleRate, arrivalSec);
+        const bool observeArrival = timeBlock(h.timestampNanos, h.sampleRate, arrivalSec, dmrSec);
+        feedSamples(m_pcmv4->dec.samples(), frames, h.sampleRate, arrivalSec, observeArrival);
         return;
     }
 
@@ -1192,6 +1235,11 @@ void Source::feedSilence(int count, int rate) {
 // is dropped and rebuilt rather than trusted; the decoder keeps its lock.
 void Source::trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamples) {
     if (rate <= 0 || rate != m_decoderRate) { m_tsHave = false; return; }
+    // A zero stamp is "no capture time": UberSDR has no usable reference from
+    // radiod for a moment (a new channel, a rate change, radiod rebuilding its
+    // anchor). It says nothing about the timeline either way, and the samples
+    // still count, so the next real stamp lines up against them as usual.
+    if (timestampNanos == 0) return;
     if (frameSamples > 0) m_lastFrameSamples = frameSamples;
     if (m_lastFrameSamples <= 0) m_lastFrameSamples = rate / 50;
 
@@ -1233,7 +1281,19 @@ void Source::trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamp
         static_cast<std::int64_t>(timestampNanos - m_tsBlockStartNanos) >= static_cast<std::int64_t>(kBlockSec * 1e9)) {
         const double step = m_tsBlockMin - m_tsBaseline;
         const double frameSec = static_cast<double>(m_lastFrameSamples) / rate;
-        if (step > 0.5 * frameSec && step <= kMaxFillSec) {
+        const bool reanchor = m_timing == TimingMode::Capture && step > 0.5 * frameSec &&
+            std::fabs(step - std::llround(step / frameSec) * frameSec) > kCaptureFrameToleranceSec;
+        if (reanchor && step <= kMaxFillSec) {
+            // Capture stamps are exact, and audio lost on the way here is whole
+            // frames of it; a step that is not is radiod re-anchoring after it
+            // lost samples at the USB, before any stream was cut from them.
+            // Nothing is missing from this stream -- its samples after the step
+            // were simply captured later than the count says, which is what
+            // the capture clock is following -- so there is nothing to fill.
+            LOG_INFO(m_cfg.name.c_str(), "receiver re-anchored its capture times %+.3f ms "
+                     "(samples lost at the SDR, not on the way here)", step * 1000.0);
+            m_tsBaseline = m_tsBlockMin;
+        } else if (step > 0.5 * frameSec && step <= kMaxFillSec) {
             // Whole frames: the server only ever loses whole ones, and rounding
             // to them keeps the estimate's jitter out of the fill.
             const long long frames = std::llround(step / frameSec);
@@ -1274,11 +1334,150 @@ void Source::trackTimeline(std::uint64_t timestampNanos, int rate, int frameSamp
     }
 }
 
+// ---------------------------------------------------------------------------
+// Capture timing
+
+namespace {
+
+// Names the clock this host's timestamps are on, exactly as UberSDR does
+// (capture_time.go, hostClockID): the first eight bytes of the SHA-256 of the
+// kernel's boot_id, in hex. Every process and container on one host reads the
+// same boot_id, and no other host does, so a receiver that sends this value is
+// stamping on this host's CLOCK_REALTIME. Empty if the kernel does not say.
+const std::string& hostClockId() {
+    static const std::string id = [] {
+        std::ifstream f("/proc/sys/kernel/random/boot_id");
+        std::string s;
+        std::getline(f, s);
+        while (!s.empty() && std::isspace(static_cast<unsigned char>(s.back()))) s.pop_back();
+        std::size_t start = 0;
+        while (start < s.size() && std::isspace(static_cast<unsigned char>(s[start]))) ++start;
+        s.erase(0, start);
+        if (s.empty()) return std::string();
+        unsigned char md[EVP_MAX_MD_SIZE];
+        unsigned int n = 0;
+        if (EVP_Digest(s.data(), s.size(), md, &n, EVP_sha256(), nullptr) != 1 || n < 8) return std::string();
+        static const char kHex[] = "0123456789abcdef";
+        std::string out;
+        for (int i = 0; i < 8; ++i) {
+            out += kHex[md[i] >> 4];
+            out += kHex[md[i] & 15];
+        }
+        return out;
+    }();
+    return id;
+}
+
+const char* timingName(int mode) {
+    static const char* const kNames[] = {"pending", "capture", "arrival"};
+    return kNames[mode];
+}
+
+} // namespace
+
+void Source::setTiming(TimingMode mode, const std::string& why) {
+    const bool changed = mode != m_timing;
+    const bool wasDecided = m_timing != TimingMode::Pending;
+    m_timing = mode;
+    if (changed && wasDecided) {
+        // The two put different terms in the delay model, so offsets measured
+        // under one do not continue under the other.
+        discardTiming("timing changed");
+    }
+    if (changed) {
+        m_capture.reset();
+        m_captureTrusted = true;
+        LOG_INFO(m_cfg.name.c_str(), "timing samples by %s: %s",
+                 mode == TimingMode::Capture ? "the receiver's capture times" : "their arrival here",
+                 why.c_str());
+    }
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_snap.timingMode = timingName(static_cast<int>(mode));
+    m_snap.timingWhy = why;
+    if (mode != TimingMode::Capture) {
+        m_snap.capturePaused = false;
+        m_snap.capturePausedWhy.clear();
+    }
+    updateDelayModel();
+}
+
+void Source::onServerClockId(const std::string& clockId) {
+    if (!m_cfg.captureTiming) {
+        setTiming(TimingMode::Arrival, "capture timing is off in the configuration");
+    } else if (clockId.empty()) {
+        setTiming(TimingMode::Arrival, "the receiver did not say which clock its timestamps are on");
+    } else if (hostClockId().empty()) {
+        setTiming(TimingMode::Arrival, "this host has no boot id to compare clocks by");
+    } else if (clockId != hostClockId()) {
+        setTiming(TimingMode::Arrival, "the receiver is on another host, so its timestamps are on another clock");
+    } else {
+        setTiming(TimingMode::Capture, "the receiver is on this host and stamps capture times on its clock");
+    }
+}
+
+bool Source::timeBlock(std::uint64_t stampNanos, int rate, double arrivalSec, double dmrSec) {
+    switch (m_timing) {
+    case TimingMode::Arrival:
+        return true;
+    case TimingMode::Pending: {
+        // Untimed until the receiver says; a receiver that never does is timed
+        // by arrival, which needs nothing from it.
+        const double now = monotonicNow();
+        if (m_timingPendingSince <= 0.0) {
+            m_timingPendingSince = now;
+        } else if (now - m_timingPendingSince > kTimingPendingSec) {
+            setTiming(TimingMode::Arrival, "the receiver has not said which clock its timestamps are on");
+        }
+        return false;
+    }
+    case TimingMode::Capture:
+        break;
+    }
+
+    m_slew.sample(arrivalSec, dmrSec);
+    std::string why;
+    const bool trusted = m_slew.steady(arrivalSec, &why);
+    if (trusted != m_captureTrusted) {
+        m_captureTrusted = trusted;
+        if (trusted) LOG_INFO(m_cfg.name.c_str(), "capture times trusted again");
+        else LOG_WARN(m_cfg.name.c_str(), "capture times not trusted: %s", why.c_str());
+    }
+
+    // The capture instant on the daemon clock: the stamp is on the host clock,
+    // and so is dmrSec's other half, read as this packet arrived. Only the
+    // capture-to-arrival interval is ever taken on the host clock.
+    double capture = 0.0, lag = 0.0;
+    bool usable = trusted && stampNanos != 0 && rate > 0;
+    if (usable) {
+        capture = static_cast<double>(stampNanos / 1000000000ULL) +
+                  static_cast<double>(stampNanos % 1000000000ULL) * 1e-9 + dmrSec;
+        lag = arrivalSec - capture;
+        // Captured after it arrived, or a second before: not this packet's
+        // capture time on this clock (a step of the host clock in between).
+        usable = lag > 0.0 && lag < kMaxCaptureLagSec;
+    }
+    if (usable) m_capture.observe(m_samplesWritten, capture);
+
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_snap.capturePaused = !trusted;
+    m_snap.capturePausedWhy = trusted ? std::string() : why;
+    m_snap.hostSlewPpm = m_slew.deviationPpm();
+    if (usable) m_snap.captureLagSec = lag;
+    else ++m_snap.captureUntimed;
+    return false;   // the arrival fit is not used for this source
+}
+
+bool Source::hostTimeAt(std::int64_t sample, double& hostSec) const {
+    return m_timing == TimingMode::Capture ? m_capture.hostTimeAt(sample, hostSec)
+                                           : m_clock.hostTimeAt(sample, hostSec);
+}
+
 void Source::discardTiming(const char* why) {
     // The decoder's own sample indices stay consistent with each other, so its
     // lock survives; what cannot be trusted is their mapping to host time, and
     // the UTC anchor that was composed through it.
     m_clock.reset();
+    m_capture.reset();
     std::lock_guard<std::mutex> lk(m_mu);
     m_haveAnchor = false;
     m_offsets.clear();
@@ -1309,6 +1508,7 @@ bool Source::ensureDecoder(int rate) {
         m_samplesWritten = 0;
         m_tsHave = false;
         m_clock.reset();
+        m_capture.reset();
         // Everything the old decoder left behind goes with it. A source that
         // was locked at 12 kHz and is now fed an unusable rate would otherwise
         // go on reporting "locked" and a current offset while nothing is being
@@ -1343,6 +1543,8 @@ bool Source::ensureDecoder(int rate) {
     m_tsHave = false;
     m_clock.setSampleRate(rate);
     m_clock.reset();
+    m_capture.setSampleRate(rate);
+    m_capture.reset();
     {
         std::lock_guard<std::mutex> lk(m_mu);
         m_haveAnchor = false;
@@ -1528,15 +1730,26 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
         m_snap.station = station;
     }
 
-    const ClockFit f = m_clock.fit();
-    m_snap.clockFitValid = f.valid;
-    m_snap.clockResidualSec = f.residualRms;
-    m_snap.clockSpanSec = f.spanSec;
-    m_snap.clockPpm = f.valid && m_decoderRate > 0
-        ? (f.secPerSample * m_decoderRate - 1.0) * 1e6 : 0.0;
-    m_snap.clockSlopeUncSec = f.slopeUncertaintySec;
-    m_snap.clockSlopeHeld = f.slopeHeld;
-    m_snap.lastExcessDelaySec = m_clock.lastExcessDelay();
+    if (m_timing == TimingMode::Capture) {
+        // No fit: each packet times its own samples. See CaptureClock.
+        m_snap.clockFitValid = m_capture.marks() > 0;
+        m_snap.clockResidualSec = 0.0;
+        m_snap.clockSpanSec = m_capture.spanSec();
+        m_snap.clockPpm = 0.0;
+        m_snap.clockSlopeUncSec = 0.0;
+        m_snap.clockSlopeHeld = false;
+        m_snap.lastExcessDelaySec = 0.0;
+    } else {
+        const ClockFit f = m_clock.fit();
+        m_snap.clockFitValid = f.valid;
+        m_snap.clockResidualSec = f.residualRms;
+        m_snap.clockSpanSec = f.spanSec;
+        m_snap.clockPpm = f.valid && m_decoderRate > 0
+            ? (f.secPerSample * m_decoderRate - 1.0) * 1e6 : 0.0;
+        m_snap.clockSlopeUncSec = f.slopeUncertaintySec;
+        m_snap.clockSlopeHeld = f.slopeHeld;
+        m_snap.lastExcessDelaySec = m_clock.lastExcessDelay();
+    }
 
     updateDelayModel();
     recomputeOffset();
@@ -1544,6 +1757,11 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
 
 void Source::resetStream(const char* why) {
     m_clock.reset();
+    m_capture.reset();
+    // Decided afresh for every connection, from what the receiver says.
+    m_timing = TimingMode::Pending;
+    m_timingPendingSince = 0.0;
+    m_captureTrusted = true;
     if (m_pcmv4) m_pcmv4->dec.reset();
     m_samplesWritten = 0;
     m_decoderRate = 0;
@@ -1555,6 +1773,10 @@ void Source::resetStream(const char* why) {
     m_dcf77.reset();
 
     std::lock_guard<std::mutex> lk(m_mu);
+    m_snap.timingMode = "pending";
+    m_snap.timingWhy = "waiting for the receiver to say which clock its timestamps are on";
+    m_snap.capturePaused = false;
+    m_snap.capturePausedWhy.clear();
     m_haveAnchor = false;
     m_haveFrame = false;
     m_offsets.clear();
@@ -1632,7 +1854,7 @@ void Source::onClockTime(const clockdec::ClockTimeInfo& t) {
     // formed from the anchor yet either -- so the anchor waits for the next
     // minute rather than going in unchecked.
     double edgeHostSec = 0.0;
-    if (!m_clock.hostTimeAt(t.lastEdgeSample, edgeHostSec)) return;
+    if (!hostTimeAt(t.lastEdgeSample, edgeHostSec)) return;
 
     // Composed exactly as the reference front end does: the voted frame's
     // second 0, plus whole seconds to the edge this timestamp is anchored to.
@@ -1761,7 +1983,7 @@ void Source::onClockSecond(const clockdec::ClockSecondInfo& i) {
     // When the sample carrying this edge was observed here, on the daemon clock
     // the fit is taken on and the offset is measured against.
     double hostSec = 0.0;
-    if (!m_clock.hostTimeAt(i.edgeSample, hostSec)) return;
+    if (!hostTimeAt(i.edgeSample, hostSec)) return;
 
     std::lock_guard<std::mutex> lk(m_mu);
     if (!m_haveAnchor) return;
@@ -1989,7 +2211,11 @@ void Source::updateDelayModel() {
     // rule by the back door. It does not get a vote.
     const double rttMs = m_snap.wsRttMs > 0.0 ? m_snap.wsRttMs : m_snap.httpRttMs;
     m_snap.rttFromWs = m_snap.wsRttMs > 0.0;
-    const double net = rttMs > 0.0 ? (rttMs / 1000.0) * 0.5 : 0.0;
+    // With capture timing the samples are timed at the antenna end, so the
+    // network is not in the path at all; the round trip is still measured and
+    // shown, it just is not charged.
+    const bool capture = m_snap.timingMode == "capture";
+    const double net = capture ? 0.0 : rttMs > 0.0 ? (rttMs / 1000.0) * 0.5 : 0.0;
 
     // The decoder's own edge bias, by which decoder is running -- chosen from
     // the dial exactly as ensureDecoder chooses it. Negative: an edge reported
@@ -2006,9 +2232,9 @@ void Source::updateDelayModel() {
     // The same for an IQ session as a USB one: radiod's channel filter is a
     // linear-phase sinc whose delay is set by the block and overlap, not the
     // passband, so the iq and usb presets are delayed alike.
-    m_snap.chainSec = kUberSdrChainDelaySec;
+    m_snap.chainSec = capture ? kCaptureChainDelaySec : kUberSdrChainDelaySec;
     m_snap.extraSec = m_cfg.extraDelayMs / 1000.0;
-    m_snap.delaySec = prop + net + decoder + kUberSdrChainDelaySec + m_snap.extraSec;
+    m_snap.delaySec = prop + net + decoder + m_snap.chainSec + m_snap.extraSec;
 }
 
 // ---------------------------------------------------------------------------

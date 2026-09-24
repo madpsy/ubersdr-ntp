@@ -516,10 +516,25 @@ std::string renderStatusBlock(const StatusInput& in) {
             }
             o << '\n';
         }
+        const bool captureTimed = s.timingMode == "capture";
+        if (captureTimed) {
+            o << "    timing: the receiver's capture times (" << s.timingWhy << ")";
+            if (s.capturePaused) {
+                o << "; paused: " << s.capturePausedWhy;
+            } else {
+                o << "; captured " << f2(s.captureLagSec * 1000.0, 2) << " ms before it arrived here";
+            }
+            if (s.captureUntimed > 0) o << "; " << s.captureUntimed << " packets untimed";
+            o << '\n';
+        } else if (s.timingMode == "arrival") {
+            o << "    timing: arrival here (" << s.timingWhy << ")\n";
+        } else {
+            o << "    timing: waiting for the receiver to say which clock its timestamps are on\n";
+        }
         o << "    delay:  " << f2(s.delaySec * 1000.0, 1) << " ms total = "
           << f2(s.propagationSec * 1000.0, 1) << " propagation + "
-          << f2(s.networkSec * 1000.0, 1) << " network + "
-          << f2(s.chainSec * 1000.0, 1) << " UberSDR chain + "
+          << f2(s.networkSec * 1000.0, 1) << (captureTimed ? " network (not in the path) + " : " network + ")
+          << f2(s.chainSec * 1000.0, 1) << (captureTimed ? " RX888 capture + " : " UberSDR chain + ")
           << f2(s.decoderSec * 1000.0, 1) << " decoder bias + "
           << f2(s.extraSec * 1000.0, 1) << " configured\n";
         o << "            " << s.pathDescription << '\n';
@@ -805,6 +820,23 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     d["chain_ms"] = s.chainSec * 1000.0;
     d["decoder_bias_ms"] = s.decoderSec * 1000.0;
     d["configured_ms"] = s.extraSec * 1000.0;
+    // How the samples were put on the daemon clock; see CaptureClock.
+    // "network_ms" and "chain_ms" above read accordingly: with capture timing
+    // the network is not in the path and the chain is the RX888's own. Radio
+    // sources only: an NTP peer has no samples to time.
+    if (s.kind == SourceKind::Radio) {
+        json ct;
+        ct["mode"] = s.timingMode;
+        ct["why"] = s.timingWhy;
+        if (s.timingMode == "capture") {
+            ct["paused"] = s.capturePaused;
+            if (s.capturePaused) ct["paused_why"] = s.capturePausedWhy;
+            ct["capture_to_arrival_ms"] = s.captureLagSec * 1000.0;
+            if (std::isfinite(s.hostSlewPpm)) ct["host_clock_slew_ppm"] = s.hostSlewPpm;
+            ct["untimed_packets"] = s.captureUntimed;
+        }
+        d["timing"] = std::move(ct);
+    }
     d["path"] = s.pathDescription;
     if (s.receiverLocation.valid) {
         d["receiver_lat"] = s.receiverLocation.lat;

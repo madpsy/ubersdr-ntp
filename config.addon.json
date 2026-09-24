@@ -305,6 +305,15 @@
     // Check an https:// receiver's certificate.
     // "verify_tls": true,
 
+    // For a receiver on THIS host, time the samples by when the SDR captured
+    // them -- UberSDR stamps every packet with that, from radiod -- instead of
+    // by when they arrived here. That takes radiod, the server, the WebSocket
+    // and the network out of the delay model altogether. It switches itself on
+    // only for a receiver that proves it shares this host's clock (the two
+    // compare kernel boot ids), so a remote receiver is always timed by
+    // arrival whatever this says. false times every receiver by arrival.
+    // "capture_timing": true,
+
     // Work out the delay from the receiver and decoder, which is right
     // for every UberSDR receiver. false uses "delay_ms" verbatim instead.
     // "auto_delay": true
@@ -332,8 +341,9 @@
     //
     //   "extra_delay_ms"  anything the delay model cannot see, added on top of
     //                     it (default 0). The receiver's own delay (radiod to
-    //                     the WebSocket) is the same on every UberSDR instance
-    //                     and already built in, as is the decoder's edge bias.
+    //                     the WebSocket) is measured on this host and the same
+    //                     on every UberSDR instance elsewhere, so either way it
+    //                     is already in, as is the decoder's edge bias.
     //                     Positive or negative. Positive says the signal took
     //                     LONGER to arrive than the model thinks, which moves
     //                     the time this source gives forward; negative moves
@@ -351,7 +361,8 @@
     //                     weighted down rather than removed.
     //   "enabled"         false keeps the entry but does not connect it.
     //
-    //   and "min_margin", "verify_tls", "auto_delay" as under "defaults".
+    //   and "min_margin", "verify_tls", "auto_delay", "capture_timing" as
+    //   under "defaults".
 
     // >>> station
     // install.sh replaces everything from here to "<<< station" on a first

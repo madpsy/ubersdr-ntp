@@ -83,6 +83,7 @@ bool getSource(const json& j, SourceConfig& s, std::string& err) {
     if (!getOpt(j, "extra_delay_ms", s.extraDelayMs, err)) return false;
     if (!getOpt(j, "weight", s.weight, err)) return false;
     if (!getOpt(j, "verify_tls", s.verifyTls, err)) return false;
+    if (!getOpt(j, "capture_timing", s.captureTiming, err)) return false;
     if (auto it = j.find("min_margin"); it != j.end() && !it->is_null()) {
         if (!it->is_number()) { err = "field \"min_margin\" must be a number of dB"; return false; }
         const double m = it->get<double>();

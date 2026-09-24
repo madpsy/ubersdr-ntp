@@ -85,6 +85,10 @@ td:last-child, th:last-child { padding-right:0; }
          grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); }
 .chain .gap { text-align:center; }
 .chain .figure.big { font-size:30px; margin-top:4px; }
+.suggest { margin-top:10px; text-align:left; font-size:12px; }
+.suggest .label { margin-bottom:4px; }
+.suggest table { font-size:12px; }
+.suggest td { padding:3px 8px 3px 0; }
 .reachbits { font:12px/1 var(--mono); letter-spacing:2px; color:var(--muted); }
 .warnfig { color:var(--warn); }
 .badfig  { color:var(--bad); }
@@ -287,6 +291,7 @@ tr.fresh td { animation:fresh 4s ease-out; }
         <div class="figure big" id="classdelta">—</div>
         <div class="note" id="classdeltanote">&nbsp;</div>
         <div class="chart mini" id="ch-delta" data-height="90"></div>
+        <div class="suggest" id="suggest" hidden></div>
       </div>
       <div class="side" id="sside">
         <div class="sidehead"><span class="pill" id="spill">secondary</span>
@@ -304,7 +309,7 @@ tr.fresh td { animation:fresh 4s ease-out; }
     <div class="scroll"><table><thead><tr>
       <th>Source</th><th>Link</th><th>Station</th><th>Stage</th>
       <th class="n">Tick</th><th>Vote</th><th class="n">Qual</th>
-      <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">n</th>
+      <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">Jitter</th><th class="n">n</th>
     </tr></thead><tbody id="rows"></tbody></table></div>
     <div class="trends">
       <div><div class="trendhead"><span class="label">Offset</span>
@@ -313,6 +318,9 @@ tr.fresh td { animation:fresh 4s ease-out; }
       <div><div class="trendhead"><span class="label">Agreement</span>
         <span class="note">against the radio median</span></div>
         <div class="chart" id="ch-radio-resid" data-height="150"></div></div>
+      <div><div class="trendhead"><span class="label">Jitter</span>
+        <span class="note">spread of its own measurements</span></div>
+        <div class="chart" id="ch-radio-jitter" data-height="150"></div></div>
       <div><div class="trendhead"><span class="label">Tick SNR</span>
         <span class="note">while the tick is heard</span></div>
         <div class="chart" id="ch-radio-snr" data-height="150"></div></div>
@@ -327,12 +335,15 @@ tr.fresh td { animation:fresh 4s ease-out; }
     <div class="scroll"><table><thead><tr>
       <th>Source</th><th>State</th><th class="n">St</th><th>Refid</th>
       <th class="n">Reach</th><th class="n">Poll</th><th class="n">Delay</th>
-      <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">n</th>
+      <th class="n">Offset</th><th class="n">&plusmn;</th><th class="n">Jitter</th><th class="n">n</th>
     </tr></thead><tbody id="ntprows"></tbody></table></div>
     <div class="trends">
       <div><div class="trendhead"><span class="label">Offset</span>
         <span class="note">correction to this host</span></div>
         <div class="chart" id="ch-ntp-offset" data-height="150"></div></div>
+      <div><div class="trendhead"><span class="label">Jitter</span>
+        <span class="note">spread of its own measurements</span></div>
+        <div class="chart" id="ch-ntp-jitter" data-height="150"></div></div>
       <div><div class="trendhead"><span class="label">Round trip</span>
         <span class="note">of the sample each filter chose</span></div>
         <div class="chart" id="ch-ntp-delay" data-height="150"></div></div>
@@ -387,6 +398,11 @@ const esc = (s) => String(s == null ? "" : s)
 // Two decimals by default: ten microseconds, which DCF77's phase modulation
 // resolves and a single decimal threw away.
 const ms = (v, p = 2) => (v == null || !isFinite(v)) ? "—" : v.toFixed(p) + " ms";
+// Jitter, given in ms, shown in µs below a millisecond: a capture-timed DCF77
+// source scatters by about a microsecond, which two decimals of ms would round
+// to nothing.
+const jit = (v) => (v == null || !isFinite(v)) ? "—"
+  : v < 1 ? (v * 1000).toFixed(v < 0.01 ? 2 : 1) + " µs" : ms(v);
 // A sign always: "34 ms slow" and "34 ms fast" are opposite faults, and the
 // sign is the half that says which. A true minus, because these sit in a
 // column and a hyphen does not line up.
@@ -833,6 +849,7 @@ setInterval(paintCountdowns, 250);
 // them agree by construction and destroy the only independent check here.
 function renderClasses(d, k, radio, peers) {
   const card = $("classcard");
+  classPrimary = k.primary;
   // Nothing to compare with only one class configured.
   if (!k.primary || !radio.length || !peers.length) { card.hidden = true; return; }
   card.hidden = false;
@@ -895,7 +912,90 @@ function renderClasses(d, k, radio, peers) {
   }
 }
 
+// A suggested extra_delay_ms per radio source, from the day of history.
+//
+// The difference above is the delay model's error, but read off a
+// five-minute average it is the wrong thing to act on. So this uses the half-hour
+// buckets only -- each source's mean against the secondary class's mean over
+// the same bucket -- and takes the median of those, which a bucket spoiled by
+// a relock cannot move. The first half hour after the daemon started is left
+// out (the sample-clock fit and the estimators are still settling), as is any
+// bucket the source was missing from for more than a few minutes. Nothing is
+// suggested until an hour of such buckets exists. Per source rather than per
+// class: a slow host adds processing delay to every source it runs, but two
+// receivers of the same class can still differ.
+//
+// Offsets are the correction to add to this host's clock, and the configured
+// extra delay is added to the source's offset one for one, so the value that
+// would have made a source agree with the secondary is its configured extra
+// delay minus its difference from it.
+const kSuggestSettleSec = 1800, kSuggestMinBuckets = 2, kSuggestMinFill = 0.8;
+let sugTimer = 0, upStartUnix = null, classPrimary = null, srcConfigured = {}, ntpRoundTrips = [];
+
+function suggestFrom(d) {
+  const width = d.bucket_seconds, byId = {};
+  for (const s of d.series) byId[s.id] = s;
+  const sec = byId["class.secondary_ms"];
+  // Against NTP only: with the radio as the secondary it would be
+  // measuring the radio against itself.
+  if (!sec || upStartUnix == null || classPrimary !== "radio") return null;
+  const secAt = new Map(sec.points.filter((p) => p[4] >= width * kSuggestMinFill).map((p) => [p[0], p[1]]));
+  const out = [];
+  for (const s of d.series) {
+    if (s.group !== "radio" || !s.source || s.id !== "source." + s.source + ".offset_ms") continue;
+    const diffs = [];
+    for (const p of s.points) {
+      if (p[0] + width > d.now || p[0] < upStartUnix + kSuggestSettleSec) continue;
+      if (p[4] < width * kSuggestMinFill || !secAt.has(p[0])) continue;
+      diffs.push(p[1] - secAt.get(p[0]));
+    }
+    out.push({ name: s.source, diffs, configured: srcConfigured[s.source] });
+  }
+  return out;
+}
+
+function renderSuggest(list) {
+  const el = $("suggest");
+  if (!list || !list.length) { el.hidden = true; return; }
+  el.hidden = false;
+  const rows = list.map((x) => {
+    if (x.diffs.length < kSuggestMinBuckets) {
+      return "<tr><td class=\"name\">" + esc(x.name) + "</td><td class=\"note\" colspan=\"2\">needs " +
+        (kSuggestMinBuckets - x.diffs.length) * 30 + " more settled min</td></tr>";
+    }
+    const med = median(x.diffs);
+    const spread = Math.max(...x.diffs) - Math.min(...x.diffs);
+    const cfg = x.configured == null ? null : x.configured;
+    const val = cfg == null ? null : cfg - med;
+    const fine = Math.abs(med) < 0.2;
+    const title = x.diffs.length + " half-hour buckets, " + x.name + " minus secondary: median " +
+      signed(med) + ", spread " + ms(spread) + (cfg == null ? "" : "; configured now " + ms(cfg));
+    return '<tr title="' + esc(title) + '"><td class="name">' + esc(x.name) + '</td><td class="n">' +
+      (val == null ? "—" : (fine ? "keep " + cfg.toFixed(1) : (val >= 0 ? "+" : "−") + Math.abs(val).toFixed(1))) +
+      '</td><td class="note">' + (x.diffs.length / 2).toFixed(1) + " h" +
+      (spread > 1 ? ", <span class=\"warnfig\">unsteady ±" + (spread / 2).toFixed(1) + "</span>" : "") +
+      "</td></tr>";
+  }).join("");
+  const rt = ntpRoundTrips.length ? Math.min(...ntpRoundTrips) : null;
+  el.innerHTML = '<div class="label">Suggested extra_delay_ms</div>' +
+    "<table><tbody>" + rows + "</tbody></table>" +
+    '<div class="note">Median of half-hour means against the secondary, first 30 min after start left out. ' +
+    "Only as good as the NTP servers" +
+    (rt != null && rt > 2 ? ' — <span class="warnfig">nearest is ' + ms(rt) + " round trip, so ±" +
+      ms(rt / 2) + " at worst</span>" : "") +
+    ". Not applied: put it in the source's config and restart.</div>";
+}
+
+async function fetchSuggest() {
+  if (document.hidden) return;
+  try {
+    const r = await fetch("api/metrics?range=day", { cache: "no-store" });
+    renderSuggest(suggestFrom(await r.json()));
+  } catch (x) {}
+}
+
 function onTick(d) {
+  upStartUnix = d.unix - d.uptime_seconds;
   tickUnix = d.unix; tickAt = performance.now();
   srvOffsetMs = d.clock_offset_ms; srvAt = tickAt; srvRatePpm = d.clock_rate_ppm || 0;
   if (!haveTick) { haveTick = true; requestAnimationFrame(paintClock); }
@@ -1004,6 +1104,7 @@ function onTick(d) {
       '<td class="n">' + (n.delay_ms ? ms(n.delay_ms, 2) : "—") + "</td>" +
       '<td class="n">' + (s.have_offset ? signed(s.offset_ms) : "—") + "</td>" +
       '<td class="n">' + (s.have_offset ? ms(s.dispersion_ms) : "—") + "</td>" +
+      '<td class="n">' + (s.have_offset ? jit(s.jitter_ms) : "—") + "</td>" +
       '<td class="n">' + s.samples + "</td></tr>";
   }).join("");
 
@@ -1035,6 +1136,7 @@ function onTick(d) {
       '<td class="n">' + (s.last_quality ? s.last_quality + "%" : "—") + "</td>" +
       '<td class="n">' + (s.have_offset ? signed(s.offset_ms) : "—") + "</td>" +
       '<td class="n">' + (s.have_offset ? ms(s.dispersion_ms) : "—") + "</td>" +
+      '<td class="n">' + (s.have_offset ? jit(s.jitter_ms) : "—") + "</td>" +
       '<td class="n">' + s.samples + "</td></tr>";
   }).join("");
 }
@@ -1088,7 +1190,7 @@ function peerRows(x) {
         "and which sets the floor under the dispersion below</span>"
       : "—"],
     ["Offset", t.have_offset
-      ? signed(t.offset_ms) + " ± " + ms(t.dispersion_ms) + " — jitter " + ms(t.jitter_ms) +
+      ? signed(t.offset_ms) + " ± " + ms(t.dispersion_ms) + " — jitter " + jit(t.jitter_ms) +
         ", " + t.samples + " samples, newest " + dur(t.age_seconds) + " old" +
         '<br><span class="note">worth ' + ms(t.weight_dispersion_ms) +
         " against the other sources: the round trip and its scatter, without the " +
@@ -1115,6 +1217,14 @@ function peerRows(x) {
 }
 
 function onStatus(d) {
+  const firstStatus = !Object.keys(srcConfigured).length;
+  srcConfigured = {};
+  ntpRoundTrips = [];
+  for (const x of d.sources) {
+    if (x.kind !== "ntp" && x.delay) srcConfigured[x.name] = x.delay.configured_ms;
+    if (x.kind === "ntp" && x.ntp && x.ntp.delay_ms > 0) ntpRoundTrips.push(x.ntp.delay_ms);
+  }
+  if (firstStatus) { fetchSuggest(); clearInterval(sugTimer); sugTimer = setInterval(fetchSuggest, 300000); }
   $("detail").innerHTML = d.sources.map((x) => {
     if (x.kind === "ntp") {
       return '<div class="card"><div class="label">' + esc(x.name) +
@@ -1125,6 +1235,10 @@ function onStatus(d) {
     }
     const dec = x.decoder, t = x.timing, dl = x.delay, sc = x.sample_clock,
           l = x.link, a = x.audio;
+    // How this source's samples are put on the daemon clock: the receiver's
+    // capture times (a receiver on this host) or their arrival here.
+    const tm = dl.timing || { mode: "pending" };
+    const captureTimed = tm.mode === "capture";
     const rows = [
       ["In use", x.in_use ? "yes"
         : "no — " + esc(x.not_used_reason || "not yet considered")],
@@ -1169,15 +1283,21 @@ function onStatus(d) {
           : "")],
       ["Offset", t.have_offset
         ? signed(t.offset_ms) + " ± " + ms(t.dispersion_ms) + " — raw " + signed(t.raw_offset_ms) +
-          ", jitter " + ms(t.jitter_ms) + ", " + t.samples + " samples, newest " +
+          ", jitter " + jit(t.jitter_ms) + ", " + t.samples + " samples, newest " +
           dur(t.age_seconds) + " old"
         : "none yet"],
+      ["Timing", timingText(tm)],
       ["Delay model", ms(dl.total_ms) + " total = " + ms(dl.propagation_ms) + " propagation + " +
-        ms(dl.network_ms) + " network + " +
-        ms(dl.chain_ms) + " UberSDR chain " + signed(dl.decoder_bias_ms) + " decoder bias + " +
+        ms(dl.network_ms) + (captureTimed ? " network (not in the path) + " : " network + ") +
+        ms(dl.chain_ms) + (captureTimed ? " RX888 capture " : " UberSDR chain ") +
+        signed(dl.decoder_bias_ms) + " decoder bias + " +
         ms(dl.configured_ms) + " configured<br>" +
         '<span class="note">' + esc(dl.path) + "</span>"],
-      ["Sample clock", sc.fitted
+      ["Sample clock", captureTimed
+        ? (sc.fitted
+            ? "each packet times its own samples, no fit; capture marks cover " + dur(sc.span_seconds)
+            : "no capture marks yet")
+        : sc.fitted
         ? "fit over " + dur(sc.span_seconds) + ", residual " + ms(sc.residual_ms, 2) +
           ", receiver runs " + sc.ppm.toFixed(1) + " ppm against ours, last packet " +
           ms(sc.last_excess_delay_ms) + " late"
@@ -1189,6 +1309,32 @@ function onStatus(d) {
       rows.map((r) => "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td></tr>").join("") +
       "</tbody></table></div></div>";
   }).join("");
+}
+
+// The Timing row: which clock a radio source's samples are timed on, and, with
+// capture timing, whether it is being trusted right now. See CaptureClock in
+// SampleClock.h and "Capture timing" in the README.
+function timingText(tm) {
+  if (tm.mode === "capture") {
+    let t = "the receiver's capture times — " + esc(tm.why || "");
+    if (tm.paused) {
+      t += '<br><b class="warnfig">paused: ' + esc(tm.paused_why || "") + "</b>";
+    } else {
+      t += '<br><span class="note">captured ' + ms(tm.capture_to_arrival_ms, 2) +
+        " before it arrived here";
+      if (tm.host_clock_slew_ppm != null) {
+        t += ", host clock " + tm.host_clock_slew_ppm.toFixed(1) + " ppm off its usual rate";
+      }
+      t += "</span>";
+    }
+    if (tm.untimed_packets) {
+      t += '<br><span class="note">' + tm.untimed_packets.toLocaleString() +
+        " packets untimed (no capture time, or not trusted at the time)</span>";
+    }
+    return t;
+  }
+  if (tm.mode === "arrival") return "arrival here — " + esc(tm.why || "");
+  return "waiting for the receiver to say which clock its timestamps are on";
 }
 
 // ---------------------------------------------------------------------------
@@ -1658,6 +1804,8 @@ function renderMetrics() {
   chart("ch-radio-offset", { unit: "ms", signed: true, legend: true, title: "Radio offset" }).update(perSource("radio", "offset_ms"));
   chart("ch-radio-resid", { unit: "ms", signed: true, legend: true, title: "Radio agreement" })
     .update(Object.assign(perSource("radio", "residual_ms"), { emptyText: "needs two receivers locked" }));
+  chart("ch-radio-jitter", { unit: "µs", floorZero: true, legend: true, title: "Radio jitter", minSpan: 2 })
+    .update(perSource("radio", "jitter_us"));
   chart("ch-radio-snr", { unit: "dB", legend: true, title: "Tick SNR", minSpan: 2 }).update(perSource("radio", "snr_db"));
   // Refused decoded times: how many in each bucket, which is what says whether
   // it is a rarity or a habit. How far out they were -- minutes, hours -- is
@@ -1671,6 +1819,8 @@ function renderMetrics() {
     tipText: (p) => p[5] === p[6] ? "off by " + jumpText(p[5]) : "off by " + jumpText(p[5]) + " to " + jumpText(p[6]),
   }).update(Object.assign(rejected, { emptyText: "none refused in this window" }));
   chart("ch-ntp-offset", { unit: "ms", signed: true, legend: true, title: "NTP offset" }).update(perSource("ntp", "offset_ms"));
+  chart("ch-ntp-jitter", { unit: "µs", floorZero: true, legend: true, title: "NTP jitter", minSpan: 20 })
+    .update(perSource("ntp", "jitter_us"));
   chart("ch-ntp-delay", { unit: "ms", floorZero: true, legend: true, title: "NTP round trip" }).update(perSource("ntp", "delay_ms"));
 }
 

@@ -481,10 +481,6 @@ void NtpServer::serve(int fd, const std::string& label) {
         put32(out + 32, rec.sec);
         put32(out + 36, rec.frac);
 
-        const NtpTime xmt = toNtpTime(c.utcAt(daemonNow()));
-        put32(out + 40, xmt.sec);
-        put32(out + 44, xmt.frac);
-
         // Sent from the address the request arrived on (see start()).
         struct iovec oiov{out, sizeof out};
         alignas(struct cmsghdr) char ocontrol[CMSG_SPACE(sizeof(struct in6_pktinfo))] = {};
@@ -516,6 +512,13 @@ void NtpServer::serve(int fd, const std::string& label) {
             // The interface too: a link-local address means nothing without it.
             std::memcpy(CMSG_DATA(cm), &dst6, sizeof dst6);
         }
+        // Transmit, as late as it can be read: after everything above, so the
+        // reply's own assembly is inside the server's hold time (T3 - T2)
+        // rather than counted as path. The kernel's send path after this is
+        // microseconds and symmetric with the receive stamp's.
+        const NtpTime xmt = toNtpTime(c.utcAt(daemonNow()));
+        put32(out + 40, xmt.sec);
+        put32(out + 44, xmt.frac);
         const ssize_t sent = ::sendmsg(fd, &omh, 0);
         std::lock_guard<std::mutex> lk(m_mu);
         if (sent < 0) {

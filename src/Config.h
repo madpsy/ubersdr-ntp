@@ -80,6 +80,11 @@ struct SourceConfig {
     double delayMs = 0.0;        // explicit total; used verbatim when autoDelay is false
     double extraDelayMs = 0.0;   // added on top of the auto estimate
 
+    // Time samples by the receiver's capture stamps when it is on this host
+    // (see CaptureClock in SampleClock.h). Only ever used for a receiver that
+    // proves it shares this host's clock; false keeps the arrival fit even then.
+    bool captureTiming = true;
+
     // UberSDR's reduced-depth IQ, as a margin in dB: how far under the band's
     // own noise floor the quantisation noise must stay (ka9q_ubersdr
     // pcm_lossy.go). 0 is the lossless stream; otherwise 15-60, whole dB. The

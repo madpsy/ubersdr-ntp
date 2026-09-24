@@ -244,9 +244,22 @@ struct SourceSnapshot {
     double propagationSec = 0.0;
     double networkSec = 0.0;
     double decoderSec = 0.0;   // the running decoder's edge bias (negative: early)
-    double chainSec = 0.0;     // UberSDR's fixed RF-to-WebSocket delay
+    double chainSec = 0.0;     // UberSDR's fixed RF-to-WebSocket delay, or with capture
+                               // timing the RX888's own transfer latency
     double extraSec = 0.0;
     std::string pathDescription;
+
+    // How sample indices are put on the daemon clock: "capture" (the
+    // receiver's capture stamps, for a receiver on this host -- CaptureClock),
+    // "arrival" (the arrival fit -- SampleClock), or "pending" until the
+    // receiver has said which clock its stamps are on.
+    std::string timingMode = "pending";
+    std::string timingWhy;           // why that mode
+    bool capturePaused = false;      // capture timing, but its stamps not trusted just now
+    std::string capturePausedWhy;
+    double captureLagSec = 0.0;      // capture to arrival here, latest timed packet
+    double hostSlewPpm = 0.0;        // host clock's rate off its usual, NaN while unknown
+    std::uint64_t captureUntimed = 0;  // packets that carried no usable capture time
 
     // sample clock
     bool clockFitValid = false;

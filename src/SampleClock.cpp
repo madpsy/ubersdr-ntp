@@ -2,7 +2,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <ctime>
+#include <iterator>
+#include <vector>
 
 namespace ubersdr_ntp {
 
@@ -229,5 +232,141 @@ double SampleClock::lastExcessDelay() const {
     std::lock_guard<std::mutex> lk(m_mu);
     return m_lastExcess;
 }
+
+// ---------------------------------------------------------------------------
+// CaptureClock
+
+CaptureClock::CaptureClock(int sampleRate) : m_rate(sampleRate) {}
+
+void CaptureClock::setSampleRate(int rate) {
+    std::lock_guard<std::mutex> lk(m_mu);
+    if (rate != m_rate) m_marks.clear();
+    m_rate = rate;
+}
+
+void CaptureClock::reset() {
+    std::lock_guard<std::mutex> lk(m_mu);
+    m_marks.clear();
+}
+
+void CaptureClock::observe(std::int64_t firstSample, double captureSec) {
+    std::lock_guard<std::mutex> lk(m_mu);
+    if (!m_marks.empty() && firstSample <= m_marks.back().sample) m_marks.clear();
+    m_marks.push_back({firstSample, captureSec});
+    if (m_rate <= 0) return;
+    const std::int64_t keep = static_cast<std::int64_t>(kHistorySec * m_rate);
+    while (m_marks.size() > 1 && firstSample - m_marks.front().sample > keep) m_marks.pop_front();
+}
+
+bool CaptureClock::hostTimeAt(std::int64_t sample, double& hostSec) const {
+    std::lock_guard<std::mutex> lk(m_mu);
+    if (m_marks.empty() || m_rate <= 0) return false;
+
+    // The marks are in sample order: the nearest is at the lower bound or just
+    // before it.
+    auto it = std::lower_bound(m_marks.begin(), m_marks.end(), sample,
+                               [](const Mark& m, std::int64_t s) { return m.sample < s; });
+    const Mark* best = nullptr;
+    if (it != m_marks.end()) best = &*it;
+    if (it != m_marks.begin()) {
+        const Mark& prev = *std::prev(it);
+        if (!best || sample - prev.sample <= best->sample - sample) best = &prev;
+    }
+    const double dist = static_cast<double>(sample - best->sample) / m_rate;
+    if (std::fabs(dist) > kMaxExtrapolateSec) return false;
+    // At the stream's nominal rate: radiod's clock is the GPSDO, and over the
+    // fraction of a second to the nearest mark the daemon crystal's tens of ppm
+    // are nanoseconds.
+    hostSec = best->sec + dist;
+    return true;
+}
+
+std::size_t CaptureClock::marks() const {
+    std::lock_guard<std::mutex> lk(m_mu);
+    return m_marks.size();
+}
+
+double CaptureClock::spanSec() const {
+    std::lock_guard<std::mutex> lk(m_mu);
+    if (m_marks.size() < 2 || m_rate <= 0) return 0.0;
+    return static_cast<double>(m_marks.back().sample - m_marks.front().sample) / m_rate;
+}
+
+// ---------------------------------------------------------------------------
+// HostSlewGuard
+
+void HostSlewGuard::reset() {
+    m_hist.clear();
+    m_deviationPpm = std::numeric_limits<double>::quiet_NaN();
+    m_calmSince = -1.0;
+}
+
+void HostSlewGuard::sample(double daemonSec, double dmr) {
+    if (!m_hist.empty() && daemonSec - m_hist.back().daemonSec < 1.0) return;
+    m_hist.push_back({daemonSec, dmr});
+    while (m_hist.size() > 2 && daemonSec - m_hist.front().daemonSec > kHistorySec) m_hist.pop_front();
+
+    // d(daemon - realtime)/dt is the crystal's rate less the host clock's. Its
+    // rate over the last kShortSec, from the oldest reading inside that span.
+    auto slopeBetween = [](const Reading& a, const Reading& b) {
+        return (b.dmr - a.dmr) / (b.daemonSec - a.daemonSec);
+    };
+    const Reading& now = m_hist.back();
+    const Reading* from = nullptr;
+    for (const Reading& r : m_hist) {
+        if (daemonSec - r.daemonSec <= kShortSec) { from = &r; break; }
+    }
+    if (!from || now.daemonSec - from->daemonSec < 0.5 * kShortSec) {
+        m_deviationPpm = std::numeric_limits<double>::quiet_NaN();
+        m_calmSince = -1.0;
+        return;
+    }
+    const double shortRate = slopeBetween(*from, now);
+
+    // The usual rate: the median of consecutive kShortSec slopes across the
+    // history, so a spell of slewing inside it does not become the baseline.
+    std::vector<double> slopes;
+    for (std::size_t i = 0; i < m_hist.size();) {
+        std::size_t j = i + 1;
+        while (j < m_hist.size() && m_hist[j].daemonSec - m_hist[i].daemonSec < kShortSec) ++j;
+        if (j >= m_hist.size()) break;
+        slopes.push_back(slopeBetween(m_hist[i], m_hist[j]));
+        i = j;
+    }
+    double deviation;
+    if (slopes.size() >= 5) {
+        std::nth_element(slopes.begin(), slopes.begin() + slopes.size() / 2, slopes.end());
+        deviation = std::fabs(shortRate - slopes[slopes.size() / 2]) * 1e6;
+    } else {
+        // Too little history for a baseline: allow a crystal's worth of rate.
+        deviation = std::max(0.0, std::fabs(shortRate) * 1e6 - kCrystalAllowancePpm);
+    }
+    m_deviationPpm = deviation;
+    if (deviation > kMaxDeviationPpm) m_calmSince = -1.0;
+    else if (m_calmSince < 0.0) m_calmSince = daemonSec;
+}
+
+bool HostSlewGuard::steady(double daemonSec, std::string* why) const {
+    char buf[160];
+    if (std::isnan(m_deviationPpm)) {
+        if (why) *why = "measuring the host clock's rate";
+        return false;
+    }
+    if (m_calmSince < 0.0) {
+        if (why) {
+            std::snprintf(buf, sizeof buf, "host clock being slewed (%.0f ppm off its usual rate)",
+                          m_deviationPpm);
+            *why = buf;
+        }
+        return false;
+    }
+    if (daemonSec - m_calmSince < kExposureSec) {
+        if (why) *why = "host clock only just steady";
+        return false;
+    }
+    return true;
+}
+
+double HostSlewGuard::deviationPpm() const { return m_deviationPpm; }
 
 } // namespace ubersdr_ntp

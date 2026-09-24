@@ -41,7 +41,9 @@
 
 #include <cstdint>
 #include <deque>
+#include <limits>
 #include <mutex>
+#include <string>
 
 namespace ubersdr_ntp {
 
@@ -130,6 +132,126 @@ private:
     std::deque<Point> m_envelope;
     ClockFit m_fit{};
     double m_lastExcess = 0.0;
+};
+
+// Maps a decoder sample index onto the daemon clock from the receiver's own
+// capture times, for a receiver on THIS host.
+//
+// radiod (with the ubersdr-radiod capture-time patch) knows when the RX888
+// captured each sample, and UberSDR stamps every packet with the capture time
+// of its first sample, on the host's CLOCK_REALTIME. For a receiver on the same
+// host that is the clock this daemon can read too, so the capture instant on
+// the daemon clock is
+//
+//     stamp + (daemonNow() - realtimeNow())      read when the packet arrives
+//
+// Only the INTERVAL between capture and arrival is taken on the host clock --
+// tens of milliseconds, over which even a clock being slewed hard moves by
+// microseconds -- and the host clock's absolute reading cancels. That is the
+// distinction that matters: an absolute stamp is only as good as whatever
+// disciplines the receiver's host, which is nothing this daemon may trust, but
+// a difference between two readings of one clock is a measurement. A receiver
+// on another host is on another clock, and gets the arrival fit (SampleClock).
+//
+// What this removes from the delay model is everything between the antenna
+// and here: radiod's block framing and filters, the multicast hop, the server,
+// the WebSocket -- and their jitter, which is why there is no fit. Each packet
+// is an exact statement about its own samples, so a sample is mapped through
+// the packet nearest it, and a step in the stamps (radiod re-anchoring after it
+// lost samples, which makes the samples after it genuinely later) is followed
+// the moment it happens rather than smeared across a regression window.
+class CaptureClock {
+public:
+    explicit CaptureClock(int sampleRate);
+
+    void setSampleRate(int rate);
+    int sampleRate() const { return m_rate; }
+
+    // The block whose FIRST sample is `firstSample` was captured at daemon time
+    // `captureSec`. Samples must arrive in order; one that goes backwards means
+    // a new stream, and the old marks are dropped.
+    void observe(std::int64_t firstSample, double captureSec);
+
+    // Daemon time at which `sample` was captured, from the nearest mark, or
+    // false when there is none within reach (none yet, or the sample is further
+    // than kMaxExtrapolateSec from every mark).
+    bool hostTimeAt(std::int64_t sample, double& hostSec) const;
+
+    void reset();
+    std::size_t marks() const;
+    double spanSec() const;   // how much stream the marks cover
+
+    // Marks are kept this long. The decoders name edges well after they were
+    // heard -- a voted time names an edge up to its frame window back -- so
+    // this is minutes, not seconds.
+    static constexpr double kHistorySec = 900.0;
+    // How far a sample may be from its nearest mark. A packet with no capture
+    // time leaves a gap of a packet or a few; anything much wider is a stream
+    // this clock knows nothing about.
+    static constexpr double kMaxExtrapolateSec = 2.0;
+
+private:
+    struct Mark {
+        std::int64_t sample;
+        double sec;
+    };
+    mutable std::mutex m_mu;
+    int m_rate;
+    std::deque<Mark> m_marks;
+};
+
+// Whether the host clock is running steadily enough, against the daemon clock,
+// for capture times to be trusted.
+//
+// radiod anchors its capture times on the host clock: the floor, over ten
+// seconds, of when each USB transfer landed. When the host clock is slewed --
+// by hundreds of ppm, for a minute at a time, while whatever disciplines it
+// corrects an offset -- that floor lags the clock, and UberSDR extrapolates a
+// capture reference for up to three seconds more before radiod sends another.
+// So a capture time can be wrong by up to about kExposureSec times the slew
+// rate. At the few ppm a disciplined clock normally moves that is microseconds;
+// at 500 ppm it is 6.5 ms. This is what notices the second case.
+//
+// It compares the host clock's rate against the daemon clock over the last
+// kShortSec with its usual rate over the last kHistorySec. The usual rate is
+// NOT zero -- the daemon clock is the raw crystal, tens of ppm off, while the
+// host clock is disciplined -- so the baseline is the median of the history's
+// kShortSec slopes: a minute of heavy slewing is a few of them, and the median
+// does not move. Capture timing is trusted once the difference has stayed under
+// kMaxDeviationPpm for kExposureSec, because a slew that has just ended still
+// sits in radiod's window for that long.
+class HostSlewGuard {
+public:
+    // One reading, as daemonNow() and daemonMinusRealtime(). Readings closer
+    // together than a second are ignored, so this can be fed per packet.
+    void sample(double daemonSec, double daemonMinusRealtimeSec);
+
+    // True when capture times can be trusted at daemonSec. `why`, if given,
+    // says why not.
+    bool steady(double daemonSec, std::string* why = nullptr) const;
+
+    // The host clock's rate over kShortSec less its usual rate, ppm; NaN
+    // until there is enough history to say.
+    double deviationPpm() const;
+
+    void reset();
+
+    static constexpr double kShortSec = 16.0;
+    static constexpr double kHistorySec = 900.0;
+    static constexpr double kMaxDeviationPpm = 20.0;
+    static constexpr double kExposureSec = 13.0;
+    // Before there is history for a baseline, the host clock's rate against
+    // the raw crystal may be anything a crystal can be off by, plus the limit.
+    static constexpr double kCrystalAllowancePpm = 50.0;
+
+private:
+    struct Reading {
+        double daemonSec;
+        double dmr;
+    };
+    std::deque<Reading> m_hist;
+    double m_deviationPpm = std::numeric_limits<double>::quiet_NaN();
+    double m_calmSince = -1.0;   // daemon seconds, -1 while not calm
 };
 
 // The clocks this daemon reads, as doubles. They are not interchangeable.

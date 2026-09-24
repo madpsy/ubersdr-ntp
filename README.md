@@ -442,7 +442,7 @@ audio stream measures:
 | Propagation | 9–45 ms | Computed, from the receiver's published coordinates to whichever transmitter the decoder says it is hearing |
 | Network | 5–100 ms | Measured, as half the round trip of a JSON ping that the receiver itself answers, down the audio connection |
 | UberSDR chain | 9.4 ms | A constant: RF reaching the SDR to audio leaving the WebSocket. Calibrated against the NTP class — see below |
-| Decoder bias | −8.9 ms (WWV/WWVH), 0 (WWVB, DCF77) | WWV: −13.6 ms measured on synthetic signals by `tools/decodertest.cpp`, plus a +4.7 ms WWV-only residual (below). DCF77: `tools/dcf77test.cpp` |
+| Decoder bias | −13.6 ms (WWV/WWVH), 0 (WWVB, DCF77) | WWV: measured on synthetic signals by `tools/decodertest.cpp`; the +4.7 ms WWV-only residual that sat on top of it is withdrawn (below). DCF77: `tools/dcf77test.cpp` |
 | `extra_delay_ms` | 0 | Yours, for anything genuinely local |
 
 The network term is measured over the **WebSocket**, not with an HTTP request,
@@ -474,6 +474,47 @@ as a raw figure, but nothing classifies an instance by how the two compare, and
 the handshake does not get a vote.
 
 The HTTP figure is used only when a server never answers a ping at all.
+
+### Capture timing, for a receiver on this host
+
+Everything above is for a receiver somewhere else. For one on the same host,
+most of it goes away.
+
+radiod (with the `ubersdr-radiod` capture-time patch) works out when the RX888
+captured each sample: its A/D clock is GPSDO-locked, so the capture time is a
+straight line through the sample count, anchored by the floor of when its USB
+transfers land. UberSDR stamps every audio packet with the capture time of its
+first sample, net of radiod's channel filter delay, or with 0 while it has no
+valid reference. The stamp is on the host's `CLOCK_REALTIME`.
+
+For a receiver on this host that is a clock this daemon can read too, so a
+packet's capture instant on the daemon clock is the stamp plus
+`daemon − realtime`, read as the packet arrives. Only the capture-to-arrival
+interval — tens of milliseconds — is taken on the host clock, and the host
+clock's absolute reading cancels. An absolute stamp from a receiver's host
+would be only as good as whatever disciplines that host; a difference between
+two readings of one clock is a measurement. A receiver proves it is on this
+host by sending a hash of the kernel's `boot_id` in its `status` message, which
+every container on a host shares and no other host has. Anything else is timed
+by arrival, as above.
+
+What that removes from the delay model is the network term and the chain
+constant: radiod's framing and processing, the multicast hop, the server and
+the WebSocket are all between the capture and the stamp's arrival, and none of
+it is modelled any more. What is left is propagation, the decoder's edge bias,
+and the RX888's own transfer latency (`kCaptureChainDelaySec`, estimated at
+50–300 µs, held at zero until it is measured against the GPS-fed reference).
+There is no arrival fit either: each packet times its own samples exactly, so a
+sample is mapped through the packet nearest it, and when radiod re-anchors
+after losing samples at the USB the step applies from that packet on.
+
+Two things pause it. A packet stamped 0, or captured implausibly long before it
+arrived, is left untimed. And while the host clock is being slewed hard, radiod's
+anchor, a floor over ten seconds, lags it: a capture time can be out by about
+thirteen seconds times the slew. So the daemon watches the host clock's rate
+against its own and trusts capture times only while it has stayed within 20 ppm
+of its usual rate for thirteen seconds. The status page says which timing each
+source is on, and why.
 
 ### Calibrating the chain constant against NTP
 
@@ -520,6 +561,14 @@ Those WWV calibrations were all made over Opus, which this program no longer
 uses: the sum they fixed also held the 8 ms the delay model then charged for
 Opus (measured offline as a 5–10 ms bias). WWV over PCM is right to the extent
 that figure was, and the residual carries whatever it was out by.
+
+The residual is **zero from 2026-09-24**, pending a measurement that can split
+it. With capture timing nothing between the antenna and the sample index treats
+WWV differently from DCF77, so no known mechanism needs it, and the one
+WWV-over-PCM reading put it nearer +2.3 ms than +4.7 anyway. What it might
+really be — the decoder bias on live ticks, or the skywave model — is to be
+measured as that: WWV against DCF77 on one receiver, both capture-timed, over
+twenty settled minutes by day and by night.
 
 The part nothing in the stream can see is the delay inside the receiver —
 `radiod`'s demodulator and filters, its block framing, the server's handling —
