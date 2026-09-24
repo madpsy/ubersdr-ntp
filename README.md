@@ -534,6 +534,21 @@ that the jitter term adds on top, so the served root dispersion is about 1.2 ms
 rather than 10.2. The 10 ms returns the moment any condition lapses: timing
 falls back to AM, the PM tracker unlocks, or capture timing pauses.
 
+WWV and WWVH get the same treatment on their own terms. Capture-timed, with the
+decoder having named the station, what is left of the delay model's doubt is
+the skywave geometry and the decoder's edge on live ticks. The geometry is
+bounded from the model itself: the largest difference between it and any mode
+that could be carrying the signal, a virtual height from 250 to 450 km and the
+fewest hops that height allows or one more. That is about 1.4 ms at 7000 km,
+under 2 ms on most long paths and up to about 3 ms under 1000 km, where one extra
+hop is a large share of the flight (more again inside 300 km, where the model
+assumes groundwave and 5–10 MHz arrives by near-vertical skywave). On top of it
+goes 1 ms for the decoder's edge bias, which was measured on synthetic ticks and
+not yet against a reference on live ones. So WWV at 7000 km claims about 2.4 ms
+of delay uncertainty instead of 10. Arrival-timed WWV, or WWV before the
+decoder has told WWV from WWVH — a guess worth about 14 ms in Europe — keeps
+the 10 ms floor.
+
 ### Calibrating the chain constant against NTP
 
 The terms every source shares cannot be measured by comparing sources: two

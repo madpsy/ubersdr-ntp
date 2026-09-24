@@ -74,6 +74,22 @@ double skywaveDelaySeconds(double distanceMeters, double virtualHeightM) {
     return (2.0 * hops * slant) / kC;
 }
 
+double skywaveModeSpreadSeconds(double distanceMeters) {
+    if (distanceMeters <= 0.0) return 0.0;
+    const double model = skywaveDelaySeconds(distanceMeters);
+    double worst = 0.0;
+    for (const double h : {kVirtualHeightLowM, kVirtualHeightM, kVirtualHeightHighM}) {
+        const int least = hopCount(distanceMeters, h);
+        for (int hops = least; hops <= least + 1; ++hops) {
+            const double halfArc = (distanceMeters / hops / 2.0) / kEarthRadiusM;
+            const double R = kEarthRadiusM, Rh = kEarthRadiusM + h;
+            const double slant = std::sqrt(R * R + Rh * Rh - 2.0 * R * Rh * std::cos(halfArc));
+            worst = std::max(worst, std::abs(2.0 * hops * slant / kC - model));
+        }
+    }
+    return worst;
+}
+
 double lfDelaySeconds(double distanceMeters) {
     if (distanceMeters <= 0.0) return 0.0;
     return distanceMeters * kLfGroundIndex / kC;

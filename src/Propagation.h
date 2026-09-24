@@ -105,6 +105,18 @@ double maxHopMeters(double virtualHeightM = kVirtualHeightM,
 // never again disagree about what the geometry allows.
 double skywaveDelaySeconds(double distanceMeters, double virtualHeightM = kVirtualHeightM);
 
+// How far the real path's delay can plausibly sit from skywaveDelaySeconds():
+// the largest difference, either sign, over the modes that could be carrying
+// it -- a virtual height anywhere from kVirtualHeightLowM to kVirtualHeightHighM,
+// and the fewest hops that height can carry or one more. That is the
+// geometry's whole contribution to the doubt, and it is what bounds the delay
+// model once capture timing has taken the receiver's chain and the network out
+// of the path. About 1.4 ms at 7000 km and under 2 ms on most long paths; more
+// on short ones, where one extra hop is a larger share of the flight.
+inline constexpr double kVirtualHeightLowM = 250000.0;
+inline constexpr double kVirtualHeightHighM = 450000.0;
+double skywaveModeSpreadSeconds(double distanceMeters);
+
 // WWVB IS NOT AN HF PATH AND MUST NOT USE THE GEOMETRY ABOVE
 //
 // 60 kHz does not hop off the F layer. It travels in the Earth-ionosphere

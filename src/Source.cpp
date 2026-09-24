@@ -239,6 +239,15 @@ constexpr double kDelayUncertaintyFraction = 0.15;
 // Only inside the groundwave service area; past it the modes interfere.
 constexpr double kDelayUncertaintyFloorLfPmSec = 0.001;
 constexpr double kLfGroundwaveServiceM = 2000e3;
+// WWV and WWVH, capture-timed, from a receiver whose decoder has named the
+// station. The 10 ms floor was measured on arrival-timed WWV, where the chain
+// and the receiver's buffering were inside the error; capture timing takes both
+// out. What is left is the skywave geometry, bounded from the model itself by
+// skywaveModeSpreadSeconds() (Propagation.h), and the decoder's edge on live
+// ticks, whose bias was measured on synthetic ones: this allowance is for
+// that, not yet measured against a reference. Until the decoder names the
+// station the transmitter is a guess worth ~14 ms, and the 10 ms stands.
+constexpr double kWwvDecoderAllowanceSec = 0.001;
 
 // The smallest uncertainty a source may claim when it is being weighed against
 // the others. See the use site.
@@ -2133,9 +2142,20 @@ void Source::recomputeOffset() {
                              m_snap.timingMode == "capture" && m_snap.pmLocked && m_snap.timingFromPm &&
                              !m_snap.capturePaused && m_snap.receiverLocation.valid &&
                              greatCircleMeters(m_snap.receiverLocation, dcf77Site()) <= kLfGroundwaveServiceM;
-    const double delayUncertainty =
-        std::max(lfPmCapture ? kDelayUncertaintyFloorLfPmSec : kDelayUncertaintyFloorSec,
-                 m_snap.delaySec * kDelayUncertaintyFraction);
+    const bool wwvCapture = m_cfg.autoDelay && m_broadcast == Broadcast::Wwv &&
+                            m_snap.timingMode == "capture" && !m_snap.capturePaused &&
+                            (m_snap.station == "wwv" || m_snap.station == "wwvh") &&
+                            m_snap.receiverLocation.valid;
+    double delayUncertainty;
+    if (lfPmCapture) {
+        delayUncertainty = std::max(kDelayUncertaintyFloorLfPmSec, m_snap.delaySec * kDelayUncertaintyFraction);
+    } else if (wwvCapture) {
+        const GeoPoint tx = m_snap.station == "wwvh" ? wwvhSite() : wwvSite();
+        delayUncertainty = skywaveModeSpreadSeconds(greatCircleMeters(m_snap.receiverLocation, tx)) +
+                           kWwvDecoderAllowanceSec;
+    } else {
+        delayUncertainty = std::max(kDelayUncertaintyFloorSec, m_snap.delaySec * kDelayUncertaintyFraction);
+    }
     const double own = e.jitterSec + m_snap.clockResidualSec + m_snap.clockSlopeUncSec + e.rateTermSec;
     m_snap.dispersionSec = own + delayUncertainty;
 
