@@ -94,7 +94,7 @@ function model(d) {
   const radio = d.sources.filter((s) => s.kind !== "ntp");
   const peers = d.sources.filter((s) => s.kind === "ntp");
   // Failing back is the primary class coming back, so its countdown goes on
-  // the primary's own time signals -- the ones it will come back on. The
+  // the primary's own time signals -- the ready ones it will come back on. The
   // figure is written by paintCountdowns() in index.html, which interpolates
   // it smoothly between ticks; see setCountdown there.
   const k = d.clock || {};
@@ -118,7 +118,9 @@ function model(d) {
       key: "st:" + id, kind: "rf", state: heard.length ? "live" : "down", serving: list.some((s) => s.in_use),
       title: STATIONS[id].name, tag: freqs.join(" · ") || "HF",
       sub: list.every((s) => s.link === "stopped") ? "no receiver running" : STATIONS[id].where,
-      pill: k.primary === "radio" && heard.length ? backPill : null,
+      // Only a station with a ready source is one the class comes back on:
+      // heard is not enough, a carrier can be heard with no minute decoding.
+      pill: k.primary === "radio" && list.some((s) => s.ready) ? backPill : null,
       kf: heard.length + "/" + list.length, kl: "heard",
       body: metrics([
         ["heard by", heard.length + " of " + list.length],
