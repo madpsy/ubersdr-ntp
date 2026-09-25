@@ -2609,6 +2609,7 @@ SourceSnapshot Source::snapshot() const {
                            (m_broadcast == Broadcast::Dcf77 ? "77.5" : m_broadcast == Broadcast::Allouis ? "162" : "60") + " kHz")
           : !s.phaseLocked                 ? "no edge: the tick is heard but not yet tracked"
           : !s.anchored                    ? "no frame: edges are tracked but no minute has decoded"
+          : s.refusal == "staleness"       ? "no decode: minutes are framed but none has read its time code lately"
           : s.refusal != "none"            ? "frames refused: " + s.refusal
           : s.framesInWindow < 2           ? "voting: " + std::to_string(s.framesInWindow) + " of " +
                                              std::to_string(s.windowSize) + " frames agree so far"

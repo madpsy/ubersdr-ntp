@@ -515,35 +515,37 @@ TimeFrameVoter::LockVerdict TimeFrameVoter::lockVerdict() const {
             ++increments;
         }
     }
-    if (increments < m_cfg.minFramesForLock - 1) {
-        return {false, ClockLockRefusal::Contested};
-    }
-
     // Static-field self-consistency in the SAME normalized space the vote uses:
     // each static field must carry at least one confident bit vote (a strictly
     // positive winning margin). No qualifying frame (e.g. an all-Unknown window
     // whose doy decodes out of range) yields zero margin everywhere — must not
     // lock.
     const std::vector<NormalizedFrame> frames = buildNormalizedFrames();
-    if (frames.empty()) {
-        return {false, ClockLockRefusal::Staleness};
-    }
 
     // Staleness bound (WS-4.5): a lock needs a range-VALID frame among the
     // newest maxNewestValidAge slots. Without this the window dead-reckons on
     // aged frames while garbage streams in — the vote keeps extrapolating
     // forward with no live support.
-    if (m_cfg.maxNewestValidAge >= 0) {
-        bool fresh = false;
-        for (const NormalizedFrame& nf : frames) {
-            if (nf.valid && nf.age <= m_cfg.maxNewestValidAge) {
-                fresh = true;
-                break;
-            }
+    bool fresh = m_cfg.maxNewestValidAge < 0;
+    for (const NormalizedFrame& nf : frames) {
+        if (nf.valid && nf.age <= m_cfg.maxNewestValidAge) {
+            fresh = true;
+            break;
         }
-        if (!fresh) {
-            return {false, ClockLockRefusal::Staleness};
-        }
+    }
+
+    // A short increment chain is only a contest when there is something to
+    // contest. A window of undecoded minutes (all-Unknown frames read as
+    // minute 0) fails the chain too, and names the wrong cause: nothing has
+    // decoded lately, which is staleness. The verdict is unchanged -- both
+    // refuse -- only the tag.
+    if (increments < m_cfg.minFramesForLock - 1) {
+        return {false, fresh && !frames.empty() ? ClockLockRefusal::Contested
+                                                : ClockLockRefusal::Staleness};
+    }
+
+    if (frames.empty() || !fresh) {
+        return {false, ClockLockRefusal::Staleness};
     }
     for (std::size_t fi = FieldHours; fi <= FieldYear; ++fi) {
         const ClockFieldMap& map = m_cfg.fields[fi];
