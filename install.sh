@@ -177,6 +177,51 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# Publish NTP on the host, when port 123 is free for it
+# ---------------------------------------------------------------------------
+
+# 123/udp on the host goes to this container only if nothing else there has it
+# -- chronyd or ntpd serving already would be refused the port, or refuse
+# ours. Taken to be ours when this container already publishes it (a re-run,
+# or a --force-update). Docker's DNAT keeps each client's own address, which
+# the rate limit and the top-clients list both need.
+NTP_PUBLISHED=0
+publish_ntp_port() {
+    if grep -qE '^\s*-\s*"?123:123/udp"?' "${COMPOSE_FILE}"; then
+        NTP_PUBLISHED=1
+        return
+    fi
+    local why=""
+    if docker port ntp 123/udp >/dev/null 2>&1; then
+        why="already this container's"
+    elif ! command -v ss >/dev/null 2>&1; then
+        echo "Cannot tell whether port 123/udp is free (no 'ss'): not publishing NTP on the host."
+        return
+    elif [[ -z "$(ss -Hlun 'sport = :123' 2>/dev/null)" ]]; then
+        why="free"
+    else
+        echo "Port 123/udp is in use on this host by something else, so NTP is not published."
+        echo "  See what has it : sudo ss -ulpn 'sport = :123'"
+        echo "  If that is a local chronyd/ntpd you can stop serving from it, then run"
+        echo "  ./install.sh --force-update to publish this one instead."
+        return
+    fi
+    # Straight after container_name: a ports: list with one entry.
+    awk '{ print } /^[[:space:]]*container_name:[[:space:]]*ntp[[:space:]]*$/ && !done {
+             print "    ports:"
+             print "      # Added by install.sh: port 123/udp was free on this host."
+             print "      - \"123:123/udp\""
+             done = 1 }' "${COMPOSE_FILE}" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "${COMPOSE_FILE}"
+    if grep -q '"123:123/udp"' "${COMPOSE_FILE}"; then
+        NTP_PUBLISHED=1
+        echo "Port 123/udp is ${why}: publishing NTP on the host."
+    else
+        echo "Could not add the port to ${COMPOSE_FILE}: NTP is not published on the host."
+    fi
+}
+publish_ntp_port
+
+# ---------------------------------------------------------------------------
 # Fetch the configuration, once
 # ---------------------------------------------------------------------------
 
@@ -241,7 +286,11 @@ else
     echo "./restart.sh"
 fi
 echo ""
-echo "NTP itself (port 123/udp) is not published outside Docker yet."
+if (( NTP_PUBLISHED )); then
+    echo "NTP is served on this host's port 123/udp: point clients at this machine."
+else
+    echo "NTP (port 123/udp) is not published outside Docker (see above)."
+fi
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo "  UBERSDR PROXY CONFIGURATION"

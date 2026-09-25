@@ -57,8 +57,9 @@ ENV UBERSDR_NTP_DRIFT_FILE=/var/lib/ubersdr-ntp/drift
 
 USER ntp
 
-# The status page and JSON API only. NTP (123/udp) is deliberately not exposed.
-EXPOSE 6099
+# The status page and JSON API, and NTP. install.sh publishes 123/udp on the
+# host when nothing else there has it; the status page is only ever proxied.
+EXPOSE 6099 123/udp
 
 # The page, not /api/health: that answers 503 while unsynchronised, which is a
 # state to report, not a reason to call the container broken.

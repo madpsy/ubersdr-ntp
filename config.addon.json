@@ -17,8 +17,9 @@
   // PORTS
   // =====================================================================
   "ntp": {
-    // The NTP service. Inside the container only: the compose file publishes
-    // no port for NTP, so nothing outside the Docker network can reach it yet.
+    // The NTP service. install.sh publishes it on the host's port 123/udp when
+    // nothing else there has that port; otherwise it is reachable only inside
+    // the Docker network.
     //
     // 123 is PRIVILEGED outside a container: either run as root, grant the
     // one capability
