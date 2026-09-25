@@ -416,9 +416,19 @@
     // session that occupies one of its listener slots.
     // , { "name": "remote-10", "url": "https://sdr.example.org", "carrier_hz": 10000000, "extra_delay_ms": 0.0, "password": "" }
 
+    // WWVH (NIST, Kauai) needs no entry of its own: it shares 2.5, 5, 10 and
+    // 15 MHz with WWV, and the one decoder on those carriers tells the two
+    // apart by their tones and times whichever it hears -- a receiver in the
+    // Pacific or Asia hears WWVH on the same entries as above.
+    //
+    // 2.5 MHz, WWV and WWVH both: a night-time frequency, useful when the
+    // higher ones have closed, and a long antenna helps.
+    // , { "name": "local-2.5", "url": "http://ubersdr:8080", "carrier_hz": 2500000, "extra_delay_ms": 0.0 }
+
     // WWV's two extra outlets. 20 MHz is WWV only; 25 MHz is an experimental
     // broadcast -- real, but intermittent and lower power.
     // , { "name": "local-20", "url": "http://ubersdr:8080", "carrier_hz": 20000000, "extra_delay_ms": 0.0 }
+    // , { "name": "local-25", "url": "http://ubersdr:8080", "carrier_hz": 25000000, "extra_delay_ms": 0.0 }
 
     // 60 kHz: MSF or WWVB, whichever the receiver is nearer. Both transmit on
     // 60 kHz, 7000 km apart, so the receiver's published coordinates decide:
