@@ -24,6 +24,8 @@ const STATIONS = {
   wwvh: { name: "WWVH", where: "Kekaha, Kauaʻi, Hawaii" },
   wwvb: { name: "WWVB", where: "Fort Collins, Colorado" },
   dcf77: { name: "DCF77", where: "Mainflingen, Germany" },
+  msf:   { name: "MSF",   where: "Anthorn, Cumbria, UK" },
+  allouis: { name: "Allouis", where: "Allouis, near Vierzon, France" },
   unknown: { name: "WWV / WWVH", where: "station not identified yet" },
 };
 
@@ -104,6 +106,7 @@ function model(d) {
     const st = status[s.name] || {};
     let id = s.station && STATIONS[s.station] ? s.station : "unknown";
     if (id === "unknown" && st.carrier_hz === 77500) id = "dcf77";
+    else if (id === "unknown" && st.carrier_hz === 162000) id = "allouis";
     else if (id === "unknown" && st.carrier_hz && st.carrier_hz < 1e6) id = "wwvb";
     (stations[id] = stations[id] || []).push(s);
   }
@@ -176,6 +179,7 @@ function model(d) {
     });
     const id = s.station && STATIONS[s.station] ? s.station
       : st.carrier_hz === 77500 ? "dcf77"
+      : st.carrier_hz === 162000 ? "allouis"
       : (st.carrier_hz && st.carrier_hz < 1e6 ? "wwvb" : "unknown");
     L.push({ from: "st:" + id, to: "src:" + s.name, kind: "rf",
              state: s.tone_detected ? "live" : "down", serving: s.in_use,

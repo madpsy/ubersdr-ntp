@@ -180,9 +180,10 @@ private:
     double m_lastTimeAt = 0.0;
     std::atomic<bool> m_socketOpen{false};
     bool m_haveDescription = false;   // supervisor thread only
-    // /api/description has answered, or failed, at least once: what a 60 kHz
-    // source waits for before choosing MSF or WWVB (resolveLf60).
+    // /api/description has been tried at least once, and has answered (parsed):
+    // what a 60 kHz source waits for before choosing MSF or WWVB (resolveLf60).
     std::atomic<bool> m_descriptionTried{false};
+    std::atomic<bool> m_descriptionAnswered{false};
 
     // The leap warning bit is taken from single frames, so one misread frame
     // would otherwise announce a leap second to every client.
@@ -200,11 +201,10 @@ private:
     std::unique_ptr<clockdec::MsfDecoder> m_msf;
     std::unique_ptr<clockdec::AllouisDecoder> m_allouis;
     // 60 kHz tuned on the carrier (Broadcast::Lf60): which station the
-    // receiver's location made it, Unknown until decided, and whether that was
-    // the no-coordinates fallback (so coordinates that turn up later can undo
-    // it). WebSocket thread.
+    // receiver's location made it, Unknown until decided; and since when it has
+    // been waiting on a description that failed. WebSocket thread.
     clockdec::ClockStation m_lf60 = clockdec::ClockStation::Unknown;
-    bool m_lf60Fallback = false;
+    double m_lf60WaitSince = 0.0;
     // WWVB from IQ (Lf60 resolved to WWVB): the IQ turned into the USB audio
     // its decoder was written for -- low-passed, shifted up 1 kHz, the real
     // part -- and the low-pass's delay, which the delay model takes back off.
@@ -213,6 +213,9 @@ private:
     std::array<IqBiquad, 4> m_iqLp{};   // I, I, Q, Q: two sections each
     double m_iqShiftPhase = 0.0, m_iqShiftStep = 0.0;
     double m_iqToAudioDelaySec = 0.0;
+    // The same delay as the delay model sees it: under m_mu, since the model is
+    // recomputed from the supervisor thread too. 0 unless WWVB is from IQ.
+    double m_iqToAudioDelayModelSec = 0.0;
     std::vector<float> m_audio;
     clockdec::ClockStation resolveLf60();
     // DCF77: the timing source last logged, and the one being seen and since

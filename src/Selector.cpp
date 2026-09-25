@@ -86,6 +86,10 @@ std::string refidFor(const std::string& station) {
     if (station == "wwvh") return "WWVH";
     if (station == "wwvb") return "WWVB";
     if (station == "dcf77") return "DCF";   // RFC 5905's code for LF radio DCF77
+    if (station == "msf") return "MSF";     // RFC 5905: MSF Anthorn (UK) Radio 60 kHz
+    // RFC 5905's code for Allouis, registered when it was TDF on 164 kHz; it is
+    // the same station, and "TDF" is what clients and tools know it by.
+    if (station == "allouis") return "TDF";
     return "WWV";
 }
 

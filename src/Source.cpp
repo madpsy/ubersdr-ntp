@@ -239,6 +239,9 @@ constexpr double kDelayUncertaintyFraction = 0.15;
 // Only inside the groundwave service area; past it the modes interfere.
 constexpr double kDelayUncertaintyFloorLfPmSec = 0.001;
 constexpr double kLfGroundwaveServiceM = 2000e3;
+// How long a 60 kHz source waits on a receiver description that failed before
+// deciding WWVB without it (resolveLf60).
+constexpr double kLf60DescriptionWaitSec = 60.0;
 // WWV and WWVH, capture-timed, from a receiver whose decoder has named the
 // station. The 10 ms floor was measured on arrival-timed WWV, where the chain
 // and the receiver's buffering were inside the error; capture timing takes both
@@ -959,6 +962,7 @@ bool Source::fetchDescription() {
             }
         }
         updateDelayModel();
+        m_descriptionAnswered.store(true);
         m_descriptionTried.store(true);
         // Said at INFO the first time and when coordinates newly appear; a
         // receiver that publishes none is retried on every reconnection, and
@@ -1534,8 +1538,17 @@ clockdec::ClockStation Source::resolveLf60() {
         return dm <= dw ? clockdec::ClockStation::Msf : clockdec::ClockStation::Wwvb;
     }
     if (m_lf60 != clockdec::ClockStation::Unknown) return m_lf60;
-    if (!m_descriptionTried.load()) return clockdec::ClockStation::Unknown;
-    return clockdec::ClockStation::Wwvb;
+    // Answered, and no coordinates in it: nothing more is coming.
+    if (m_descriptionAnswered.load()) return clockdec::ClockStation::Wwvb;
+    // Tried and failed: it is retried with the next connection, but a source
+    // is not held silent for that. A minute, then WWVB -- and coordinates that
+    // arrive later still move it to MSF.
+    if (m_descriptionTried.load()) {
+        const double now = monotonicNow();
+        if (m_lf60WaitSince <= 0.0) m_lf60WaitSince = now;
+        if (now - m_lf60WaitSince >= kLf60DescriptionWaitSec) return clockdec::ClockStation::Wwvb;
+    }
+    return clockdec::ClockStation::Unknown;
 }
 
 bool Source::ensureDecoder(int rate) {
@@ -1550,18 +1563,22 @@ bool Source::ensureDecoder(int rate) {
                 std::lock_guard<std::mutex> lk(m_mu);
                 loc = m_snap.receiverLocation;
                 m_snap.station = want == clockdec::ClockStation::Msf ? "msf" : "wwvb";
-                updateDelayModel();
+                // The delay model is brought up to date once the decoder it
+                // describes exists (end of ensureDecoder), not here.
             }
             if (loc.valid) {
                 LOG_INFO(m_cfg.name.c_str(), "60 kHz: the receiver is %.0f km from MSF and %.0f km from WWVB; "
                          "decoding %s", greatCircleMeters(loc, msfSite()) / 1000.0,
                          greatCircleMeters(loc, wwvbSite()) / 1000.0,
                          want == clockdec::ClockStation::Msf ? "MSF" : "WWVB");
-            } else {
+            } else if (m_descriptionAnswered.load()) {
                 LOG_WARN(m_cfg.name.c_str(), "60 kHz: the receiver publishes no coordinates, so MSF "
                          "cannot be told from WWVB by where it is; decoding WWVB");
+            } else {
+                LOG_WARN(m_cfg.name.c_str(), "60 kHz: no answer from /api/description for %.0f s, so MSF "
+                         "cannot be told from WWVB by where the receiver is; decoding WWVB until it answers",
+                         kLf60DescriptionWaitSec);
             }
-            m_lf60Fallback = !loc.valid;
             m_lf60 = want;
             m_decoderRate = 0;   // (re)build below
         }
@@ -1585,6 +1602,7 @@ bool Source::ensureDecoder(int rate) {
         m_dcf77.reset();
         m_msf.reset();
         m_allouis.reset();
+        m_wwvbFromIq = false;
         m_samplesWritten = 0;
         m_tsHave = false;
         m_clock.reset();
@@ -1595,6 +1613,7 @@ bool Source::ensureDecoder(int rate) {
         // decoded at all — until staleness caught it three minutes later.
         std::lock_guard<std::mutex> lk(m_mu);
         m_haveAnchor = false;
+        m_iqToAudioDelayModelSec = 0.0;
         m_haveFrame = false;
         m_offsets.clear();
         m_leapFrames = 0;
@@ -1745,6 +1764,12 @@ bool Source::ensureDecoder(int rate) {
                       (m_stationMemory == clockdec::ClockStation::Wwvh ? "WWVH" : "WWV");
     }
 
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        m_iqToAudioDelayModelSec = m_wwvbFromIq ? m_iqToAudioDelaySec : 0.0;
+        updateDelayModel();
+    }
+
     LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz%s",
              m_dcf77 ? "DCF77 (AM + PM, IQ)" : m_allouis ? "Allouis (PM, IQ)" : m_msf ? "MSF (IQ)"
              : m_wwvbFromIq ? "WWVB (from IQ)" : wwvb ? "WWVB" : "WWV/WWVH", rate, stationNote.c_str());
@@ -1866,7 +1891,10 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     // DCF77 is the only thing on 77.5 kHz, as WWV is on 20 and 25 MHz: the tag
     // is the carrier's, and does not blink to "unknown" while a new decoder
     // looks for it.
-    const char* station = m_dcf77 ? "dcf77" : m_allouis ? "allouis" : m_msf ? "msf" : "unknown";
+    // Likewise the LF stations, whose decoders let go of the tag in no-signal:
+    // the carrier (and for 60 kHz the receiver's location) already decided it.
+    const char* station = m_dcf77 ? "dcf77" : m_allouis ? "allouis" : m_msf ? "msf"
+                        : m_wwvbFromIq ? "wwvb" : "unknown";
     switch (st) {
         case clockdec::ClockStation::Wwv:  station = "wwv"; break;
         case clockdec::ClockStation::Wwvh: station = "wwvh"; break;
@@ -1934,6 +1962,7 @@ void Source::resetStream(const char* why) {
     m_wwvbFromIq = false;
 
     std::lock_guard<std::mutex> lk(m_mu);
+    m_iqToAudioDelayModelSec = 0.0;
     m_snap.timingMode = "pending";
     m_snap.timingWhy = "waiting for the receiver to say which clock its timestamps are on";
     m_snap.capturePaused = false;
@@ -2451,7 +2480,7 @@ void Source::updateDelayModel() {
     // IQ is timed through the low-pass that turns it into audio, whose delay
     // is exactly known (ensureDecoder) and taken off here.
     const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec + kWwvResidualSec
-                         : m_wwvbFromIq ? m_iqToAudioDelaySec : 0.0;
+                         : m_iqToAudioDelayModelSec;
 
     m_snap.propagationSec = prop;
     m_snap.networkSec = net;

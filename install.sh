@@ -113,7 +113,8 @@ choose_stations() {
 # config: the LF stations in range first, then WWV always.
 station_sources() {
     local url="http://ubersdr:8080" name
-    for name in "${STATIONS[@]}"; do
+    # ${STATIONS[@]+...}: on bash before 4.4, set -u takes an empty array as unbound.
+    for name in ${STATIONS[@]+"${STATIONS[@]}"}; do
         case "${name}" in
             dcf77)   echo "    { \"name\": \"dcf77\",    \"url\": \"${url}\", \"carrier_hz\": 77500, \"extra_delay_ms\": 0.0 }," ;;
             msf)     echo "    { \"name\": \"msf\",      \"url\": \"${url}\", \"carrier_hz\": 60000, \"extra_delay_ms\": 0.0 }," ;;

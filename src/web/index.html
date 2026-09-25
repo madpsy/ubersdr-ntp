@@ -473,6 +473,14 @@ function dcf77Text(p) {
     (p.pm_refused_locks ? ", " + p.pm_refused_locks + " PM lock(s) refused for contradicting AM (interference?)" : "");
 }
 
+// Whether a source is received as IQ, by the daemon's rule (Config.h,
+// broadcastFor): DCF77 and Allouis by their carriers whatever the dial, and
+// 60 kHz when it is tuned on the carrier (MSF, or WWVB by location).
+function isIqSource(x) {
+  return x.carrier_hz === 77500 || x.carrier_hz === 162000 ||
+    (x.carrier_hz === 60000 && x.dial_hz === x.carrier_hz);
+}
+
 // Allouis, timed by correlating each second's whole phase modulation.
 function allouisText(p) {
   return "phase correlation " + (p.timing_locked ? "tracking" : "searching") +
@@ -1275,7 +1283,7 @@ function onStatus(d) {
       ["Receiver", esc(x.receiver_name || "(unnamed)") + " — " + esc(x.url)],
       ["Tuning", (x.dial_hz / 1e6).toFixed(6) + " MHz dial for the " +
         (x.carrier_hz / 1e6).toFixed(4) + " MHz carrier, " +
-        (x.dial_hz === x.carrier_hz ? "IQ ±6 kHz" : "USB 0–3 kHz") + ", " +
+        (isIqSource(x) ? "IQ ±6 kHz" : "USB 0–3 kHz") + ", " +
         (x.min_margin_db > 0 ? "reduced depth, " + x.min_margin_db + " dB margin" : "lossless") +
         (a.sample_rate ? " at " + a.sample_rate + " Hz" : "")],
       ["Link", esc(l.state) + (l.detail ? " (" + esc(l.detail) + ")" : "") +
