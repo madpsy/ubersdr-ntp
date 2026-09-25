@@ -21,6 +21,13 @@ checked against their GPS capture stamps) and wired into the daemon:
 - Allouis gets DCF77's 1 ms dispersion floor under the same conditions
   (capture-timed, timed by its phase, within 2000 km of Allouis). MSF keeps
   10 ms until its edge bias is settled (see *Recordings*).
+- **Calibrated on M9PSY-1 (2026-09-25, night)**, all three capture-timed off
+  one RX888 against a GPS-disciplined stratum 1 on the same host, 15 settled
+  minutes: DCF77 -0.004 ms, Allouis +0.480, MSF -0.187 (drifting -0.12 to
+  -0.25, likely night skywave). So Allouis's second is 50.48 ms after its
+  excursion starts (`kSecondAfterStartSec`), and MSF's steepest-fall edge is
+  0.19 ms after NPL's second (`kMsfDecoderEdgeBiasSec`, in the delay model).
+  Both to be confirmed by day.
 
 Measured limits (synthetic): MSF locks down to about 27 dB-Hz, with edges
 p99 0.15 ms at 40 dB-Hz; Allouis down to 29 dB-Hz, p99 0.12-0.18 ms at 40.

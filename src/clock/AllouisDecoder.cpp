@@ -46,16 +46,22 @@ constexpr double kDataEnd  = 0.900;   // nothing is modulated after this
 // The unmodulated stretch every second ends with, less 5 ms each side.
 constexpr double kQuietFrom = 0.905;
 constexpr double kQuietTo   = 0.995;
-// Where the second is: 50 ms after the excursion starts, at its midpoint --
-// the zero crossing between +1 and -1 rad. Nothing published says so. Measured
-// on M9PSY-1 against DCF77's phase modulation, recorded at the same moment from
-// the same receiver (so every term but the transmitters' cancels) on a path of
-// almost the same length (1057 km to Allouis, 1061 km to Mainflingen): the
-// excursion started 49.96 ms before DCF77's second at 01:20 UTC and 50.47 ms
-// at 02:02 UTC, 2026-09-25 -- night, when both paths wander. Everything this
-// decoder works in (templates, the quiet window, the processing) is counted
-// from the excursion's start; only what it reports is moved.
-constexpr double kSecondAfterStartSec = 0.050;
+// Where the second is: 50.48 ms after the excursion starts -- close to its
+// midpoint, the zero crossing between +1 and -1 rad, but not on it. Nothing
+// published says where. Measured on M9PSY-1, where MSF, Allouis and DCF77 come
+// off one RX888 and one set of radiod capture stamps, so every receiver term
+// cancels and the paths are modelled as propagation alone:
+//   against DCF77's phase modulation, recorded at the same moment (paths 1057
+//   and 1061 km): the excursion started 50.47 ms before DCF77's second at
+//   02:02 UTC 2026-09-25 (49.96 at 01:20, the one outlier), and with 50.00
+//   taken, Allouis read +0.43 ms against DCF77 live over 14 minutes;
+//   against a GPS-disciplined stratum 1 on the same host, live, capture-timed:
+//   +0.480 ms over 15 settled minutes (halves +0.454, +0.503), DCF77 reading
+//   -0.004 against the same reference over the same minutes.
+// Night, all of it; to be confirmed by day. Everything this decoder works in
+// (templates, the quiet window, the processing) is counted from the
+// excursion's start; only what it reports is moved.
+constexpr double kSecondAfterStartSec = 0.05048;
 
 // The position codes, per henningM1r/gr_ALS162_Receiver (GPLv3),
 // python/ALS162_codes.py: the phase's change over each 25 ms of 200-1000 ms,

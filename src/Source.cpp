@@ -101,6 +101,20 @@ constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
 // capture-timed, over twenty settled minutes by day and by night.
 constexpr double kWwvResidualSec = 0.0;
 
+// Where MsfDecoder puts MSF's second against where NPL does: 0.19 ms LATE. The
+// decoder times the steepest point of the carrier's fall; NPL's second is the
+// carrier going off, and on the air the fall (shaped by Anthorn's antenna)
+// takes a fraction of a millisecond to reach its steepest. Measured on M9PSY-1,
+// capture-timed against a GPS-disciplined stratum 1 on the same host, the delay
+// model being propagation alone (125 km, 0.42 ms): MSF read -0.187 ms over 15
+// settled minutes, DCF77 -0.004 against the same reference. Not a steady figure
+// at night -- the halves were -0.118 and -0.248, most likely a one-hop skywave
+// (about 0.3 ms behind the groundwave even at 125 km) reshaping the fall as it
+// comes and goes -- so this is the night's mean, to be confirmed by day, when
+// the skywave is gone. Kept here rather than in the decoder, whose synthetic
+// fall is symmetric and whose steepest point is its edge.
+constexpr double kMsfDecoderEdgeBiasSec = 0.000190;
+
 // The delay from RF reaching the SDR to the audio leaving UberSDR's WebSocket:
 // radiod's demodulator and filters, its block framing, the server's handling.
 // It is a property of the software, the same on every instance, so it is one
@@ -2475,11 +2489,13 @@ void Source::updateDelayModel() {
     // is timing them (tools/dcf77test), so it has none either.
     // WWV's residual rides here too (kWwvResidualSec), with the term it is most
     // likely to belong to.
-    // MSF's and Allouis's decoders put the edge where the station puts the
-    // second (MsfDecoder, AllouisDecoder), so neither has one. WWVB taken from
-    // IQ is timed through the low-pass that turns it into audio, whose delay
-    // is exactly known (ensureDecoder) and taken off here.
+    // Allouis's decoder puts the edge where the station puts the second
+    // (AllouisDecoder), so it has none. MSF's times the steepest point of the
+    // fall, 0.19 ms after NPL's second (kMsfDecoderEdgeBiasSec). WWVB taken
+    // from IQ is timed through the low-pass that turns it into audio, whose
+    // delay is exactly known (ensureDecoder) and taken off here.
     const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec + kWwvResidualSec
+                         : m_snap.station == "msf" ? kMsfDecoderEdgeBiasSec
                          : m_iqToAudioDelayModelSec;
 
     m_snap.propagationSec = prop;

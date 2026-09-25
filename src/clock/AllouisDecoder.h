@@ -32,10 +32,10 @@
 // excursion(s) and that second's position code -- against the received phase,
 // so the second is timed by 700 ms and more of known modulation, not by an
 // amplitude edge. Everything above is counted from the excursion's start,
-// which is 50 ms BEFORE the second: the excursion's midpoint, its zero crossing
-// from +1 to -1 rad, is on the second. Not published anywhere; measured against
-// DCF77 (AllouisDecoder.cpp, kSecondAfterStartSec). The edge reported is the
-// second itself.
+// which is 50.48 ms BEFORE the second -- close to the excursion's midpoint,
+// its zero crossing from +1 to -1 rad. Not published anywhere; measured against
+// DCF77 and a GPS-disciplined stratum 1 (AllouisDecoder.cpp,
+// kSecondAfterStartSec). The edge reported is the second itself.
 //
 // Decoded minutes are converted to UTC before they reach the shared voter, as
 // synthetic frames in WWVB's field layout, as Dcf77Decoder does.

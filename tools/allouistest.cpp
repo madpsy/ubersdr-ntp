@@ -140,8 +140,9 @@ struct Scenario {
     unsigned seed = 1;
 };
 
-// The excursion starts 50 ms before the second it marks (AllouisDecoder.h).
-constexpr double kLeadSec = 0.050;
+// The excursion starts 50.48 ms before the second it marks
+// (AllouisDecoder.cpp, kSecondAfterStartSec).
+constexpr double kLeadSec = 0.05048;
 
 struct Sec {
     double t = 0.0;       // the UTC second, in stream time; its modulation starts kLeadSec before
