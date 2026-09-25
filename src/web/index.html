@@ -62,6 +62,11 @@ h1 span { color:var(--muted); font-weight:400; }
 .note { color:var(--muted); font-size:12px; }
 .pill { display:inline-block; padding:2px 9px; border-radius:99px; font-size:11px;
   font-weight:600; text-transform:uppercase; letter-spacing:.05em; white-space:nowrap; }
+/* The status pill names every station in the answer, which outgrows a grid
+   cell; it wraps inside its own cell rather than running under the next one.
+   A 10px radius is still fully round on one line and stays tidy on two. */
+#syncpill .pill { white-space:normal; overflow-wrap:anywhere; max-width:100%;
+  border-radius:10px; }
 .ok   { background:color-mix(in srgb,var(--ok) 16%,transparent);   color:var(--ok); }
 .warn { background:color-mix(in srgb,var(--warn) 20%,transparent); color:var(--warn); }
 .bad  { background:color-mix(in srgb,var(--bad) 16%,transparent);  color:var(--bad); }
