@@ -41,6 +41,8 @@ GeoPoint wwvSite();    // Fort Collins, Colorado
 GeoPoint wwvhSite();   // Kekaha, Kauai, Hawaii
 GeoPoint wwvbSite();   // Fort Collins, Colorado
 GeoPoint dcf77Site();  // Mainflingen, Germany
+GeoPoint msfSite();    // Anthorn, UK
+GeoPoint allouisSite(); // Allouis, France
 
 // Great-circle distance in metres.
 double greatCircleMeters(const GeoPoint& a, const GeoPoint& b);

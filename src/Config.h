@@ -68,9 +68,11 @@ struct SourceConfig {
     bool enabled = true;
 
     // The transmitter's carrier. The dial is derived as carrier - 1 kHz, which
-    // is the tuning WWV/WWVH and WWVB all want: it puts the carrier at 1000 Hz
-    // audio in USB. 77500 is DCF77, which is tuned to the carrier itself in IQ
-    // mode (see kDcf77CarrierHz).
+    // is the tuning WWV/WWVH want: it puts the carrier at 1000 Hz audio in USB.
+    // The LF carriers are tuned to the carrier itself in IQ mode instead:
+    // 77500 is DCF77, 162000 Allouis, and 60000 MSF or WWVB -- which of the two
+    // is decided by where the receiver is (see Broadcast::Lf60). An explicit
+    // dial_hz of 59000 keeps 60 kHz as WWVB over USB audio, as it always was.
     std::uint64_t carrierHz = 10000000;
     // An explicit dial, for a receiver that needs one. 0 means derive it.
     std::uint64_t dialHz = 0;
@@ -88,7 +90,7 @@ struct SourceConfig {
     // UberSDR's reduced-depth IQ, as a margin in dB: how far under the band's
     // own noise floor the quantisation noise must stay (ka9q_ubersdr
     // pcm_lossy.go). 0 is the lossless stream; otherwise 15-60, whole dB. The
-    // server honours it for IQ only, so of these sources only DCF77 uses it.
+    // server honours it for IQ only, so only the LF sources (isIqBroadcast) use it.
     int minMarginDb = 0;
 
     // Sources whose signal is reliably worse can be kept but weighted down, or
@@ -368,8 +370,8 @@ struct Config {
 };
 
 // The dial for a carrier: 1 kHz below it, which is what puts the carrier at
-// 1000 Hz audio in USB for WWV, WWVH and WWVB alike -- and the carrier itself
-// for DCF77, which is taken as IQ with the carrier at 0 Hz (see below).
+// 1000 Hz audio in USB for WWV and WWVH -- and the carrier itself for the LF
+// stations, which are taken as IQ with the carrier at 0 Hz (see below).
 std::uint64_t dialForCarrier(std::uint64_t carrierHz);
 
 // DCF77, Mainflingen. Unlike the NIST stations it is decoded from IQ, not from
@@ -380,6 +382,15 @@ inline constexpr std::uint64_t kDcf77CarrierHz = 77500;
 // How far the dial may sit from the carrier and leave it inside that 12 kHz.
 inline constexpr std::uint64_t kDcf77MaxDialOffsetHz = 5000;
 
+// Allouis (ALS162), France: phase modulation only, so IQ as DCF77.
+inline constexpr std::uint64_t kAllouisCarrierHz = 162000;
+
+// 60 kHz: MSF (Anthorn, UK) and WWVB (Fort Collins, US) both. Tuned on the
+// carrier, in IQ, it is decided by the receiver's own coordinates which of the
+// two it hears -- the nearer transmitter (Source::resolveLf60). A dial of
+// 59 kHz instead is the old tuning, WWVB over USB audio, and stays exactly that.
+inline constexpr std::uint64_t kLf60CarrierHz = 60000;
+
 // Below this the dial is taken to be WWVB, which is a different decoder rather
 // than a setting -- except DCF77's carrier, which broadcastFor takes first. The
 // ceiling matches wwvbCeilingHz in ka9q_ubersdr's clock extension and
@@ -389,12 +400,19 @@ inline constexpr std::uint64_t kWwvbCeilingHz = 1000000;
 
 // Which broadcast, and so which decoder, a source is. Decided from the tuning,
 // never offered as a setting: they are different signals, not options. DCF77
-// by its carrier, exactly; below kWwvbCeilingHz otherwise, WWVB; above, WWV or
-// WWVH, which one decoder tells apart itself.
-enum class Broadcast { Wwv, Wwvb, Dcf77 };
+// and Allouis by their carriers, exactly; 60 kHz tuned on the carrier is Lf60,
+// MSF or WWVB by the receiver's location; below kWwvbCeilingHz otherwise,
+// WWVB over USB; above, WWV or WWVH, which one decoder tells apart itself.
+enum class Broadcast { Wwv, Wwvb, Dcf77, Allouis, Lf60 };
 inline Broadcast broadcastFor(std::uint64_t carrierHz, std::uint64_t dialHz) {
     if (carrierHz == kDcf77CarrierHz) return Broadcast::Dcf77;
+    if (carrierHz == kAllouisCarrierHz) return Broadcast::Allouis;
+    if (carrierHz == kLf60CarrierHz && dialHz == carrierHz) return Broadcast::Lf60;
     return dialHz < kWwvbCeilingHz ? Broadcast::Wwvb : Broadcast::Wwv;
+}
+// The broadcasts received as IQ, tuned on the carrier, rather than USB audio.
+inline bool isIqBroadcast(Broadcast b) {
+    return b == Broadcast::Dcf77 || b == Broadcast::Allouis || b == Broadcast::Lf60;
 }
 
 // Carriers only WWV transmits on. WWVH shares 2.5, 5, 10 and 15 MHz with it,

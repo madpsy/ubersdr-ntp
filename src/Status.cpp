@@ -781,6 +781,19 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
         d["pm_interference"] = s.pmInterference;
         dec["dcf77"] = std::move(d);
     }
+    if (s.station == "allouis" || s.station == "msf") {
+        // Allouis is timed by a correlation of each second's whole phase; MSF
+        // by its carrier's fall. Both from IQ tuned on the carrier.
+        auto num = [](double v) { return std::isfinite(v) ? json(v) : json(nullptr); };
+        json d;
+        d["carrier_offset_hz"] = num(s.carrierOffsetHz);
+        if (s.station == "allouis") {
+            d["timing_locked"] = s.pmLocked;
+            d["timing"] = s.timingFromPm;
+            d["timing_snr_db"] = num(s.pmSnrDb);
+        }
+        dec[s.station] = std::move(d);
+    }
     dec["audio_seconds"] = s.sampleRate ? static_cast<double>(s.samplesConsumed) / s.sampleRate : 0.0;
     dec["last_quality"] = s.lastQuality;
     dec["last_decoded_utc"] = s.lastDecodedUtc;

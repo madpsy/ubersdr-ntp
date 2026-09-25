@@ -1,4 +1,4 @@
-// ubersdr-ntp — an NTP server disciplined by WWV/WWVH/WWVB/DCF77 heard over UberSDR.
+// ubersdr-ntp — an NTP server disciplined by WWV/WWVH/WWVB/DCF77/MSF/Allouis heard over UberSDR.
 //
 // Connects to one or more UberSDR receivers, tunes each to a time-signal
 // frequency, decodes the broadcast time code in process, and serves the result
@@ -82,7 +82,7 @@ void onSignal(int sig) {
 void usage() {
     using ubersdr_ntp::kVersion;
     std::printf(
-        "ubersdr-ntp %s — an NTP server disciplined by WWV/WWVH/WWVB/DCF77 over UberSDR\n"
+        "ubersdr-ntp %s — an NTP server disciplined by WWV/WWVH/WWVB/DCF77/MSF/Allouis over UberSDR\n"
         "\n"
         "Usage:\n"
         "  ubersdr-ntp --config FILE [overrides]\n"
@@ -94,8 +94,10 @@ void usage() {
         "      --source URL@MHZ     A radio source, for a quick run without a config file.\n"
         "                           e.g. --source https://sdr.example.org@10\n"
         "                           May be repeated. The dial is derived as 1 kHz below\n"
-        "                           the carrier, which is the tuning WWV, WWVH and WWVB\n"
-        "                           all want; @0.0775 is DCF77, tuned on the carrier as IQ.\n"
+        "                           the carrier, which is the tuning WWV and WWVH want.\n"
+        "                           The LF carriers are tuned on the carrier as IQ:\n"
+        "                           @0.0775 is DCF77, @0.162 Allouis, and @0.06 MSF or\n"
+        "                           WWVB, whichever the receiver is nearer.\n"
         "      --ntp-source HOST    An upstream NTP server, as a second class of source.\n"
         "                           e.g. --ntp-source time.cloudflare.com, or HOST:PORT.\n"
         "                           May be repeated.\n"

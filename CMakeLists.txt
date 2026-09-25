@@ -53,6 +53,8 @@ add_library(clockdecoders STATIC
     src/clock/WwvDecoder.cpp
     src/clock/WwvbDecoder.cpp
     src/clock/Dcf77Decoder.cpp
+    src/clock/MsfDecoder.cpp
+    src/clock/AllouisDecoder.cpp
     src/clock/TimeFrameVoter.cpp)
 target_include_directories(clockdecoders PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
 target_compile_options(clockdecoders PRIVATE -w)
@@ -73,6 +75,33 @@ target_link_libraries(ubersdr-ntp-dcf77test PRIVATE clockdecoders Threads::Threa
 target_compile_options(ubersdr-ntp-dcf77test PRIVATE -Wall -Wextra)
 target_compile_definitions(ubersdr-ntp-dcf77test PRIVATE
     DCF77_TESTDATA="${CMAKE_CURRENT_SOURCE_DIR}/tools/testdata/dcf77_live.wav")
+
+# Offline MSF test: synthesised complex baseband (noise, sample-grid offsets,
+# carrier offset, GMT/BST change, a leap-second minute, a missed marker, WWVB
+# fed to it), then the M9PSY-1 recording in tools/testdata, checked against its
+# capture stamps. Not installed.
+add_executable(ubersdr-ntp-msftest tools/msftest.cpp)
+target_link_libraries(ubersdr-ntp-msftest PRIVATE clockdecoders Threads::Threads)
+target_compile_options(ubersdr-ntp-msftest PRIVATE -Wall -Wextra)
+target_compile_definitions(ubersdr-ntp-msftest PRIVATE
+    MSF_TESTDATA="${CMAKE_CURRENT_SOURCE_DIR}/tools/testdata/msf_m9psy1_20260925T0120Z.wav")
+
+# Offline ALS162 (Allouis) test: synthesised phase modulation (noise,
+# sample-grid offsets, carrier offset, inverted I/Q, CET/CEST change, a
+# maintenance outage), then the M9PSY-1 recording in tools/testdata, checked
+# against its capture stamps. Not installed.
+add_executable(ubersdr-ntp-allouistest tools/allouistest.cpp)
+target_link_libraries(ubersdr-ntp-allouistest PRIVATE clockdecoders Threads::Threads)
+target_compile_options(ubersdr-ntp-allouistest PRIVATE -Wall -Wextra)
+target_compile_definitions(ubersdr-ntp-allouistest PRIVATE
+    ALS162_TESTDATA="${CMAKE_CURRENT_SOURCE_DIR}/tools/testdata/als162_m9psy1_20260925T0120Z.wav")
+
+# Records lossless IQ from an UberSDR receiver, tuned on a carrier, with the
+# receiver's capture timestamp for every packet in a CSV beside the WAV. For
+# making test recordings (tools/testdata). Not installed.
+add_executable(ubersdr-ntp-iqrecord tools/iqrecord.cpp)
+target_link_libraries(ubersdr-ntp-iqrecord PRIVATE ixwebsocket_vendored PkgConfig::CURL Threads::Threads)
+target_compile_options(ubersdr-ntp-iqrecord PRIVATE -Wall -Wextra)
 
 # Offline test of the daemon's clock: the offset/rate estimator against a
 # drifting crystal, a step and outliers; the sample-clock fit on a steady clock

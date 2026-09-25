@@ -22,6 +22,11 @@ GeoPoint wwvbSite() { return GeoPoint{ 40.67806, -105.04667, true }; }
 GeoPoint wwvhSite() { return GeoPoint{ 21.98750, -159.76306, true }; }
 // DCF77's primary antenna. The backup is 350 m away, about 1 us of flight time.
 GeoPoint dcf77Site() { return GeoPoint{ 50.015528, 9.008515, true }; }
+// MSF, Anthorn: 54 55 N, 3 15 W per NPL's specification, which gives it only
+// to the arcminute -- about 1.8 km, 6 us of flight time.
+GeoPoint msfSite() { return GeoPoint{ 54.916667, -3.250000, true }; }
+// Allouis (ALS162), near Vierzon: 47 10 05 N, 2 12 02 E per ITU-R TF.2487.
+GeoPoint allouisSite() { return GeoPoint{ 47.168056, 2.200556, true }; }
 
 double greatCircleMeters(const GeoPoint& a, const GeoPoint& b) {
     if (!a.valid || !b.valid) return 0.0;

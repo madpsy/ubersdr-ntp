@@ -433,10 +433,25 @@ void testDcf77Tuning() {
           r.ok && warned, "%s", r.why());
     check("and is named after what it listens to",
           d && d->name.rfind("dcf77-", 0) == 0, "%s", d ? d->name.c_str() : "");
-    check("60 kHz is still WWVB, 1 kHz below",
-          b && broadcastFor(b->carrierHz, b->dialHz) == Broadcast::Wwvb && b->dialHz == 59000 &&
-              b->name.rfind("wwvb-", 0) == 0,
+    check("60 kHz is tuned on the carrier in IQ, MSF or WWVB by the receiver's location",
+          b && broadcastFor(b->carrierHz, b->dialHz) == Broadcast::Lf60 && b->dialHz == 60000 &&
+              isIqBroadcast(Broadcast::Lf60) && b->name.rfind("lf60-", 0) == 0,
           "%s", b ? b->name.c_str() : "");
+    const Loaded old = load(R"({"sources":[{"url":"http://r.example","carrier_hz":60000,"dial_hz":59000}]})");
+    const SourceConfig* w = old.ok && old.cfg.sources.size() == 1 ? &old.cfg.sources[0] : nullptr;
+    check("60 kHz with the old 59 kHz dial is still WWVB over USB audio",
+          w && broadcastFor(w->carrierHz, w->dialHz) == Broadcast::Wwvb &&
+              !isIqBroadcast(Broadcast::Wwvb) && w->name.rfind("wwvb-", 0) == 0,
+          "%s", w ? w->name.c_str() : old.why());
+    const Loaded als = load(R"({"sources":[{"url":"http://r.example","carrier_hz":162000}]})");
+    const SourceConfig* a = als.ok && als.cfg.sources.size() == 1 ? &als.cfg.sources[0] : nullptr;
+    check("162 kHz is Allouis, IQ with the dial ON the carrier",
+          a && broadcastFor(a->carrierHz, a->dialHz) == Broadcast::Allouis && a->dialHz == 162000 &&
+              a->name.rfind("allouis-", 0) == 0,
+          "%s", a ? a->name.c_str() : als.why());
+    const Loaded alsFar = load(R"({"sources":[{"url":"http://r.example","carrier_hz":162000,"dial_hz":150000}]})");
+    check("an Allouis dial outside the IQ passband is refused", !alsFar.ok &&
+              std::string(alsFar.why()).find("IQ passband") != std::string::npos, "%s", alsFar.why());
 
     const Loaded near = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500,"dial_hz":76500}]})");
     check("a dial 1 kHz off still leaves the carrier in the IQ passband", near.ok, "%s", near.why());

@@ -326,10 +326,11 @@
     //                     Named after the station and carrier if left out.
     //   "url"             the receiver, http:// or https://. Required.
     //
-    //   "carrier_hz"      the TRANSMITTER's carrier (default 10000000). The
-    //                     dial is derived as 1 kHz below it, which is the
-    //                     tuning WWV, WWVH and WWVB all want -- it puts the
-    //                     carrier at 1000 Hz audio in USB. DO NOT subtract the
+    //   "carrier_hz"      the TRANSMITTER's carrier (default 10000000). For
+    //                     WWV the dial is derived as 1 kHz below it, which
+    //                     puts the carrier at 1000 Hz audio in USB. The LF
+    //                     carriers -- 60000, 77500, 162000 -- are tuned ON the
+    //                     carrier in IQ mode instead. DO NOT subtract the
     //                     kilohertz yourself.
     //   "dial_hz"         an explicit dial, for a receiver that needs one.
     //                     0, the default, derives it.
@@ -366,8 +367,8 @@
 
     // >>> station
     // install.sh replaces everything from here to "<<< station" on a first
-    // install: WWV always, and DCF77 as well if the receiver is within its
-    // range and covers LF.
+    // install: WWV always, and DCF77, MSF and Allouis as well, each if the
+    // receiver is within 2000 km of that transmitter and covers its frequency.
     { "name": "local-5",  "url": "http://ubersdr:8080", "carrier_hz": 5000000, "extra_delay_ms": 0.0 },
     { "name": "local-10", "url": "http://ubersdr:8080", "carrier_hz": 10000000, "extra_delay_ms": 0.0 },
     { "name": "local-15", "url": "http://ubersdr:8080", "carrier_hz": 15000000, "extra_delay_ms": 0.0 }
@@ -382,10 +383,29 @@
     // broadcast -- real, but intermittent and lower power.
     // , { "name": "local-20", "url": "http://ubersdr:8080", "carrier_hz": 20000000, "extra_delay_ms": 0.0 }
 
-    // WWVB, for a receiver in range of its 60 kHz groundwave. Chosen
-    // automatically for any dial below 1 MHz -- it is a genuinely different
-    // decoder, not a setting.
-    // , { "name": "wwvb", "url": "http://ubersdr:8080", "carrier_hz": 60000, "extra_delay_ms": 0.0 }
+    // 60 kHz: MSF or WWVB, whichever the receiver is nearer. Both transmit on
+    // 60 kHz, 7000 km apart, so the receiver's published coordinates decide:
+    // Anthorn for Europe, Fort Collins for North America. Tuned on the carrier
+    // in IQ mode. A receiver that publishes no coordinates gets WWVB.
+    //
+    // MSF is the UK's time signal, from NPL: 15 kW on 60 kHz from Anthorn in
+    // Cumbria, heard across the UK and much of northern and western Europe.
+    // On-off keyed; its second is the carrier going off, sent to better than
+    // 1 ms. WWVB (NIST, Fort Collins) is the same frequency for North America.
+    //
+    // "dial_hz": 59000 keeps the old tuning -- WWVB over USB audio, whatever
+    // the receiver's location.
+    // , { "name": "msf", "url": "http://ubersdr:8080", "carrier_hz": 60000, "extra_delay_ms": 0.0 }
+    // , { "name": "wwvb", "url": "http://ubersdr:8080", "carrier_hz": 60000, "dial_hz": 59000, "extra_delay_ms": 0.0 }
+
+    // Allouis (ALS162), for a receiver in western Europe. The French time
+    // signal: 800 kW on 162 kHz longwave from Allouis, near Vierzon, carrying
+    // phase modulation only -- an excursion at every second and a pseudo-random
+    // code through the rest of it, which times the second as finely as DCF77's.
+    // Its groundwave covers France and well beyond. Off air every Tuesday
+    // 08:00-12:00 French time for maintenance; the source rides that out and
+    // locks again after. Tuned on the carrier in IQ mode.
+    // , { "name": "allouis", "url": "http://ubersdr:8080", "carrier_hz": 162000, "extra_delay_ms": 0.0 }
 
     // DCF77, for a receiver in Europe. The German time signal: 50 kW on
     // 77.5 kHz longwave from Mainflingen, near Frankfurt, run by PTB. Its

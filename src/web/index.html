@@ -473,8 +473,16 @@ function dcf77Text(p) {
     (p.pm_refused_locks ? ", " + p.pm_refused_locks + " PM lock(s) refused for contradicting AM (interference?)" : "");
 }
 
+// Allouis, timed by correlating each second's whole phase modulation.
+function allouisText(p) {
+  return "phase correlation " + (p.timing_locked ? "tracking" : "searching") +
+    (p.timing_snr_db != null ? " at " + p.timing_snr_db.toFixed(1) + " dB" : "") +
+    (p.timing ? ", timing the second" : ", not timing") +
+    (p.carrier_offset_hz != null ? ", carrier " + p.carrier_offset_hz.toFixed(2) + " Hz off the dial" : "");
+}
+
 function stationMix(d) {
-  const label = { wwv: "WWV", wwvh: "WWVH", wwvb: "WWVB", dcf77: "DCF77" };
+  const label = { wwv: "WWV", wwvh: "WWVH", wwvb: "WWVB", dcf77: "DCF77", msf: "MSF", allouis: "Allouis" };
   const counts = new Map();
   for (const s of d.sources || []) {
     if (s.kind !== "radio" || !s.in_use) continue;
@@ -1267,7 +1275,7 @@ function onStatus(d) {
       ["Receiver", esc(x.receiver_name || "(unnamed)") + " — " + esc(x.url)],
       ["Tuning", (x.dial_hz / 1e6).toFixed(6) + " MHz dial for the " +
         (x.carrier_hz / 1e6).toFixed(4) + " MHz carrier, " +
-        (dec.station === "dcf77" ? "IQ ±6 kHz" : "USB 0–3 kHz") + ", " +
+        (x.dial_hz === x.carrier_hz ? "IQ ±6 kHz" : "USB 0–3 kHz") + ", " +
         (x.min_margin_db > 0 ? "reduced depth, " + x.min_margin_db + " dB margin" : "lossless") +
         (a.sample_rate ? " at " + a.sample_rate + " Hz" : "")],
       ["Link", esc(l.state) + (l.detail ? " (" + esc(l.detail) + ")" : "") +
@@ -1279,7 +1287,7 @@ function onStatus(d) {
         ? a.baseband_power_dbfs.toFixed(1) + " dBFS baseband, noise " +
           a.noise_dbfs.toFixed(1) + " dBFS, SNR " + a.snr_db.toFixed(1) + " dB"
         : "not reported"],
-      ["Acquisition", (dec.station === "dcf77" || dec.station === "wwvb" ? "carrier " : "tick ") +
+      ["Acquisition", (["dcf77", "wwvb", "msf", "allouis"].includes(dec.station) ? "carrier " : "tick ") +
         dec.tone_snr_db.toFixed(1) + " dB " +
         (dec.tone_detected ? "(detected)" : "(NOT detected)") + ", edge " +
         (dec.phase_locked ? "locked" : "unlocked") +
@@ -1293,6 +1301,7 @@ function onStatus(d) {
             " (tick " + signedDb(dec.tick_band_ratio_db) + ")"
           : "")],
       ...(dec.dcf77 ? [["DCF77", dcf77Text(dec.dcf77)]] : []),
+      ...(dec.allouis ? [["Allouis", allouisText(dec.allouis)]] : []),
       ["Last decode", dec.last_decoded_utc
         ? esc(dec.last_decoded_utc) + " at quality " + dec.last_quality + "%, " +
           dur(dec.last_decode_age_seconds) + " ago"

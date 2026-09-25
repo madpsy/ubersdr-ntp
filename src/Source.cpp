@@ -399,7 +399,7 @@ std::string describeClose(unsigned code, bool remote) {
 Source::Source(SourceConfig cfg)
     : m_cfg(std::move(cfg)),
       m_broadcast(broadcastFor(m_cfg.carrierHz, m_cfg.dialHz)),
-      m_iq(m_broadcast == Broadcast::Dcf77),
+      m_iq(isIqBroadcast(m_broadcast)),
       m_channels(m_iq ? 2 : 1),
       m_sessionId(makeUuidV4()),
       m_clock(12000),
@@ -412,6 +412,7 @@ Source::Source(SourceConfig cfg)
     m_snap.minMarginDb = m_iq ? m_cfg.minMarginDb : 0;
     m_snap.weight = m_cfg.weight;
     m_snap.station = m_broadcast == Broadcast::Dcf77 ? "dcf77"
+                   : m_broadcast == Broadcast::Allouis ? "allouis"
                    : m_broadcast == Broadcast::Wwvb ? "wwvb"
                    : wwvOnlyCarrier(m_cfg.carrierHz) ? "wwv" : "unknown";
     m_linkSince = monotonicNow();
@@ -924,6 +925,7 @@ bool Source::fetchDescription() {
                                   m_cfg.verifyTls, resp, rtt, err);
     if (code != 200) {
         LOG_DEBUG(m_cfg.name.c_str(), "/api/description unavailable (%ld %s)", code, err.c_str());
+        m_descriptionTried.store(true);
         return false;
     }
 
@@ -957,6 +959,7 @@ bool Source::fetchDescription() {
             }
         }
         updateDelayModel();
+        m_descriptionTried.store(true);
         // Said at INFO the first time and when coordinates newly appear; a
         // receiver that publishes none is retried on every reconnection, and
         // repeating "no coordinates" each time would bury the log.
@@ -974,6 +977,7 @@ bool Source::fetchDescription() {
         return true;
     } catch (const std::exception& e) {
         LOG_DEBUG(m_cfg.name.c_str(), "/api/description unparseable: %s", e.what());
+        m_descriptionTried.store(true);
         return false;
     }
 }
@@ -1512,8 +1516,57 @@ void Source::discardTiming(const char* why) {
     LOG_DEBUG(m_cfg.name.c_str(), "timing discarded (%s)", why);
 }
 
+// 60 kHz tuned on the carrier is MSF or WWVB, and which is decided by where
+// the receiver is: the nearer transmitter. Anthorn serves Europe and Fort
+// Collins North America, 7000 km apart, so there is no receiver for which the
+// choice is close. Unknown while /api/description has not yet answered; WWVB,
+// as 60 kHz always was here, when it answered without coordinates or not at
+// all -- and then coordinates that turn up later still decide.
+clockdec::ClockStation Source::resolveLf60() {
+    GeoPoint loc;
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        loc = m_snap.receiverLocation;
+    }
+    if (loc.valid) {
+        const double dm = greatCircleMeters(loc, msfSite());
+        const double dw = greatCircleMeters(loc, wwvbSite());
+        return dm <= dw ? clockdec::ClockStation::Msf : clockdec::ClockStation::Wwvb;
+    }
+    if (m_lf60 != clockdec::ClockStation::Unknown) return m_lf60;
+    if (!m_descriptionTried.load()) return clockdec::ClockStation::Unknown;
+    return clockdec::ClockStation::Wwvb;
+}
+
 bool Source::ensureDecoder(int rate) {
-    if (m_decoderRate == rate && (m_wwv || m_wwvb || m_dcf77)) return true;
+    if (m_broadcast == Broadcast::Lf60) {
+        // Nothing is decoded until the station is decided -- a few hundred
+        // milliseconds after the socket opens, when the description answers.
+        const clockdec::ClockStation want = resolveLf60();
+        if (want == clockdec::ClockStation::Unknown) return false;
+        if (want != m_lf60) {
+            GeoPoint loc;
+            {
+                std::lock_guard<std::mutex> lk(m_mu);
+                loc = m_snap.receiverLocation;
+                m_snap.station = want == clockdec::ClockStation::Msf ? "msf" : "wwvb";
+                updateDelayModel();
+            }
+            if (loc.valid) {
+                LOG_INFO(m_cfg.name.c_str(), "60 kHz: the receiver is %.0f km from MSF and %.0f km from WWVB; "
+                         "decoding %s", greatCircleMeters(loc, msfSite()) / 1000.0,
+                         greatCircleMeters(loc, wwvbSite()) / 1000.0,
+                         want == clockdec::ClockStation::Msf ? "MSF" : "WWVB");
+            } else {
+                LOG_WARN(m_cfg.name.c_str(), "60 kHz: the receiver publishes no coordinates, so MSF "
+                         "cannot be told from WWVB by where it is; decoding WWVB");
+            }
+            m_lf60Fallback = !loc.valid;
+            m_lf60 = want;
+            m_decoderRate = 0;   // (re)build below
+        }
+    }
+    if (m_decoderRate == rate && (m_wwv || m_wwvb || m_dcf77 || m_msf || m_allouis)) return true;
     if (m_decoderRate == rate && m_rateRefused) return false;   // said once, not per packet
 
     // The decoders decimate to a fixed series rate — 200 Hz for WWV/WWVH,
@@ -1530,6 +1583,8 @@ bool Source::ensureDecoder(int rate) {
         m_wwv.reset();
         m_wwvb.reset();
         m_dcf77.reset();
+        m_msf.reset();
+        m_allouis.reset();
         m_samplesWritten = 0;
         m_tsHave = false;
         m_clock.reset();
@@ -1562,6 +1617,9 @@ bool Source::ensureDecoder(int rate) {
     m_wwv.reset();
     m_wwvb.reset();
     m_dcf77.reset();
+    m_msf.reset();
+    m_allouis.reset();
+    m_wwvbFromIq = false;
     m_decoderRate = rate;
     m_samplesWritten = 0;
     m_lastFrameSamples = rate / 50;
@@ -1590,7 +1648,8 @@ bool Source::ensureDecoder(int rate) {
     // that plus a spread-spectrum phase code on IQ — so this is decided from
     // the tuning (broadcastFor), not offered as a setting. WWV and WWVH share
     // one decoder and it identifies which it is hearing itself.
-    const bool wwvb = m_broadcast == Broadcast::Wwvb;
+    const bool wwvb = m_broadcast == Broadcast::Wwvb ||
+                      (m_broadcast == Broadcast::Lf60 && m_lf60 == clockdec::ClockStation::Wwvb);
 
     // The plausibility gate. A deep fade zero-biases the same bits in every
     // frame of the voter's window, so the misread is unanimous and no
@@ -1600,9 +1659,50 @@ bool Source::ensureDecoder(int rate) {
     // being measured is milliseconds.
     auto reference = [] { return hostNowFields(static_cast<long long>(realtimeNow() * 1000.0)); };
 
-    if (m_iq) {
-        // The carrier's place in the baseband: 0 unless dial_hz moved it.
-        const double offsetHz = static_cast<double>(m_cfg.carrierHz) - static_cast<double>(m_cfg.dialHz);
+    auto wire = [&](auto& d) {
+        d->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
+        d->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
+        d->onFrame = [this](const clockdec::ClockFrameInfo& f) { onClockFrame(f); };
+        d->onTime = [this](const clockdec::ClockTimeInfo& t) { onClockTime(t); };
+        d->setPlausibility(reference, 24 * 60);
+    };
+    // The carrier's place in the baseband: 0 unless dial_hz moved it.
+    const double offsetHz = static_cast<double>(m_cfg.carrierHz) - static_cast<double>(m_cfg.dialHz);
+
+    if (m_broadcast == Broadcast::Allouis) {
+        m_allouis = std::make_unique<clockdec::AllouisDecoder>(rate, offsetHz);
+        wire(m_allouis);
+    } else if (m_broadcast == Broadcast::Lf60 && m_lf60 == clockdec::ClockStation::Msf) {
+        m_msf = std::make_unique<clockdec::MsfDecoder>(rate, offsetHz);
+        wire(m_msf);
+    } else if (m_broadcast == Broadcast::Lf60) {
+        // WWVB from IQ: its decoder wants the USB audio of a 59 kHz dial, with
+        // the carrier at 1000 Hz. The IQ is low-passed to +/-900 Hz -- WWVB's
+        // keying needs tens of hertz -- so that nothing below the carrier folds
+        // into the audio, shifted up by 1000 Hz, and its real part taken.
+        m_wwvb = std::make_unique<clockdec::WwvbDecoder>(rate);
+        wire(m_wwvb);
+        m_wwvbFromIq = true;
+        const double w0 = 2.0 * 3.14159265358979323846 * 900.0 / rate;
+        const double c = std::cos(w0), sn = std::sin(w0);
+        // Two Butterworth sections (Q 0.541, 1.307): fourth order, no overshoot to speak of.
+        const double qs[2] = {0.54119610014619698, 1.3065629648763766};
+        double delay = 0.0;
+        for (int sec = 0; sec < 2; ++sec) {
+            const double alpha = sn / (2.0 * qs[sec]);
+            const double a0 = 1.0 + alpha;
+            IqBiquad b;
+            b.b0 = ((1.0 - c) / 2.0) / a0; b.b1 = (1.0 - c) / a0; b.b2 = ((1.0 - c) / 2.0) / a0;
+            b.a1 = (-2.0 * c) / a0; b.a2 = (1.0 - alpha) / a0;
+            m_iqLp[static_cast<std::size_t>(sec)] = b;       // I
+            m_iqLp[static_cast<std::size_t>(sec + 2)] = b;   // Q
+            // DC group delay, samples: the edges WWVB is timed by are slow.
+            delay += 1.0 - (b.a1 + 2.0 * b.a2) / (1.0 + b.a1 + b.a2);
+        }
+        m_iqToAudioDelaySec = delay / rate;
+        m_iqShiftPhase = 0.0;
+        m_iqShiftStep = 2.0 * 3.14159265358979323846 * (1000.0 - offsetHz) / rate;
+    } else if (m_iq) {
         m_dcf77 = std::make_unique<clockdec::Dcf77Decoder>(rate, offsetHz);
         m_dcf77->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
         m_dcf77->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
@@ -1646,7 +1746,8 @@ bool Source::ensureDecoder(int rate) {
     }
 
     LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz%s",
-             m_iq ? "DCF77 (AM + PM, IQ)" : wwvb ? "WWVB" : "WWV/WWVH", rate, stationNote.c_str());
+             m_dcf77 ? "DCF77 (AM + PM, IQ)" : m_allouis ? "Allouis (PM, IQ)" : m_msf ? "MSF (IQ)"
+             : m_wwvbFromIq ? "WWVB (from IQ)" : wwvb ? "WWVB" : "WWV/WWVH", rate, stationNote.c_str());
     return true;
 }
 
@@ -1669,16 +1770,39 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     if (m_mono.size() < values) m_mono.resize(values);
     for (std::size_t i = 0; i < values; ++i) m_mono[i] = pcm[i] * (1.0f / 32768.0f);
 
-    if (m_dcf77) m_dcf77->process(m_mono.data(), static_cast<std::size_t>(count));
-    else if (m_wwv) m_wwv->process(m_mono.data(), static_cast<std::size_t>(count));
-    else m_wwvb->process(m_mono.data(), static_cast<std::size_t>(count));
+    const std::size_t n = static_cast<std::size_t>(count);
+    if (m_dcf77) m_dcf77->process(m_mono.data(), n);
+    else if (m_allouis) m_allouis->process(m_mono.data(), n);
+    else if (m_msf) m_msf->process(m_mono.data(), n);
+    else if (m_wwv) m_wwv->process(m_mono.data(), n);
+    else if (m_wwvbFromIq) {
+        if (m_audio.size() < n) m_audio.resize(n);
+        auto run = [](IqBiquad& b, double x) {
+            const double y = b.b0 * x + b.z1;
+            b.z1 = b.b1 * x - b.a1 * y + b.z2;
+            b.z2 = b.b2 * x - b.a2 * y;
+            return y;
+        };
+        for (std::size_t i = 0; i < n; ++i) {
+            const double I = run(m_iqLp[1], run(m_iqLp[0], m_mono[2 * i]));
+            const double Q = run(m_iqLp[3], run(m_iqLp[2], m_mono[2 * i + 1]));
+            // Re((I + jQ) e^{+j phi}): the baseband moved up to 1 kHz.
+            m_audio[i] = static_cast<float>(I * std::cos(m_iqShiftPhase) - Q * std::sin(m_iqShiftPhase));
+            m_iqShiftPhase += m_iqShiftStep;
+            if (m_iqShiftPhase > 6.283185307179586) m_iqShiftPhase -= 6.283185307179586;
+        }
+        m_wwvb->process(m_audio.data(), n);
+    } else m_wwvb->process(m_mono.data(), n);
 
     // Diagnostics are assembled on call from state the decoder already holds,
     // so this costs nothing on the sample path and keeps the status report
     // current without a second timer reaching into the decoder.
-    const auto d = m_dcf77 ? m_dcf77->diagnostics() : m_wwv ? m_wwv->diagnostics() : m_wwvb->diagnostics();
-    const auto st = m_dcf77 ? m_dcf77->station() : m_wwv ? m_wwv->station() : m_wwvb->station();
-    const auto consumed = m_dcf77 ? m_dcf77->samplesConsumed()
+    const auto d = m_dcf77 ? m_dcf77->diagnostics() : m_allouis ? m_allouis->diagnostics()
+                 : m_msf ? m_msf->diagnostics() : m_wwv ? m_wwv->diagnostics() : m_wwvb->diagnostics();
+    const auto st = m_dcf77 ? m_dcf77->station() : m_allouis ? m_allouis->station()
+                  : m_msf ? m_msf->station() : m_wwv ? m_wwv->station() : m_wwvb->station();
+    const auto consumed = m_dcf77 ? m_dcf77->samplesConsumed() : m_allouis ? m_allouis->samplesConsumed()
+                        : m_msf ? m_msf->samplesConsumed()
                         : m_wwv ? m_wwv->samplesConsumed() : m_wwvb->samplesConsumed();
 
     if (m_wwv) {
@@ -1702,6 +1826,13 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     m_snap.windowSize = d.windowSize;
     m_snap.voteQuality = d.voteQuality;
     m_snap.samplesConsumed = consumed;
+    if (m_allouis || m_msf) {
+        // Allouis is timed by its phase alone: the same fields as DCF77's PM.
+        m_snap.pmLocked = d.pmLocked;
+        m_snap.pmSnrDb = d.pmSnrDb;
+        m_snap.timingFromPm = d.timingFromPm;
+        m_snap.carrierOffsetHz = d.carrierOffsetHz;
+    }
     if (m_dcf77) {
         m_snap.pmLocked = d.pmLocked;
         m_snap.pmSnrDb = d.pmSnrDb;
@@ -1735,12 +1866,14 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     // DCF77 is the only thing on 77.5 kHz, as WWV is on 20 and 25 MHz: the tag
     // is the carrier's, and does not blink to "unknown" while a new decoder
     // looks for it.
-    const char* station = m_dcf77 ? "dcf77" : "unknown";
+    const char* station = m_dcf77 ? "dcf77" : m_allouis ? "allouis" : m_msf ? "msf" : "unknown";
     switch (st) {
         case clockdec::ClockStation::Wwv:  station = "wwv"; break;
         case clockdec::ClockStation::Wwvh: station = "wwvh"; break;
         case clockdec::ClockStation::Wwvb: station = "wwvb"; break;
         case clockdec::ClockStation::Dcf77: station = "dcf77"; break;
+        case clockdec::ClockStation::Msf: station = "msf"; break;
+        case clockdec::ClockStation::Allouis: station = "allouis"; break;
         default: break;
     }
     if (m_snap.station != station) {
@@ -1796,6 +1929,9 @@ void Source::resetStream(const char* why) {
     m_wwv.reset();
     m_wwvb.reset();
     m_dcf77.reset();
+    m_msf.reset();
+    m_allouis.reset();
+    m_wwvbFromIq = false;
 
     std::lock_guard<std::mutex> lk(m_mu);
     m_snap.timingMode = "pending";
@@ -2146,8 +2282,14 @@ void Source::recomputeOffset() {
                             m_snap.timingMode == "capture" && !m_snap.capturePaused &&
                             (m_snap.station == "wwv" || m_snap.station == "wwvh") &&
                             m_snap.receiverLocation.valid;
+    // Allouis, likewise: timed by its phase, capture-timed, and inside the
+    // groundwave's reach of Allouis.
+    const bool allouisCapture = m_cfg.autoDelay && m_broadcast == Broadcast::Allouis &&
+                                m_snap.timingMode == "capture" && m_snap.pmLocked && m_snap.timingFromPm &&
+                                !m_snap.capturePaused && m_snap.receiverLocation.valid &&
+                                greatCircleMeters(m_snap.receiverLocation, allouisSite()) <= kLfGroundwaveServiceM;
     double delayUncertainty;
-    if (lfPmCapture) {
+    if (lfPmCapture || allouisCapture) {
         delayUncertainty = std::max(kDelayUncertaintyFloorLfPmSec, m_snap.delaySec * kDelayUncertaintyFraction);
     } else if (wwvCapture) {
         const GeoPoint tx = m_snap.station == "wwvh" ? wwvhSite() : wwvSite();
@@ -2224,13 +2366,19 @@ void Source::updateDelayModel() {
     // tag is used the moment it is available.
     GeoPoint tx;
     bool lf = false;
+    bool undecided = false;
     if (m_broadcast == Broadcast::Dcf77) { tx = dcf77Site(); lf = true; }
+    else if (m_broadcast == Broadcast::Allouis) { tx = allouisSite(); lf = true; }
+    else if (m_snap.station == "msf") { tx = msfSite(); lf = true; }
+    else if (m_broadcast == Broadcast::Lf60 && m_snap.station != "wwvb") undecided = true;
     else if (m_snap.station == "wwvh") tx = wwvhSite();
     else if (m_snap.station == "wwvb" || m_broadcast == Broadcast::Wwvb) { tx = wwvbSite(); lf = true; }
     else tx = wwvSite();
 
     double prop = 0.0;
-    if (m_snap.receiverLocation.valid) {
+    if (undecided) {
+        m_snap.pathDescription = "60 kHz: MSF or WWVB not yet decided (it waits for the receiver's coordinates)";
+    } else if (m_snap.receiverLocation.valid) {
         // 60 and 77.5 kHz get the groundwave, not F-layer hops. See Propagation.h.
         const double d = greatCircleMeters(m_snap.receiverLocation, tx);
         prop = lf ? lfDelaySeconds(d) : skywaveDelaySeconds(d);
@@ -2298,7 +2446,12 @@ void Source::updateDelayModel() {
     // is timing them (tools/dcf77test), so it has none either.
     // WWV's residual rides here too (kWwvResidualSec), with the term it is most
     // likely to belong to.
-    const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec + kWwvResidualSec : 0.0;
+    // MSF's and Allouis's decoders put the edge where the station puts the
+    // second (MsfDecoder, AllouisDecoder), so neither has one. WWVB taken from
+    // IQ is timed through the low-pass that turns it into audio, whose delay
+    // is exactly known (ensureDecoder) and taken off here.
+    const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec + kWwvResidualSec
+                         : m_wwvbFromIq ? m_iqToAudioDelaySec : 0.0;
 
     m_snap.propagationSec = prop;
     m_snap.networkSec = net;
@@ -2408,7 +2561,7 @@ SourceSnapshot Source::snapshot() const {
               ? (m_broadcast == Broadcast::Wwv
                      ? std::string("no tick: nothing at 1000 Hz to time a second from")
                      : std::string("no carrier: the transmitter is not heard at ") +
-                           (m_broadcast == Broadcast::Dcf77 ? "77.5" : "60") + " kHz")
+                           (m_broadcast == Broadcast::Dcf77 ? "77.5" : m_broadcast == Broadcast::Allouis ? "162" : "60") + " kHz")
           : !s.phaseLocked                 ? "no edge: the tick is heard but not yet tracked"
           : !s.anchored                    ? "no frame: edges are tracked but no minute has decoded"
           : s.refusal != "none"            ? "frames refused: " + s.refusal

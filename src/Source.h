@@ -38,7 +38,10 @@
 #include "clock/WwvDecoder.h"
 #include "clock/WwvbDecoder.h"
 #include "clock/Dcf77Decoder.h"
+#include "clock/MsfDecoder.h"
+#include "clock/AllouisDecoder.h"
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
@@ -137,8 +140,9 @@ private:
     void recordWsRtt(double rttSec);
 
     SourceConfig m_cfg;
-    // What is being listened to, from the tuning (Config.h, broadcastFor). DCF77
-    // is taken as IQ -- two channels a frame -- and everything else as mono audio.
+    // What is being listened to, from the tuning (Config.h, broadcastFor). The
+    // LF stations are taken as IQ -- two channels a frame (isIqBroadcast) --
+    // and everything else as mono audio.
     const Broadcast m_broadcast;
     const bool m_iq;
     const int m_channels;
@@ -176,6 +180,9 @@ private:
     double m_lastTimeAt = 0.0;
     std::atomic<bool> m_socketOpen{false};
     bool m_haveDescription = false;   // supervisor thread only
+    // /api/description has answered, or failed, at least once: what a 60 kHz
+    // source waits for before choosing MSF or WWVB (resolveLf60).
+    std::atomic<bool> m_descriptionTried{false};
 
     // The leap warning bit is taken from single frames, so one misread frame
     // would otherwise announce a leap second to every client.
@@ -190,6 +197,24 @@ private:
     std::unique_ptr<clockdec::WwvDecoder> m_wwv;
     std::unique_ptr<clockdec::WwvbDecoder> m_wwvb;
     std::unique_ptr<clockdec::Dcf77Decoder> m_dcf77;
+    std::unique_ptr<clockdec::MsfDecoder> m_msf;
+    std::unique_ptr<clockdec::AllouisDecoder> m_allouis;
+    // 60 kHz tuned on the carrier (Broadcast::Lf60): which station the
+    // receiver's location made it, Unknown until decided, and whether that was
+    // the no-coordinates fallback (so coordinates that turn up later can undo
+    // it). WebSocket thread.
+    clockdec::ClockStation m_lf60 = clockdec::ClockStation::Unknown;
+    bool m_lf60Fallback = false;
+    // WWVB from IQ (Lf60 resolved to WWVB): the IQ turned into the USB audio
+    // its decoder was written for -- low-passed, shifted up 1 kHz, the real
+    // part -- and the low-pass's delay, which the delay model takes back off.
+    bool m_wwvbFromIq = false;
+    struct IqBiquad { double b0 = 1, b1 = 0, b2 = 0, a1 = 0, a2 = 0, z1 = 0, z2 = 0; };
+    std::array<IqBiquad, 4> m_iqLp{};   // I, I, Q, Q: two sections each
+    double m_iqShiftPhase = 0.0, m_iqShiftStep = 0.0;
+    double m_iqToAudioDelaySec = 0.0;
+    std::vector<float> m_audio;
+    clockdec::ClockStation resolveLf60();
     // DCF77: the timing source last logged, and the one being seen and since
     // when, so a change is logged once it has held (WebSocket thread).
     int m_loggedTimingPm = -1;

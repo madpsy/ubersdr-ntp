@@ -49,7 +49,8 @@ bool parseSecondaryMode(const std::string& s, SecondaryMode& out) {
 }
 
 std::uint64_t dialForCarrier(std::uint64_t carrierHz) {
-    if (carrierHz == kDcf77CarrierHz) return carrierHz;
+    if (carrierHz == kDcf77CarrierHz || carrierHz == kAllouisCarrierHz || carrierHz == kLf60CarrierHz)
+        return carrierHz;
     return carrierHz > 1000 ? carrierHz - 1000 : 0;
 }
 
@@ -422,12 +423,13 @@ bool Config::finalise(std::string& err) {
         }
 
         const Broadcast bc = broadcastFor(s.carrierHz, s.dialHz);
-        if (bc == Broadcast::Dcf77) {
+        if (bc == Broadcast::Dcf77 || bc == Broadcast::Allouis) {
             const std::uint64_t off = s.dialHz > s.carrierHz ? s.dialHz - s.carrierHz
                                                              : s.carrierHz - s.dialHz;
+            const char* what = bc == Broadcast::Dcf77 ? "DCF77" : "Allouis";
             if (off > kDcf77MaxDialOffsetHz) {
-                err = "source \"" + (s.name.empty() ? std::string("dcf77") : s.name) +
-                      "\": dial_hz " + std::to_string(s.dialHz) + " puts the DCF77 carrier " +
+                err = "source \"" + (s.name.empty() ? std::string(bc == Broadcast::Dcf77 ? "dcf77" : "allouis") : s.name) +
+                      "\": dial_hz " + std::to_string(s.dialHz) + " puts the " + what + " carrier " +
                       std::to_string(off) + " Hz off, outside the 12 kHz IQ passband; "
                       "leave dial_hz out and it goes on the carrier";
                 return false;
@@ -438,7 +440,8 @@ bool Config::finalise(std::string& err) {
             // Named after what it listens to, which is what anyone reading the
             // log wants to see anyway.
             std::ostringstream os;
-            os << (bc == Broadcast::Dcf77 ? "dcf77" : bc == Broadcast::Wwvb ? "wwvb" : "wwv");
+            os << (bc == Broadcast::Dcf77 ? "dcf77" : bc == Broadcast::Allouis ? "allouis"
+                   : bc == Broadcast::Lf60 ? "lf60" : bc == Broadcast::Wwvb ? "wwvb" : "wwv");
             if (bc == Broadcast::Wwv) os << (s.carrierHz / 1000000) << "M";
             os << "-" << ++autoName;
             s.name = os.str();
@@ -465,9 +468,9 @@ bool Config::finalise(std::string& err) {
         // Reduced depth exists for IQ only; the server sends a demodulated
         // channel lossless whatever it is asked. Not an error -- it may well
         // have come in from "defaults" -- but not what the setting says either.
-        if (s.minMarginDb > 0 && broadcastFor(s.carrierHz, s.dialHz) != Broadcast::Dcf77) {
-            warnings.push_back(label + "min_margin applies to DCF77's IQ stream only; this source "
-                               "is received as audio, which UberSDR always sends lossless");
+        if (s.minMarginDb > 0 && !isIqBroadcast(broadcastFor(s.carrierHz, s.dialHz))) {
+            warnings.push_back(label + "min_margin applies to the LF sources' IQ streams only; this "
+                               "source is received as audio, which UberSDR always sends lossless");
         }
         if (s.enabled) ++enabled;
     }

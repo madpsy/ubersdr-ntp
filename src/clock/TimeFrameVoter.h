@@ -40,6 +40,8 @@ enum class ClockStation : int {
     Wwvh    = 2,
     Wwvb    = 3,
     Dcf77   = 4,
+    Msf     = 5,
+    Allouis = 6,
 };
 
 // Why locked() currently says no (WS-7 acquisition telemetry). A tag on the
