@@ -2,6 +2,7 @@
 
 #include "CivilTime.h"
 #include "Log.h"
+#include "ThreadPriority.h"
 #include "SampleClock.h"
 
 #include "../third_party/json.hpp"
@@ -535,6 +536,9 @@ void HttpApi::stop() {
 }
 
 void HttpApi::accept() {
+    // Below the decoders, and far below the NTP replies; every connection
+    // thread started here inherits it (ThreadPriority.h).
+    setThreadNice(kReportingNice);
     while (m_running.load()) {
         struct pollfd pfd{m_listenFd, POLLIN, 0};
         const int pr = ::poll(&pfd, 1, 500);

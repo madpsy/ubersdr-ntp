@@ -220,6 +220,7 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
             c.warnings.push_back(os.str());
         }
         if (!getOpt(n, "drift_file", c.ntp.driftFile, err)) return false;
+        if (!getOpt(n, "realtime_priority", c.ntp.realtimePriority, err)) return false;
         if (auto lit = n.find("listen"); lit != n.end() && !lit->is_null()) {
             if (!getOpt(n, "listen", c.ntp.listen, err)) return false;
         }
@@ -379,6 +380,11 @@ bool Config::finalise(std::string& err) {
     };
     if (!finiteAtLeast(ntp.coastSeconds, 0.0, "ntp.coast_seconds")) return false;
     if (!finiteAtLeast(ntp.coastDriftPpm, 0.0, "ntp.coast_drift_ppm")) return false;
+    if (ntp.realtimePriority < 0 || ntp.realtimePriority > 99) {
+        err = "ntp.realtime_priority is " + std::to_string(ntp.realtimePriority) +
+              "; it must be 0 (normal priority) or a SCHED_FIFO priority from 1 to 99";
+        return false;
+    }
     {
         const RateLimitConfig& rl = ntp.rateLimit;
         std::ostringstream os;

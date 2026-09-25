@@ -82,6 +82,14 @@
         "exempt": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
       }
 
+    // Real-time (SCHED_FIFO) priority for the threads that answer NTP, 1-99, or
+    // 0 for normal priority. A reply's transmit timestamp is read just before
+    // it is sent; a thread preempted in between gives the client that delay as
+    // offset. They sleep until a request and take microseconds on it, so this
+    // starves nothing, and the decoders stay at normal priority. The compose
+    // file's "ulimits: rtprio" must be at least this; the log says if not.
+    // , "realtime_priority": 10
+
     // Where the crystal's fitted frequency is kept between runs -- ntpd's
     // driftfile, for ntpd's reason. "-" disables it. In the addon the default
     // is /var/lib/ubersdr-ntp/drift, on the compose file's "state" volume,

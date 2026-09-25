@@ -59,6 +59,9 @@
 #include <thread>
 #include <vector>
 
+#include <sys/mman.h>
+#include <sys/resource.h>
+
 namespace {
 
 constexpr const char* kTag = "main";
@@ -414,6 +417,26 @@ int main(int argc, char** argv) {
     }
 
     // --- runtime ------------------------------------------------------------
+
+    // Memory locked, so a page fault can never stall an NTP reply between its
+    // transmit timestamp and the send. Only when RLIMIT_MEMLOCK is unlimited
+    // (the compose file's ulimits, systemd's LimitMEMLOCK): MCL_FUTURE under a
+    // finite limit would make a later allocation fail once the daemon grew
+    // past it, which is a crash in place of a rare fault. Otherwise skipped,
+    // and said.
+    {
+        struct rlimit rl{};
+        if (::getrlimit(RLIMIT_MEMLOCK, &rl) == 0 && rl.rlim_cur == RLIM_INFINITY) {
+            if (::mlockall(MCL_CURRENT | MCL_FUTURE) == 0) {
+                LOG_INFO(kTag, "memory locked: no page fault can delay a reply");
+            } else {
+                LOG_WARN(kTag, "cannot lock memory (%s); running without", std::strerror(errno));
+            }
+        } else {
+            LOG_INFO(kTag, "memory not locked: RLIMIT_MEMLOCK is not unlimited "
+                     "(compose: ulimits memlock -1, systemd: LimitMEMLOCK=infinity)");
+        }
+    }
     // SIGPIPE is ignored rather than handled: a client that closes an HTTP or
     // SSE connection mid-write would otherwise kill the process, and every
     // write site already checks its return value.

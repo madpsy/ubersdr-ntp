@@ -44,6 +44,15 @@ RestartSec=10
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 CapabilityBoundingSet=CAP_NET_BIND_SERVICE
 
+# The NTP reply threads run SCHED_FIFO at ntp.realtime_priority (default 10):
+# the transmit timestamp is read just before the send, and a thread preempted in
+# between hands the client that delay as offset. The limit is what permits it,
+# with no capability; they sleep until a request and use microseconds on it, and
+# the decoders stay at normal priority. So RestrictRealtime= is not set here.
+# Memory is locked (unlimited MEMLOCK) so no page fault lands in that gap either.
+LimitRTPRIO=10
+LimitMEMLOCK=infinity
+
 # /var/log/ubersdr-ntp, created and chowned to the dynamic UID on every start.
 # ReadWritePaths= is no substitute: it lifts ProtectSystem= for the path but
 # does not change its owner, and a dynamic UID cannot be given ownership of a
@@ -64,7 +73,6 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
-RestrictRealtime=yes
 LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native

@@ -539,6 +539,20 @@ void testRateLimit() {
     check("every setting is read", set.ok && s.intervalSec == 8.0 && s.burst == 4 && !s.kod &&
           s.leak == 0.25 && s.ipv4Prefix == 24 && s.ipv6Prefix == 56 && s.exempt.size() == 3, "%s", set.why());
 
+    check("ntp.realtime_priority defaults to 10", def.ok && def.cfg.ntp.realtimePriority == 10);
+    for (const char* rp : {"0", "10", "99"}) {
+        const Loaded r = load(std::string(R"({"ntp":{"realtime_priority":)") + rp +
+                              R"(},"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+        check((std::string("realtime_priority ") + rp + " loads").c_str(),
+              r.ok && r.cfg.ntp.realtimePriority == std::atoi(rp), "%s", r.why());
+    }
+    for (const char* rp : {"-1", "100"}) {
+        const Loaded r = load(std::string(R"({"ntp":{"realtime_priority":)") + rp +
+                              R"(},"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+        check((std::string("realtime_priority ") + rp + " is refused").c_str(),
+              r.failedWith("realtime_priority"), "%s", r.why());
+    }
+
     const Loaded part = load(R"({"ntp":{"port":123,"rate_limit":{"burst":3}},
                                  "sources":[{"url":"http://r.example","carrier_hz":77500}]})");
     const RateLimitConfig& pr = part.cfg.ntp.rateLimit;

@@ -3,7 +3,22 @@ services:
     image: madpsy/ubersdr-ntp:latest
     container_name: ntp
     restart: unless-stopped
-    cpu_shares: 512
+    # No cpu_shares: the default, the same footing as everything else. Less
+    # would make the decoders the first to fall behind under load, when they
+    # most need to keep up; radiod, which the capture timing rests on, is
+    # real-time itself and was never protected by it. Within this container
+    # the status page and MQTT already yield to the decoders (nice 10).
+    # As near real time as the answer needs, and no further:
+    #   rtprio   lets the NTP reply threads run SCHED_FIFO at
+    #            ntp.realtime_priority (default 10). They sleep until a request
+    #            and use microseconds on it, so nothing else is starved -- and
+    #            the decoders stay at normal priority, below radiod.
+    #   memlock  unlimited, so the daemon locks its memory and no page fault can
+    #            land between a reply's transmit timestamp and its send.
+    # Without these it still runs, at normal priority, and says so in the log.
+    ulimits:
+      rtprio: 10
+      memlock: -1
     # Every setting is in ./config/config.json — the receivers, frequencies,
     # upstream NTP servers and ports. Edit it there, then ./restart.sh.
     #

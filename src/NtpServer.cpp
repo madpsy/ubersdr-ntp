@@ -12,6 +12,8 @@
 #include <ctime>
 #include <netinet/in.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -130,6 +132,12 @@ bool NtpServer::start(std::string& err) {
         // process reading it is real delay that the client would otherwise see
         // as our asymmetry; asking the kernel removes it. Best-effort: a
         // platform without it falls back to reading the clock on wake-up.
+        // Replies ahead of bulk traffic in the host's queues. 6 is the highest
+        // SO_PRIORITY an unprivileged socket may set.
+        {
+            const int prio = 6;
+            ::setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &prio, sizeof prio);
+        }
 #ifdef SO_TIMESTAMPNS
         ::setsockopt(fd, SOL_SOCKET, SO_TIMESTAMPNS, &one, sizeof one);
 #endif
@@ -214,7 +222,33 @@ void NtpServer::stop() {
     m_threads.clear();
 }
 
+void NtpServer::enterRealtime() {
+    const int prio = m_cfg.realtimePriority;
+    int rc = 0;
+    if (prio > 0) {
+        struct sched_param sp{};
+        sp.sched_priority = prio;
+        rc = ::pthread_setschedparam(::pthread_self(), SCHED_FIFO, &sp);
+    }
+    // Once for the service, not once a listener: they all get the same answer.
+    bool first = false;
+    if (!m_realtimeLogged.compare_exchange_strong(first, true)) return;
+    if (prio <= 0) {
+        LOG_INFO(kTag, "answering at normal priority (ntp.realtime_priority is 0)");
+    } else if (rc == 0) {
+        LOG_INFO(kTag, "answering at real-time priority %d (SCHED_FIFO)", prio);
+    } else {
+        // Not fatal: an unattended install must keep serving, and normal
+        // priority is only less exact under load, not wrong.
+        LOG_WARN(kTag, "cannot answer at real-time priority %d (%s), so replies run at normal "
+                 "priority; allow it with RLIMIT_RTPRIO >= %d (compose: ulimits rtprio, "
+                 "systemd: LimitRTPRIO) or CAP_SYS_NICE",
+                 prio, std::strerror(rc), prio);
+    }
+}
+
 void NtpServer::serve(int fd, const std::string& label) {
+    enterRealtime();
     std::uint8_t buf[1024];
 
     while (m_running.load()) {

@@ -2,6 +2,7 @@
 
 #include "CivilTime.h"
 #include "Log.h"
+#include "ThreadPriority.h"
 #include "SampleClock.h"
 #include "Version.h"
 
@@ -255,6 +256,7 @@ void MqttPublisher::stop() {
 }
 
 void MqttPublisher::run() {
+    setThreadNice(kReportingNice);   // reporting only: see ThreadPriority.h
     while (m_running) {
         const double now = monotonicNow();
 

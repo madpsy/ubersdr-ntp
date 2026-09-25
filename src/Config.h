@@ -222,6 +222,17 @@ struct NtpConfig {
     // network that a leap second is coming.
     bool honourLeapWarning = true;
 
+    // SCHED_FIFO priority for the threads that answer NTP requests, 1-99; 0
+    // leaves them at normal priority. The transmit timestamp is read just
+    // before the reply is sent, and a thread preempted in between hands the
+    // client that delay as offset, uncorrected. They sleep in recvmsg and use
+    // microseconds a packet, so real-time costs nothing else anything; the
+    // decoders stay at normal priority, where they cannot starve radiod. Needs
+    // RLIMIT_RTPRIO at least this (the compose file's ulimits, systemd's
+    // LimitRTPRIO) or CAP_SYS_NICE; without either the replies run at normal
+    // priority and the log says so once.
+    int realtimePriority = 10;
+
     // See RateLimitConfig. The old ntp.rate_limit_per_client (responses per
     // second, burst the same) is still read, into this, with a warning.
     RateLimitConfig rateLimit;

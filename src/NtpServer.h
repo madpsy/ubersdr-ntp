@@ -83,6 +83,9 @@ public:
 
 private:
     void serve(int fd, const std::string& label);
+    // Puts the calling reply thread at ntp.realtime_priority (see NtpConfig).
+    void enterRealtime();
+    std::atomic<bool> m_realtimeLogged{false};
 
     NtpConfig m_cfg;
     Selector& m_selector;
