@@ -104,7 +104,7 @@ std::string addressText(const struct sockaddr_storage& sa) {
 } // namespace
 
 NtpServer::NtpServer(NtpConfig cfg, Selector& selector)
-    : m_cfg(std::move(cfg)), m_selector(selector) {}
+    : m_cfg(std::move(cfg)), m_selector(selector), m_limiter(m_cfg.rateLimit) {}
 
 NtpServer::~NtpServer() { stop(); }
 
@@ -214,63 +214,6 @@ void NtpServer::stop() {
     m_threads.clear();
 }
 
-bool NtpServer::rateLimitAllows(const std::string& key, double now) {
-    if (m_cfg.rateLimitPerClient <= 0.0) return true;
-
-    std::lock_guard<std::mutex> lk(m_mu);
-
-    // Sweep occasionally so the map cannot grow without bound. Anything that
-    // has not been seen for a minute has a full bucket anyway, so dropping it
-    // loses nothing.
-    if (now - m_lastSweep > 60.0) {
-        for (auto it = m_buckets.begin(); it != m_buckets.end();) {
-            if (now - it->second.at > 60.0) it = m_buckets.erase(it);
-            else ++it;
-        }
-        m_lastSweep = now;
-    }
-
-    const double burst = std::max(1.0, m_cfg.rateLimitPerClient);
-    auto it = m_buckets.find(key);
-    if (it == m_buckets.end()) {
-        // The minute sweep bounds the map for honest traffic, not for a flood
-        // of spoofed source addresses, which can add a fresh key every packet.
-        // So there is a hard cap: when it is reached, sweep now (with a shorter
-        // idle threshold than the minute, since a bucket idle for burst/rate
-        // seconds is already full and forgetting it changes nothing), and if
-        // the map is still full, answer this client WITHOUT tracking it. At
-        // most one such sweep a second: under a sustained flood every packet
-        // is a new key, and an O(n) walk of the map per packet, under the
-        // lock every listener shares, would be a denial of service by itself.
-        //
-        // Fail-open rather than fail-closed: refusing untracked keys would let
-        // the same flood lock out every legitimate client that had not been
-        // seen before it began, which turns a memory bound into a denial of
-        // service. The cost of fail-open is that a flood of >kMaxBuckets
-        // distinct addresses is not rate-limited -- but each of those gets
-        // one reply the size of its request, gain 1, which is exactly what it
-        // would get if it were within its limit anyway.
-        if (m_buckets.size() >= kMaxBuckets) {
-            if (now - m_lastSweep < 1.0) return true;
-            const double idle = std::min(60.0, burst / m_cfg.rateLimitPerClient);
-            for (auto sit = m_buckets.begin(); sit != m_buckets.end();) {
-                if (now - sit->second.at > idle) sit = m_buckets.erase(sit);
-                else ++sit;
-            }
-            m_lastSweep = now;
-            if (m_buckets.size() >= kMaxBuckets) return true;
-        }
-        m_buckets.emplace(key, Bucket{burst - 1.0, now});
-        return true;
-    }
-    Bucket& b = it->second;
-    b.tokens = std::min(burst, b.tokens + (now - b.at) * m_cfg.rateLimitPerClient);
-    b.at = now;
-    if (b.tokens < 1.0) return false;
-    b.tokens -= 1.0;
-    return true;
-}
-
 void NtpServer::serve(int fd, const std::string& label) {
     std::uint8_t buf[1024];
 
@@ -376,9 +319,79 @@ void NtpServer::serve(int fd, const std::string& label) {
         }
 
         const std::string peer = addressText(from);
-        if (!rateLimitAllows(peer, monotonicNow())) {
+
+        // Sent from the address the request arrived on (see start()).
+        auto reply = [&](const std::uint8_t* out) {
+            struct iovec oiov{const_cast<std::uint8_t*>(out), kPacketSize};
+            alignas(struct cmsghdr) char ocontrol[CMSG_SPACE(sizeof(struct in6_pktinfo))] = {};
+            struct msghdr omh{};
+            omh.msg_name = &from;
+            omh.msg_namelen = mh.msg_namelen;
+            omh.msg_iov = &oiov;
+            omh.msg_iovlen = 1;
+            if (haveDst4) {
+                omh.msg_control = ocontrol;
+                omh.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
+                struct cmsghdr* cm = CMSG_FIRSTHDR(&omh);
+                cm->cmsg_level = IPPROTO_IP;
+                cm->cmsg_type = IP_PKTINFO;
+                cm->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
+                // ipi_spec_dst, not ipi_addr: for a unicast request they are the
+                // same address, and for a broadcast one only spec_dst is a usable
+                // source. The interface is left to routing.
+                struct in_pktinfo pi{};
+                pi.ipi_spec_dst = dst4.ipi_spec_dst;
+                std::memcpy(CMSG_DATA(cm), &pi, sizeof pi);
+            } else if (haveDst6) {
+                omh.msg_control = ocontrol;
+                omh.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
+                struct cmsghdr* cm = CMSG_FIRSTHDR(&omh);
+                cm->cmsg_level = IPPROTO_IPV6;
+                cm->cmsg_type = IPV6_PKTINFO;
+                cm->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
+                // The interface too: a link-local address means nothing without it.
+                std::memcpy(CMSG_DATA(cm), &dst6, sizeof dst6);
+            }
+            const ssize_t sent = ::sendmsg(fd, &omh, 0);
+            if (sent < 0) {
+                std::lock_guard<std::mutex> lk(m_mu);
+                m_stats.sendErrors++;
+                // Not logged per packet: an unreachable client is the client's
+                // problem and a noisy one would fill the log with it.
+                if (m_stats.sendErrors % 1000 == 1) {
+                    LOG_WARN(kTag, "sendto %s: %s", peer.c_str(), std::strerror(errno));
+                }
+            }
+            return sent >= 0;
+        };
+
+        const RateVerdict verdict = m_limiter.check(from, monotonicNow());
+        if (verdict == RateVerdict::Drop) {
             std::lock_guard<std::mutex> lk(m_mu);
             m_stats.rateLimited++;
+            continue;
+        }
+        if (verdict == RateVerdict::Kod) {
+            // RFC 5905 7.4: stratum 0 makes the refid a kiss code, and RATE
+            // asks the client to poll less often. No time in it: all three
+            // timestamps are the client's own transmit time, as ntpd sends
+            // them, so the client can match it to its request and learns
+            // nothing it could set a clock from.
+            std::uint8_t kod[kPacketSize];
+            std::memset(kod, 0, sizeof kod);
+            kod[0] = static_cast<std::uint8_t>((3 << 6) | (version << 3) | 4);
+            kod[1] = 0;
+            std::int8_t poll = static_cast<std::int8_t>(buf[2]);
+            kod[2] = static_cast<std::uint8_t>(std::clamp<std::int8_t>(poll, 4, 17));
+            kod[3] = static_cast<std::uint8_t>(clockPrecision());
+            std::memcpy(kod + 12, "RATE", 4);
+            std::memcpy(kod + 24, buf + 40, 8);
+            std::memcpy(kod + 32, buf + 40, 8);
+            std::memcpy(kod + 40, buf + 40, 8);
+            const bool ok = reply(kod);
+            std::lock_guard<std::mutex> lk(m_mu);
+            m_stats.rateLimited++;
+            if (ok) m_stats.kodSent++;
             continue;
         }
 
@@ -481,37 +494,6 @@ void NtpServer::serve(int fd, const std::string& label) {
         put32(out + 32, rec.sec);
         put32(out + 36, rec.frac);
 
-        // Sent from the address the request arrived on (see start()).
-        struct iovec oiov{out, sizeof out};
-        alignas(struct cmsghdr) char ocontrol[CMSG_SPACE(sizeof(struct in6_pktinfo))] = {};
-        struct msghdr omh{};
-        omh.msg_name = &from;
-        omh.msg_namelen = mh.msg_namelen;
-        omh.msg_iov = &oiov;
-        omh.msg_iovlen = 1;
-        if (haveDst4) {
-            omh.msg_control = ocontrol;
-            omh.msg_controllen = CMSG_SPACE(sizeof(struct in_pktinfo));
-            struct cmsghdr* cm = CMSG_FIRSTHDR(&omh);
-            cm->cmsg_level = IPPROTO_IP;
-            cm->cmsg_type = IP_PKTINFO;
-            cm->cmsg_len = CMSG_LEN(sizeof(struct in_pktinfo));
-            // ipi_spec_dst, not ipi_addr: for a unicast request they are the
-            // same address, and for a broadcast one only spec_dst is a usable
-            // source. The interface is left to routing.
-            struct in_pktinfo pi{};
-            pi.ipi_spec_dst = dst4.ipi_spec_dst;
-            std::memcpy(CMSG_DATA(cm), &pi, sizeof pi);
-        } else if (haveDst6) {
-            omh.msg_control = ocontrol;
-            omh.msg_controllen = CMSG_SPACE(sizeof(struct in6_pktinfo));
-            struct cmsghdr* cm = CMSG_FIRSTHDR(&omh);
-            cm->cmsg_level = IPPROTO_IPV6;
-            cm->cmsg_type = IPV6_PKTINFO;
-            cm->cmsg_len = CMSG_LEN(sizeof(struct in6_pktinfo));
-            // The interface too: a link-local address means nothing without it.
-            std::memcpy(CMSG_DATA(cm), &dst6, sizeof dst6);
-        }
         // Transmit, as late as it can be read: after everything above, so the
         // reply's own assembly is inside the server's hold time (T3 - T2)
         // rather than counted as path. The kernel's send path after this is
@@ -519,16 +501,8 @@ void NtpServer::serve(int fd, const std::string& label) {
         const NtpTime xmt = toNtpTime(c.utcAt(daemonNow()));
         put32(out + 40, xmt.sec);
         put32(out + 44, xmt.frac);
-        const ssize_t sent = ::sendmsg(fd, &omh, 0);
-        std::lock_guard<std::mutex> lk(m_mu);
-        if (sent < 0) {
-            m_stats.sendErrors++;
-            // Not logged per packet: an unreachable client is the client's
-            // problem and a noisy one would fill the log with it.
-            if (m_stats.sendErrors % 1000 == 1) {
-                LOG_WARN(kTag, "sendto %s: %s", peer.c_str(), std::strerror(errno));
-            }
-        } else {
+        if (reply(out)) {
+            std::lock_guard<std::mutex> lk(m_mu);
             m_stats.answered++;
             if (!c.synchronised) m_stats.unsynchronised++;
         }

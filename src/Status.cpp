@@ -263,6 +263,7 @@ std::string renderStatusBlock(const StatusInput& in) {
     o << "ntp :123 -> " << in.ntpPort << ": " << in.ntp.requests << " requests, "
       << in.ntp.answered << " answered, " << in.ntp.ignored << " ignored, "
       << in.ntp.rateLimited << " rate-limited";
+    if (in.ntp.kodSent) o << " (" << in.ntp.kodSent << " sent RATE)";
     if (in.ntp.unsynchronised) o << ", " << in.ntp.unsynchronised << " while unsynchronised";
     o << "   (up " << formatDuration(in.uptimeSec) << ")\n";
     o << '\n';
@@ -670,6 +671,7 @@ json statusJson(const StatusInput& in) {
     ntp["answered"] = in.ntp.answered;
     ntp["ignored"] = in.ntp.ignored;
     ntp["rate_limited"] = in.ntp.rateLimited;
+    ntp["kod_sent"] = in.ntp.kodSent;
     ntp["answered_unsynchronised"] = in.ntp.unsynchronised;
     ntp["send_errors"] = in.ntp.sendErrors;
     j["ntp"] = std::move(ntp);

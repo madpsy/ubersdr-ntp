@@ -149,6 +149,7 @@ target_compile_options(ubersdr-ntp-ntptest PRIVATE -Wall -Wextra)
 add_executable(ubersdr-ntp-configtest
     tools/configtest.cpp
     src/Config.cpp
+    src/RateLimiter.cpp
     src/Log.cpp)
 target_include_directories(ubersdr-ntp-configtest PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -216,6 +217,7 @@ add_executable(ubersdr-ntp
     src/Mqtt.cpp
     src/NtpClient.cpp
     src/NtpServer.cpp
+    src/RateLimiter.cpp
     src/OffsetEstimator.cpp
     src/Propagation.cpp
     src/SampleClock.cpp

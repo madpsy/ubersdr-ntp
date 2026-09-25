@@ -1,5 +1,7 @@
 #include "Config.h"
 
+#include "IpPrefix.h"
+
 #include "../third_party/json.hpp"
 
 #include <algorithm>
@@ -179,7 +181,44 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         }
         if (!getOpt(n, "answer_when_unsynchronised", c.ntp.answerWhenUnsynchronised, err)) return false;
         if (!getOpt(n, "honour_leap_warning", c.ntp.honourLeapWarning, err)) return false;
-        if (!getOpt(n, "rate_limit_per_client", c.ntp.rateLimitPerClient, err)) return false;
+        if (auto rit = n.find("rate_limit"); rit != n.end() && !rit->is_null()) {
+            if (!rit->is_object()) { err = "ntp.rate_limit must be an object"; return false; }
+            if (auto oit = n.find("rate_limit_per_client"); oit != n.end() && !oit->is_null()) {
+                err = "ntp.rate_limit_per_client and ntp.rate_limit are both given: "
+                      "rate_limit replaces it, so remove rate_limit_per_client";
+                return false;
+            }
+            const json& r = *rit;
+            RateLimitConfig& rl = c.ntp.rateLimit;
+            if (!getOpt(r, "interval_s", rl.intervalSec, err)) return false;
+            if (!getOpt(r, "burst", rl.burst, err)) return false;
+            if (!getOpt(r, "kod", rl.kod, err)) return false;
+            if (!getOpt(r, "leak", rl.leak, err)) return false;
+            if (!getOpt(r, "ipv4_prefix", rl.ipv4Prefix, err)) return false;
+            if (!getOpt(r, "ipv6_prefix", rl.ipv6Prefix, err)) return false;
+            if (!getOpt(r, "exempt", rl.exempt, err)) return false;
+        } else if (auto oit = n.find("rate_limit_per_client"); oit != n.end() && !oit->is_null()) {
+            // The old setting: responses a second, with a burst of as many
+            // (at least 1), and nothing sent over the limit. Read into the new
+            // one exactly -- an unattended install must not stop starting, or
+            // start limiting differently, over a renamed key -- and said once.
+            double perSec = 0.0;
+            if (!getOpt(n, "rate_limit_per_client", perSec, err)) return false;
+            if (!std::isfinite(perSec) || perSec < 0.0) {
+                std::ostringstream os;
+                os << "ntp.rate_limit_per_client is " << perSec << "; it must be a finite number >= 0";
+                err = os.str();
+                return false;
+            }
+            RateLimitConfig& rl = c.ntp.rateLimit;
+            rl.intervalSec = perSec > 0.0 ? 1.0 / perSec : 0.0;
+            rl.burst = std::clamp(static_cast<int>(std::ceil(std::max(1.0, perSec))), 1, 255);
+            rl.kod = false;
+            std::ostringstream os;
+            os << "ntp.rate_limit_per_client is replaced by ntp.rate_limit; read as interval_s "
+               << rl.intervalSec << ", burst " << rl.burst << ", kod false";
+            c.warnings.push_back(os.str());
+        }
         if (!getOpt(n, "drift_file", c.ntp.driftFile, err)) return false;
         if (auto lit = n.find("listen"); lit != n.end() && !lit->is_null()) {
             if (!getOpt(n, "listen", c.ntp.listen, err)) return false;
@@ -340,7 +379,33 @@ bool Config::finalise(std::string& err) {
     };
     if (!finiteAtLeast(ntp.coastSeconds, 0.0, "ntp.coast_seconds")) return false;
     if (!finiteAtLeast(ntp.coastDriftPpm, 0.0, "ntp.coast_drift_ppm")) return false;
-    if (!finiteAtLeast(ntp.rateLimitPerClient, 0.0, "ntp.rate_limit_per_client")) return false;
+    {
+        const RateLimitConfig& rl = ntp.rateLimit;
+        std::ostringstream os;
+        if (!std::isfinite(rl.intervalSec) || (rl.intervalSec != 0.0 &&
+                                               (rl.intervalSec < 0.01 || rl.intervalSec > 4096.0))) {
+            os << "ntp.rate_limit.interval_s is " << rl.intervalSec
+               << "; it must be 0 (no limit) or from 0.01 to 4096 seconds";
+        } else if (rl.burst < 1 || rl.burst > 255) {
+            os << "ntp.rate_limit.burst is " << rl.burst << "; it must be from 1 to 255";
+        } else if (!std::isfinite(rl.leak) || rl.leak < 0.0 || rl.leak > 1.0) {
+            os << "ntp.rate_limit.leak is " << rl.leak << "; it must be from 0 to 1";
+        } else if (rl.ipv4Prefix < 1 || rl.ipv4Prefix > 32) {
+            os << "ntp.rate_limit.ipv4_prefix is " << rl.ipv4Prefix << "; it must be from 1 to 32";
+        } else if (rl.ipv6Prefix < 1 || rl.ipv6Prefix > 128) {
+            os << "ntp.rate_limit.ipv6_prefix is " << rl.ipv6Prefix << "; it must be from 1 to 128";
+        } else {
+            for (const std::string& e : rl.exempt) {
+                IpPrefix p;
+                if (!IpPrefix::parse(e, p)) {
+                    os << "ntp.rate_limit.exempt: \"" << e
+                       << "\" is not an address or a prefix such as 10.0.0.0/8 or fd00::/8";
+                    break;
+                }
+            }
+        }
+        if (!os.str().empty()) { err = os.str(); return false; }
+    }
     // 0 disables the block. Anything else under a second is not a status
     // interval anybody wants, and a tiny one (1e-12) made the main loop's
     // schedule arithmetic spin: adding it to a monotonic time is a no-op.

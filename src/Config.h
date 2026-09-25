@@ -166,6 +166,36 @@ struct NtpSourceConfig {
     double extraDelayMs = 0.0;
 };
 
+// Per-client response limiting for the NTP service (ntp.rate_limit). A token
+// bucket per client, as chrony's ratelimit and ntpd's "discard average": a
+// client may average one request per interval_s, and send burst of them at
+// once -- which covers iburst and ntpdate/sntp, 4 to 8 packets back to back.
+// Ordinary clients poll every 64 to 1024 s and never meet it; it is for broken
+// ones and for aiming UDP reflection at somebody.
+struct RateLimitConfig {
+    // Average seconds between answered requests, per client. 0 disables the
+    // limit. chrony and ntpd both default to 8; 2 is kinder to a LAN.
+    double intervalSec = 2.0;
+    // Requests a client may send at once before the average applies.
+    int burst = 8;
+    // Over the limit, answer with a RATE kiss-o'-death -- at most one per
+    // client per interval -- rather than silence. ntpd and chrony clients back
+    // off on it; the reply is the size of the request, so it amplifies nothing.
+    bool kod = true;
+    // Fraction of over-limit requests answered anyway (chrony's leak), so a
+    // client whose address a flood is spoofing still gets some time. 0 to 1.
+    double leak = 0.0;
+    // How much of an address is one client. IPv6 hands a whole /64 to one
+    // host, which can rotate through it, so a /64 is one bucket.
+    int ipv4Prefix = 32;
+    int ipv6Prefix = 64;
+    // Never limited: addresses or CIDR prefixes. None unless configured; the
+    // shipped configuration lists the RFC 1918 private ranges, the clients a
+    // LAN server exists for -- and in Docker every client may arrive NATed
+    // from one bridge address.
+    std::vector<std::string> exempt;
+};
+
 struct NtpConfig {
     std::vector<std::string> listen{"0.0.0.0", "::"};
     int port = 123;
@@ -192,10 +222,9 @@ struct NtpConfig {
     // network that a leap second is coming.
     bool honourLeapWarning = true;
 
-    // Per-client responses per second, 0 to disable. NTP on UDP is a reflection
-    // amplifier if left open; the response is the same size as the request so
-    // the gain is 1, but a limit still caps what this can be aimed at.
-    double rateLimitPerClient = 10.0;
+    // See RateLimitConfig. The old ntp.rate_limit_per_client (responses per
+    // second, burst the same) is still read, into this, with a warning.
+    RateLimitConfig rateLimit;
 
     // Where the daemon clock's fitted frequency is kept between runs. ntpd's
     // driftfile, and for ntpd's reason: the crystal's rate error is a property

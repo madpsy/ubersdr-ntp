@@ -353,6 +353,7 @@ std::string tickJson(const Combined& c, const StatusInput& in, double nowDaemon)
     n["answered"] = in.ntp.answered;
     n["ignored"] = in.ntp.ignored;
     n["rate_limited"] = in.ntp.rateLimited;
+    n["kod_sent"] = in.ntp.kodSent;
     j["ntp"] = std::move(n);
 
     nlohmann::json arr = nlohmann::json::array();

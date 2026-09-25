@@ -392,6 +392,21 @@ int main(int argc, char** argv) {
              "%d radio and %d ntp source(s)",
              cfg.ntp.port, cfg.ntp.coastSeconds, cfg.ntp.coastDriftPpm,
              cfg.clock.minRadioSources, cfg.clock.minNtpSources);
+    {
+        const RateLimitConfig& rl = cfg.ntp.rateLimit;
+        std::string exempt;
+        for (const std::string& e : rl.exempt) exempt += (exempt.empty() ? "" : ", ") + e;
+        if (rl.intervalSec <= 0.0) {
+            LOG_INFO(kTag, "ntp rate limit: off");
+        } else {
+            LOG_INFO(kTag, "ntp rate limit: one per %gs per client (/%d, /%d), burst %d, over it %s%s; exempt: %s",
+                     rl.intervalSec, rl.ipv4Prefix, rl.ipv6Prefix, rl.burst,
+                     rl.kod ? "RATE" : "silence",
+                     rl.leak > 0.0 ? (", " + std::to_string(static_cast<int>(rl.leak * 100.0 + 0.5)) +
+                                      "% answered anyway").c_str() : "",
+                     exempt.empty() ? "none" : exempt.c_str());
+        }
+    }
 
     if (checkOnly) {
         LOG_INFO(kTag, "configuration is valid (--check); exiting");

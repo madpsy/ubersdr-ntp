@@ -23,6 +23,10 @@
 // Exit status 0 when every check passes.
 
 #include "Config.h"
+#include "RateLimiter.h"
+
+#include <arpa/inet.h>
+#include <cmath>
 
 #include <cstdarg>
 #include <cstdio>
@@ -492,6 +496,168 @@ void testMinMargin() {
           wwv.ok && warned, "%s", wwv.why());
 }
 
+// A sockaddr for the limiter, from address text.
+struct sockaddr_storage addrOf(const char* text) {
+    struct sockaddr_storage ss{};
+    auto* s4 = reinterpret_cast<struct sockaddr_in*>(&ss);
+    auto* s6 = reinterpret_cast<struct sockaddr_in6*>(&ss);
+    if (::inet_pton(AF_INET, text, &s4->sin_addr) == 1) ss.ss_family = AF_INET;
+    else if (::inet_pton(AF_INET6, text, &s6->sin6_addr) == 1) ss.ss_family = AF_INET6;
+    return ss;
+}
+
+// How many of `n` requests, one every `gap` seconds from `t0`, get each verdict.
+struct Tally { int answer = 0, leak = 0, kod = 0, drop = 0; };
+Tally run(RateLimiter& rl, const char* who, int n, double gap, double t0 = 1000.0) {
+    Tally t;
+    const struct sockaddr_storage a = addrOf(who);
+    for (int i = 0; i < n; ++i) {
+        switch (rl.check(a, t0 + i * gap)) {
+            case RateVerdict::Answer: ++t.answer; break;
+            case RateVerdict::Leak:   ++t.leak; break;
+            case RateVerdict::Kod:    ++t.kod; break;
+            case RateVerdict::Drop:   ++t.drop; break;
+        }
+    }
+    return t;
+}
+
+void testRateLimit() {
+    std::printf("\nntp.rate_limit: per-client limiting of the NTP service\n");
+
+    const Loaded def = load(R"({"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    const RateLimitConfig& d = def.cfg.ntp.rateLimit;
+    check("absent, it is one per 2 s, burst 8, kiss-o'-death on, /32 and /64, nothing exempt",
+          def.ok && d.intervalSec == 2.0 && d.burst == 8 && d.kod && d.leak == 0.0 &&
+          d.ipv4Prefix == 32 && d.ipv6Prefix == 64 && d.exempt.empty(), "%s", def.why());
+
+    const Loaded set = load(R"({"ntp":{"rate_limit":{"interval_s":8,"burst":4,"kod":false,"leak":0.25,
+                                "ipv4_prefix":24,"ipv6_prefix":56,"exempt":["10.0.0.0/8","fd00::/8","192.0.2.7"]}},
+                                "sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    const RateLimitConfig& s = set.cfg.ntp.rateLimit;
+    check("every setting is read", set.ok && s.intervalSec == 8.0 && s.burst == 4 && !s.kod &&
+          s.leak == 0.25 && s.ipv4Prefix == 24 && s.ipv6Prefix == 56 && s.exempt.size() == 3, "%s", set.why());
+
+    const Loaded part = load(R"({"ntp":{"port":123,"rate_limit":{"burst":3}},
+                                 "sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    const RateLimitConfig& pr = part.cfg.ntp.rateLimit;
+    check("a partial block takes the rest from the defaults",
+          part.ok && pr.burst == 3 && pr.intervalSec == 2.0 && pr.kod && pr.ipv6Prefix == 64 &&
+          pr.exempt.empty(), "%s", part.why());
+    // Each key alone: it is read, and the other six keep their defaults.
+    {
+        const RateLimitConfig D;
+        struct One { const char* json; bool (*is)(const RateLimitConfig&); };
+        const One ones[] = {
+            {R"("interval_s":8)", [](const RateLimitConfig& c) { return c.intervalSec == 8.0; }},
+            {R"("burst":3)", [](const RateLimitConfig& c) { return c.burst == 3; }},
+            {R"("kod":false)", [](const RateLimitConfig& c) { return !c.kod; }},
+            {R"("leak":0.5)", [](const RateLimitConfig& c) { return c.leak == 0.5; }},
+            {R"("ipv4_prefix":24)", [](const RateLimitConfig& c) { return c.ipv4Prefix == 24; }},
+            {R"("ipv6_prefix":48)", [](const RateLimitConfig& c) { return c.ipv6Prefix == 48; }},
+            {R"("exempt":["10.0.0.0/8"])", [](const RateLimitConfig& c) { return c.exempt.size() == 1; }},
+        };
+        for (const One& one : ones) {
+            const Loaded r = load(std::string(R"({"ntp":{"rate_limit":{)") + one.json +
+                                  R"(}},"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+            const RateLimitConfig& c = r.cfg.ntp.rateLimit;
+            // Count the fields still at their defaults: exactly six must be.
+            const int atDefault = (c.intervalSec == D.intervalSec) + (c.burst == D.burst) + (c.kod == D.kod) +
+                                  (c.leak == D.leak) + (c.ipv4Prefix == D.ipv4Prefix) +
+                                  (c.ipv6Prefix == D.ipv6Prefix) + (c.exempt == D.exempt);
+            check((std::string("only ") + one.json + ": read, the other six at their defaults").c_str(),
+                  r.ok && one.is(c) && atDefault == 6, "%s", r.why());
+        }
+    }
+    const Loaded empty = load(R"({"ntp":{"rate_limit":{}},"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    check("an empty block is every default", empty.ok && empty.cfg.ntp.rateLimit.intervalSec == 2.0 &&
+          empty.cfg.ntp.rateLimit.burst == 8, "%s", empty.why());
+    const Loaded nul = load(R"({"ntp":{"rate_limit":null},"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    check("...and null is the same as absent", nul.ok && nul.cfg.ntp.rateLimit.intervalSec == 2.0, "%s", nul.why());
+
+    const Loaded old = load(R"({"ntp":{"rate_limit_per_client":10},
+                                "sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    bool warned = false;
+    for (const std::string& w : old.ok ? old.cfg.warnings : std::vector<std::string>{})
+        if (w.find("rate_limit_per_client") != std::string::npos) warned = true;
+    const RateLimitConfig& o = old.cfg.ntp.rateLimit;
+    check("the old rate_limit_per_client still loads, as it limited, with a warning",
+          old.ok && warned && std::abs(o.intervalSec - 0.1) < 1e-12 && o.burst == 10 && !o.kod, "%s", old.why());
+    const Loaded oldOff = load(R"({"ntp":{"rate_limit_per_client":0},
+                                   "sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    check("...and 0 still disables it", oldOff.ok && oldOff.cfg.ntp.rateLimit.intervalSec == 0.0, "%s", oldOff.why());
+
+    const Loaded both = load(R"({"ntp":{"rate_limit_per_client":10,"rate_limit":{"burst":4}},
+                                 "sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+    check("both at once is refused", both.failedWith("both given"), "%s", both.why());
+
+    for (const char* bad : {R"("interval_s":0.001)", R"("interval_s":-1)", R"("burst":0)", R"("burst":256)",
+                            R"("leak":1.5)", R"("ipv4_prefix":33)", R"("ipv6_prefix":0)",
+                            R"("exempt":["10.0.0.0/33"])", R"("exempt":["not-an-address"])",
+                            R"("exempt":["10.0.0.0/"])"}) {
+        const Loaded r = load(std::string(R"({"ntp":{"rate_limit":{)") + bad +
+                              R"(}},"sources":[{"url":"http://r.example","carrier_hz":77500}]})");
+        check((std::string(bad) + " is refused").c_str(), r.failedWith("ntp.rate_limit"), "%s", r.why());
+    }
+
+    {
+        RateLimiter rl(RateLimitConfig{});
+        const Tally burst = run(rl, "203.0.113.5", 12, 0.0);
+        check("a burst of 8 is answered, then one RATE, then silence",
+              burst.answer == 8 && burst.kod == 1 && burst.drop == 3,
+              "%d answered, %d kod, %d dropped", burst.answer, burst.kod, burst.drop);
+        const Tally polite = run(rl, "203.0.113.6", 50, 2.0);
+        check("a client at the average is always answered", polite.answer == 50, "%d of 50", polite.answer);
+        const Tally ntpdate = run(rl, "203.0.113.7", 8, 0.0, 1000.0);
+        const Tally again = run(rl, "203.0.113.7", 8, 0.0, 1000.0 + 16.0);
+        check("an iburst, and another once the bucket has refilled, both answered in full",
+              ntpdate.answer == 8 && again.answer == 8, "%d then %d", ntpdate.answer, again.answer);
+        const Tally fast = run(rl, "203.0.113.8", 200, 0.1);
+        check("a client ten times too fast gets about one in twenty, and one RATE per interval",
+              fast.answer >= 8 + 9 && fast.answer <= 8 + 11 && fast.kod >= 9 && fast.kod <= 11,
+              "%d answered, %d kod", fast.answer, fast.kod);
+    }
+    {
+        RateLimiter rl(RateLimitConfig{});
+        const Tally a = run(rl, "2001:db8:1:2::1", 8, 0.0);
+        const Tally b = run(rl, "2001:db8:1:2:ffff::9", 4, 0.0);
+        const Tally c = run(rl, "2001:db8:1:3::1", 4, 0.0);
+        check("IPv6: one /64 is one client, however it rotates; the next /64 is another",
+              a.answer == 8 && b.answer == 0 && c.answer == 4, "%d, %d, %d", a.answer, b.answer, c.answer);
+        const Tally v4 = run(rl, "198.51.100.1", 8, 0.0);
+        const Tally mapped = run(rl, "::ffff:198.51.100.1", 2, 0.0);
+        check("an IPv4-mapped address is the IPv4 client", v4.answer == 8 && mapped.answer == 0,
+              "%d, %d", v4.answer, mapped.answer);
+    }
+    {
+        RateLimitConfig cfg;
+        cfg.exempt = {"10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"};
+        RateLimiter rl(cfg);
+        const Tally lan = run(rl, "192.168.9.20", 500, 0.0);
+        const Tally docker = run(rl, "172.18.0.1", 500, 0.0);
+        const Tally outside = run(rl, "172.32.0.1", 20, 0.0);
+        check("exempt ranges are never limited, and 172.16/12 ends where it should",
+              lan.answer == 500 && docker.answer == 500 && outside.answer == 8,
+              "%d, %d, %d", lan.answer, docker.answer, outside.answer);
+    }
+    {
+        RateLimitConfig cfg;
+        cfg.kod = false;
+        RateLimiter rl(cfg);
+        const Tally t = run(rl, "203.0.113.9", 20, 0.0);
+        check("with kod off, over the limit is silence", t.answer == 8 && t.kod == 0 && t.drop == 12,
+              "%d answered, %d kod, %d dropped", t.answer, t.kod, t.drop);
+        cfg.leak = 0.5;
+        RateLimiter leaky(cfg);
+        const Tally l = run(leaky, "203.0.113.10", 4008, 0.0);
+        check("leak 0.5 answers about half of what is over the limit", l.leak > 1800 && l.leak < 2200,
+              "%d of 4000", l.leak);
+        cfg.intervalSec = 0.0;
+        RateLimiter off(cfg);
+        check("interval_s 0 limits nothing", run(off, "203.0.113.11", 1000, 0.0).answer == 1000);
+    }
+}
+
 int main() {
     std::printf("ubersdr-ntp configuration test\n");
 
@@ -510,6 +676,7 @@ int main() {
     testMqttBlock();
     testDcf77Tuning();
     testMinMargin();
+    testRateLimit();
 
     // Tidy up: the files hold made-up passwords, but leaving a trail of
     // configuration files in /tmp on every build is untidy either way.

@@ -36,6 +36,7 @@
 // process got round to looking at it is real, and on a loaded machine it is
 // larger than the jitter of the radio path.
 
+#include "RateLimiter.h"
 #include "Selector.h"
 
 #include <atomic>
@@ -43,7 +44,6 @@
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 
 namespace ubersdr_ntp {
@@ -52,7 +52,8 @@ struct NtpStats {
     std::uint64_t requests = 0;
     std::uint64_t answered = 0;
     std::uint64_t ignored = 0;       // wrong mode, wrong version, too short
-    std::uint64_t rateLimited = 0;
+    std::uint64_t rateLimited = 0;    // over the limit and not answered with the time
+    std::uint64_t kodSent = 0;        // ...of which sent a RATE kiss-o'-death
     std::uint64_t unsynchronised = 0; // answered with LI=3 / stratum 0
     std::uint64_t sendErrors = 0;
 };
@@ -72,7 +73,6 @@ public:
 
 private:
     void serve(int fd, const std::string& label);
-    bool rateLimitAllows(const std::string& key, double now);
 
     NtpConfig m_cfg;
     Selector& m_selector;
@@ -88,16 +88,7 @@ private:
     mutable std::mutex m_mu;
     NtpStats m_stats;
 
-    // Per-client token buckets. Keyed by address text rather than by a packed
-    // sockaddr so one map covers v4 and v6, and swept rather than allowed to
-    // grow, because the key space is the internet.
-    struct Bucket { double tokens; double at; };
-    std::unordered_map<std::string, Bucket> m_buckets;
-    double m_lastSweep = 0.0;
-    // A hard ceiling on m_buckets, for a spoofed-source flood the periodic
-    // sweep cannot keep up with. ~100 bytes an entry, so ~10 MB at the cap;
-    // see rateLimitAllows for what happens beyond it.
-    static constexpr std::size_t kMaxBuckets = 100000;
+    RateLimiter m_limiter;
 };
 
 } // namespace ubersdr_ntp

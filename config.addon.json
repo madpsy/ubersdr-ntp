@@ -48,10 +48,39 @@
     // cannot tell every client on the network a leap second is coming.
     // , "honour_leap_warning": true
 
-    // Responses per second per client, 0 to disable. NTP on UDP is a
-    // reflection amplifier if left open; the gain is 1, but a limit still caps
-    // what this can be aimed at.
-    // , "rate_limit_per_client": 10.0
+    // Per-client limiting, as chrony's ratelimit and ntpd's "discard average".
+    // A client may average one request per interval_s and send burst of them
+    // at once, which covers iburst and ntpdate/sntp (4 to 8 back to back).
+    // Ordinary clients poll every 64 s or slower and never meet it; it is for
+    // broken ones, and for aiming UDP reflection at somebody. Any key left
+    // out, or the whole block, takes the default shown.
+    , "rate_limit": {
+        // Average seconds between answered requests, per client; 0 disables
+        // the limit. chrony and ntpd default to 8.
+        // "interval_s": 2.0,
+
+        // Requests a client may send at once before the average applies.
+        // "burst": 8,
+
+        // Over the limit, answer with a RATE kiss-o'-death (at most one per
+        // client per interval), which ntpd and chrony clients back off on,
+        // rather than silence.
+        // "kod": true,
+
+        // Fraction of over-limit requests answered anyway, 0 to 1, so a
+        // client whose address is being spoofed still gets some time.
+        // "leak": 0.0,
+
+        // How much of an address counts as one client. IPv6 gives a host a
+        // whole /64 to rotate through, so a /64 is one client.
+        // "ipv4_prefix": 32,
+        // "ipv6_prefix": 64,
+
+        // Never limited: addresses or prefixes. The RFC 1918 private ranges --
+        // the LAN this serves, and Docker's bridge, which every client may
+        // arrive NATed from. Without this key nothing is exempt; [] says so.
+        "exempt": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"]
+      }
 
     // Where the crystal's fitted frequency is kept between runs -- ntpd's
     // driftfile, for ntpd's reason. "-" disables it. In the addon the default
