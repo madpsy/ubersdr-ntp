@@ -259,7 +259,7 @@ tr.fresh td { animation:fresh 4s ease-out; }
         <div class="note" id="srcnames">&nbsp;</div></div>
       <div><div class="label">Reference age</div><div class="figure" id="refage">—</div>
         <div class="note">since the newest fix</div></div>
-      <div><div class="label">NTP requests</div><div class="figure" id="ntpreq">—</div>
+      <div><div class="label">NTP requests, past hour</div><div class="figure" id="ntpreq">—</div>
         <div class="note" id="ntpnote">&nbsp;</div></div>
     </div>
     <div class="trends">
@@ -492,6 +492,25 @@ function allouisText(p) {
     (p.timing_snr_db != null ? " at " + p.timing_snr_db.toFixed(1) + " dB" : "") +
     (p.timing ? ", timing the second" : ", not timing") +
     (p.carrier_offset_hz != null ? ", carrier " + p.carrier_offset_hz.toFixed(2) + " Hz off the dial" : "");
+}
+
+// A count as it reads at a glance: 950, 12.4k, 124k, 1.2M. The exact figure is
+// in countHtml's tooltip. flow.js borrows both (guarded, as refOf does).
+function compactCount(n) {
+  n = Number(n) || 0;
+  if (Math.abs(n) < 1000) return String(n);
+  const units = [[1e3, "k"], [1e6, "M"], [1e9, "B"], [1e12, "T"]];
+  for (let i = 0; i < units.length; i++) {
+    const x = n / units[i][0];
+    const t = Math.abs(x) < 100 ? x.toFixed(1).replace(/\.0$/, "") : String(Math.round(x));
+    // 999,950 rounds to "1000k": say 1M instead.
+    if (Math.abs(parseFloat(t)) < 1000 || i === units.length - 1) return t + units[i][1];
+  }
+}
+function countHtml(n) {
+  n = Number(n) || 0;
+  return Math.abs(n) < 1000 ? String(n)
+    : '<span title="' + n.toLocaleString() + '">' + compactCount(n) + "</span>";
 }
 
 function stationMix(d) {
@@ -1109,9 +1128,15 @@ function onTick(d) {
   $("srcnames").textContent = (d.used_names && d.used_names.length)
     ? d.used_names.join(", ") : "none in use";
   $("refage").textContent = dur(d.reference_age_seconds);
-  $("ntpreq").textContent = d.ntp.requests.toLocaleString();
-  $("ntpnote").textContent = d.ntp.answered.toLocaleString() + " answered, " +
-    d.ntp.ignored.toLocaleString() + " ignored";
+  // The past hour, not since start: a total since start says more about the
+  // uptime than about now. The totals stay in the API.
+  const nh = d.ntp.past_hour || d.ntp;
+  $("ntpreq").textContent = compactCount(nh.requests);
+  $("ntpreq").title = nh.requests.toLocaleString() + " requests in the past hour, " +
+    d.ntp.requests.toLocaleString() + " since start";
+  $("ntpnote").innerHTML = countHtml(nh.answered) + " answered, " +
+    countHtml(nh.ignored) + " ignored" +
+    (nh.rate_limited ? ", " + countHtml(nh.rate_limited) + " rate-limited" : "");
 
   // --- the two classes ---------------------------------------------------
   const radio = d.sources.filter((s) => s.kind !== "ntp");
@@ -1213,9 +1238,9 @@ function peerRows(x) {
           " s at the server's request"
         : "") +
       '<br><span class="note">' +
-      (n.sent || 0).toLocaleString() + " sent · " + (n.received || 0).toLocaleString() +
-      " answered · " + (n.rejected || 0).toLocaleString() + " refused · " +
-      (n.spikes || 0).toLocaleString() + " dropped as delay spikes</span>" +
+      countHtml(n.sent) + " sent · " + countHtml(n.received) +
+      " answered · " + countHtml(n.rejected) + " refused · " +
+      countHtml(n.spikes) + " dropped as delay spikes</span>" +
       (n.last_reject_reason
         ? '<br><span class="note">last refusal: ' + esc(n.last_reject_reason) + "</span>"
         : "")],

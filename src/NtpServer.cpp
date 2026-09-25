@@ -287,12 +287,12 @@ void NtpServer::serve(int fd, const std::string& label) {
 
         {
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.requests++;
+            count(&NtpCounts::requests);
         }
 
         if (n < kPacketSize) {
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.ignored++;
+            count(&NtpCounts::ignored);
             continue;
         }
 
@@ -309,12 +309,12 @@ void NtpServer::serve(int fd, const std::string& label) {
         // and private modes every ntpd amplification advisory is about.
         if (mode != 3) {
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.ignored++;
+            count(&NtpCounts::ignored);
             continue;
         }
         if (version < 1 || version > 4) {
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.ignored++;
+            count(&NtpCounts::ignored);
             continue;
         }
 
@@ -355,7 +355,7 @@ void NtpServer::serve(int fd, const std::string& label) {
             const ssize_t sent = ::sendmsg(fd, &omh, 0);
             if (sent < 0) {
                 std::lock_guard<std::mutex> lk(m_mu);
-                m_stats.sendErrors++;
+                count(&NtpCounts::sendErrors);
                 // Not logged per packet: an unreachable client is the client's
                 // problem and a noisy one would fill the log with it.
                 if (m_stats.sendErrors % 1000 == 1) {
@@ -365,10 +365,12 @@ void NtpServer::serve(int fd, const std::string& label) {
             return sent >= 0;
         };
 
-        const RateVerdict verdict = m_limiter.check(from, monotonicNow());
+        const double now = monotonicNow();
+        const RateVerdict verdict = m_limiter.check(from, now);
+        m_tally.record(from, now, verdict == RateVerdict::Drop || verdict == RateVerdict::Kod);
         if (verdict == RateVerdict::Drop) {
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.rateLimited++;
+            count(&NtpCounts::rateLimited);
             continue;
         }
         if (verdict == RateVerdict::Kod) {
@@ -390,8 +392,8 @@ void NtpServer::serve(int fd, const std::string& label) {
             std::memcpy(kod + 40, buf + 40, 8);
             const bool ok = reply(kod);
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.rateLimited++;
-            if (ok) m_stats.kodSent++;
+            count(&NtpCounts::rateLimited);
+            if (ok) count(&NtpCounts::kodSent);
             continue;
         }
 
@@ -405,7 +407,7 @@ void NtpServer::serve(int fd, const std::string& label) {
         // is the correct content, but not what was asked for.
         if (!c.synchronised && !m_cfg.answerWhenUnsynchronised) {
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.ignored++;
+            count(&NtpCounts::ignored);
             continue;
         }
 
@@ -503,15 +505,46 @@ void NtpServer::serve(int fd, const std::string& label) {
         put32(out + 44, xmt.frac);
         if (reply(out)) {
             std::lock_guard<std::mutex> lk(m_mu);
-            m_stats.answered++;
-            if (!c.synchronised) m_stats.unsynchronised++;
+            count(&NtpCounts::answered);
+            if (!c.synchronised) count(&NtpCounts::unsynchronised);
         }
     }
 }
 
+void NtpServer::advanceMinutes(long long minute) const {
+    if (minute <= m_minute) return;
+    const long long gap = std::min<long long>(minute - m_minute, kMinutes);
+    for (long long k = 1; k <= gap; ++k) {
+        m_minutes[static_cast<std::size_t>((m_minute + k) % kMinutes)] = NtpCounts{};
+    }
+    m_minute = minute;
+}
+
+void NtpServer::count(std::uint64_t NtpCounts::*field) {
+    advanceMinutes(static_cast<long long>(monotonicNow() / 60.0));
+    ++(m_stats.*field);
+    ++(m_minutes[static_cast<std::size_t>(m_minute % kMinutes)].*field);
+}
+
 NtpStats NtpServer::stats() const {
-    std::lock_guard<std::mutex> lk(m_mu);
-    return m_stats;
+    const double now = monotonicNow();
+    NtpStats out;
+    {
+        std::lock_guard<std::mutex> lk(m_mu);
+        advanceMinutes(static_cast<long long>(now / 60.0));
+        static_cast<NtpCounts&>(out) = m_stats;
+        for (const NtpCounts& m : m_minutes) {
+            out.pastHour.requests += m.requests;
+            out.pastHour.answered += m.answered;
+            out.pastHour.ignored += m.ignored;
+            out.pastHour.rateLimited += m.rateLimited;
+            out.pastHour.kodSent += m.kodSent;
+            out.pastHour.unsynchronised += m.unsynchronised;
+            out.pastHour.sendErrors += m.sendErrors;
+        }
+    }
+    out.topClients = m_tally.top(10, now);
+    return out;
 }
 
 } // namespace ubersdr_ntp

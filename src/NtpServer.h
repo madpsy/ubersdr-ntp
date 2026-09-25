@@ -36,9 +36,11 @@
 // process got round to looking at it is real, and on a loaded machine it is
 // larger than the jitter of the radio path.
 
+#include "ClientTally.h"
 #include "RateLimiter.h"
 #include "Selector.h"
 
+#include <array>
 #include <atomic>
 #include <cstdint>
 #include <mutex>
@@ -48,7 +50,7 @@
 
 namespace ubersdr_ntp {
 
-struct NtpStats {
+struct NtpCounts {
     std::uint64_t requests = 0;
     std::uint64_t answered = 0;
     std::uint64_t ignored = 0;       // wrong mode, wrong version, too short
@@ -56,6 +58,14 @@ struct NtpStats {
     std::uint64_t kodSent = 0;        // ...of which sent a RATE kiss-o'-death
     std::uint64_t unsynchronised = 0; // answered with LI=3 / stratum 0
     std::uint64_t sendErrors = 0;
+};
+
+// Since start, as the counters above, and the same over the past hour -- what
+// the status page shows, since a total since start says more about uptime
+// than about now.
+struct NtpStats : NtpCounts {
+    NtpCounts pastHour;
+    std::vector<TopClient> topClients;  // the busiest over the past hour
 };
 
 class NtpServer {
@@ -86,9 +96,20 @@ private:
     std::atomic<bool> m_running{false};
 
     mutable std::mutex m_mu;
-    NtpStats m_stats;
+    NtpCounts m_stats;  // since start
 
     RateLimiter m_limiter;
+    ClientTally m_tally;
+
+    // Bumps a counter, in the totals and in this minute's bucket. m_mu held.
+    void count(std::uint64_t NtpCounts::*field);
+    // Moves the minute buckets on to `minute`, clearing skipped ones. m_mu
+    // held. Const, and the buckets mutable, because reading the past hour
+    // has to age it first.
+    void advanceMinutes(long long minute) const;
+    static constexpr int kMinutes = 60;
+    mutable std::array<NtpCounts, kMinutes> m_minutes{};
+    mutable long long m_minute = 0;
 };
 
 } // namespace ubersdr_ntp

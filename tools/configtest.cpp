@@ -23,6 +23,7 @@
 // Exit status 0 when every check passes.
 
 #include "Config.h"
+#include "ClientTally.h"
 #include "RateLimiter.h"
 
 #include <arpa/inet.h>
@@ -658,6 +659,64 @@ void testRateLimit() {
     }
 }
 
+void testClientTally() {
+    std::printf("\nTop NTP clients over the past hour, public addresses masked\n");
+
+    auto label = [](const char* a) { return publicLabel(ipAddrOf(addrOf(a))); };
+    check("LAN addresses are shown whole",
+          label("192.168.9.20") == "192.168.9.20" && label("10.1.2.3") == "10.1.2.3" &&
+          label("172.18.0.1") == "172.18.0.1" && label("127.0.0.1") == "127.0.0.1" &&
+          label("fd12:3456::1") == "fd12:3456::1" && label("fe80::1") == "fe80::1",
+          "%s %s", label("172.18.0.1").c_str(), label("fd12:3456::1").c_str());
+    check("public IPv4 is cut to its /24, and 172.32 is public",
+          label("203.0.113.77") == "203.0.113.x" && label("172.32.0.1") == "172.32.0.x",
+          "%s", label("203.0.113.77").c_str());
+    check("public IPv6 is cut to its /64", label("2001:db8:1:2:aaaa::9") == "2001:db8:1:2::/64",
+          "%s", label("2001:db8:1:2:aaaa::9").c_str());
+    check("an IPv4-mapped address is the IPv4 client", label("::ffff:203.0.113.77") == "203.0.113.x");
+
+    {
+        ClientTally t;
+        const double t0 = 6000.0;
+        for (int i = 0; i < 30; ++i) t.record(addrOf("192.168.9.20"), t0 + i, false);
+        for (int i = 0; i < 12; ++i) t.record(addrOf("203.0.113.5"), t0 + i, i >= 8);
+        for (int i = 0; i < 12; ++i) t.record(addrOf("203.0.113.200"), t0 + i, false);  // same /24
+        t.record(addrOf("2001:db8:1:2::1"), t0, false);
+        const auto top = t.top(10, t0 + 60);
+        check("busiest first, a /24 counted as one client, limited counted",
+              top.size() == 3 && top[0].client == "192.168.9.20" && top[0].requests == 30 &&
+              top[1].client == "203.0.113.x" && top[1].requests == 24 && top[1].limited == 4 &&
+              top[2].requests == 1, "%zu clients, #2 %s %llu/%llu", top.size(),
+              top.size() > 1 ? top[1].client.c_str() : "-",
+              top.size() > 1 ? static_cast<unsigned long long>(top[1].requests) : 0ULL,
+              top.size() > 1 ? static_cast<unsigned long long>(top[1].limited) : 0ULL);
+        check("top(n) is at most n", t.top(2, t0 + 60).size() == 2);
+        // Twenty more for the LAN client 50 minutes later: the hour then holds both.
+        for (int i = 0; i < 20; ++i) t.record(addrOf("192.168.9.20"), t0 + 3000 + i, false);
+        const auto later = t.top(10, t0 + 3020);
+        check("within the hour, both lots count", !later.empty() && later[0].requests == 50,
+              "%llu", later.empty() ? 0ULL : static_cast<unsigned long long>(later[0].requests));
+        const auto hourOn = t.top(10, t0 + 3600 + 120);
+        check("an hour on, the first lot has aged out and only the second remains",
+              hourOn.size() == 1 && hourOn[0].requests == 20, "%zu clients", hourOn.size());
+        check("two hours on, nobody", t.top(10, t0 + 7200 + 3100).empty());
+    }
+    {
+        ClientTally t;
+        char a[32];
+        for (int i = 0; i < 5000; ++i) {
+            std::snprintf(a, sizeof a, "10.%d.%d.1", i / 250, i % 250);
+            t.record(addrOf(a), 100.0 + i * 0.0001, false);
+        }
+        t.record(addrOf("192.168.1.1"), 100.0, false);
+        t.record(addrOf("192.168.1.1"), 100.0, false);
+        const auto top = t.top(1, 101.0);
+        check("a flood of one-off clients stops at the cap, and a client seen twice still leads",
+              !top.empty() && top[0].client == "192.168.1.1" && top[0].requests == 2,
+              "%s", top.empty() ? "-" : top[0].client.c_str());
+    }
+}
+
 int main() {
     std::printf("ubersdr-ntp configuration test\n");
 
@@ -677,6 +736,7 @@ int main() {
     testDcf77Tuning();
     testMinMargin();
     testRateLimit();
+    testClientTally();
 
     // Tidy up: the files hold made-up passwords, but leaving a trail of
     // configuration files in /tmp on every build is untidy either way.

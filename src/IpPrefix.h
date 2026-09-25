@@ -87,4 +87,46 @@ struct IpPrefix {
     }
 };
 
+// How a client is named on the public status page. An address no one outside
+// can route to -- RFC 1918, loopback, link-local, IPv6 unique-local -- names a
+// machine on this LAN and is shown whole. Anything else is a member of the
+// public and is cut to its network: a.b.c.x, or its /64. Enough to see which
+// network is hammering the server, not which person.
+inline bool isPrivate(const IpAddr& a) {
+    static const IpPrefix kPrivate[] = {
+        [] { IpPrefix p; IpPrefix::parse("10.0.0.0/8", p); return p; }(),
+        [] { IpPrefix p; IpPrefix::parse("172.16.0.0/12", p); return p; }(),
+        [] { IpPrefix p; IpPrefix::parse("192.168.0.0/16", p); return p; }(),
+        [] { IpPrefix p; IpPrefix::parse("127.0.0.0/8", p); return p; }(),
+        [] { IpPrefix p; IpPrefix::parse("169.254.0.0/16", p); return p; }(),
+        [] { IpPrefix p; IpPrefix::parse("::1", p); return p; }(),
+        [] { IpPrefix p; IpPrefix::parse("fc00::/7", p); return p; }(),
+        [] { IpPrefix p; IpPrefix::parse("fe80::/10", p); return p; }(),
+    };
+    for (const IpPrefix& p : kPrivate) if (p.contains(a)) return true;
+    return false;
+}
+
+inline std::string publicLabel(const IpAddr& a) {
+    char host[INET6_ADDRSTRLEN] = {0};
+    if (a.family == AF_INET) {
+        if (isPrivate(a)) {
+            ::inet_ntop(AF_INET, a.b.data(), host, sizeof host);
+            return host;
+        }
+        return std::to_string(a.b[0]) + "." + std::to_string(a.b[1]) + "." +
+               std::to_string(a.b[2]) + ".x";
+    }
+    if (a.family == AF_INET6) {
+        if (isPrivate(a)) {
+            ::inet_ntop(AF_INET6, a.b.data(), host, sizeof host);
+            return host;
+        }
+        const IpAddr net = masked(a, 64);
+        ::inet_ntop(AF_INET6, net.b.data(), host, sizeof host);
+        return std::string(host) + "/64";
+    }
+    return "?";
+}
+
 } // namespace ubersdr_ntp

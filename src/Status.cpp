@@ -563,6 +563,17 @@ std::string renderStatusBlock(const StatusInput& in) {
     return out;
 }
 
+void addNtpPastHour(json& ntp, const NtpStats& stats) {
+    const NtpCounts& h = stats.pastHour;
+    ntp["past_hour"] = {{"requests", h.requests}, {"answered", h.answered}, {"ignored", h.ignored},
+                        {"rate_limited", h.rateLimited}, {"kod_sent", h.kodSent},
+                        {"answered_unsynchronised", h.unsynchronised}, {"send_errors", h.sendErrors}};
+    json top = json::array();
+    for (const TopClient& t : stats.topClients)
+        top.push_back({{"client", t.client}, {"requests", t.requests}, {"rate_limited", t.limited}});
+    ntp["top_clients"] = std::move(top);
+}
+
 json statusJson(const StatusInput& in) {
     json j;
     j["version"] = in.version;
@@ -673,6 +684,7 @@ json statusJson(const StatusInput& in) {
     ntp["rate_limited"] = in.ntp.rateLimited;
     ntp["kod_sent"] = in.ntp.kodSent;
     ntp["answered_unsynchronised"] = in.ntp.unsynchronised;
+    addNtpPastHour(ntp, in.ntp);
     ntp["send_errors"] = in.ntp.sendErrors;
     j["ntp"] = std::move(ntp);
 

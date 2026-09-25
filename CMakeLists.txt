@@ -150,6 +150,7 @@ add_executable(ubersdr-ntp-configtest
     tools/configtest.cpp
     src/Config.cpp
     src/RateLimiter.cpp
+    src/ClientTally.cpp
     src/Log.cpp)
 target_include_directories(ubersdr-ntp-configtest PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
@@ -218,6 +219,7 @@ add_executable(ubersdr-ntp
     src/NtpClient.cpp
     src/NtpServer.cpp
     src/RateLimiter.cpp
+    src/ClientTally.cpp
     src/OffsetEstimator.cpp
     src/Propagation.cpp
     src/SampleClock.cpp

@@ -86,6 +86,9 @@ std::string renderStatusJson(const StatusInput& in, bool pretty);
 // keeps them identical to what /api/status says.
 nlohmann::json statusJson(const StatusInput& in);
 nlohmann::json sourceJson(const SourceSnapshot& s, const Combined& combined);
+// The NTP service's past hour: the counters as "past_hour" and the busiest
+// clients as "top_clients", added to `ntp`. Shared by /api/status and the tick.
+void addNtpPastHour(nlohmann::json& ntp, const NtpStats& stats);
 
 // Human-readable formatters, shared so the log and the page agree on how a
 // duration or an offset reads.

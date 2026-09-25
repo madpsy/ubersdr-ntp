@@ -256,17 +256,20 @@ function model(d) {
 
   // Column 3: what it serves.
   const ntp = d.ntp || {};
+  // The past hour, as the main card; the rate comes from the running total.
+  const hour = ntp.past_hour || ntp;
   const rate = reqRate();
   cols[3].push({
     key: "ntpc", kind: "out", state: !d.synchronised ? "down" : ntp.requests ? "live" : "standby",
     title: "NTP server", tag: "UDP :" + ntp.port,
     sub: d.synchronised ? "ours, answering at stratum " + d.stratum : "answering unsynchronised",
-    kf: (ntp.requests || 0).toLocaleString(), kl: "requests",
+    kf: cnt(hour.requests), kl: "requests / hour",
+    hint: topClientsHint(ntp.top_clients),
     body: metrics([
-      ["requests", (ntp.requests || 0).toLocaleString()],
+      ["requests / hour", cntHtml(hour.requests)],
       ["per minute", rate == null ? "—" : num(rate, rate < 10 ? 1 : 0)],
-      ["answered", (ntp.answered || 0).toLocaleString()],
-      ["refused", ((ntp.ignored || 0) + (ntp.rate_limited || 0)).toLocaleString()],
+      ["answered", cntHtml(hour.answered)],
+      ["refused", cntHtml((hour.ignored || 0) + (hour.rate_limited || 0))],
     ]),
   });
   L.push({ from: "core", to: "ntpc", kind: "out", serving: d.synchronised, state: !d.synchronised ? "down" : ntp.requests ? "live" : "standby",
@@ -314,6 +317,24 @@ function refOf(d) {
     }
   } catch (x) {}
   return d.refid || "";
+}
+
+// The NTP server card's tooltip: who has been asking, busiest first. Public
+// addresses arrive already cut to their /24 or /64 (ClientTally.h).
+function topClientsHint(top) {
+  if (!top || !top.length) return "No NTP clients in the past hour";
+  return "Top NTP clients, past hour\n" + top.map((t) =>
+    t.client + "  " + cnt(t.requests) + (t.rate_limited ? "  (" + cnt(t.rate_limited) + " rate-limited)" : "")
+  ).join("\n");
+}
+
+// See compactCount() and countHtml() in index.html; plain separated figures if
+// this file is ever drawn without the page.
+function cnt(n) {
+  return typeof compactCount === "function" ? compactCount(n) : (Number(n) || 0).toLocaleString();
+}
+function cntHtml(n) {
+  return typeof countHtml === "function" ? countHtml(n) : (Number(n) || 0).toLocaleString();
 }
 
 const HEADS = ["Time signals", "Receivers & servers", "Disciplined clock", "Outputs"];
