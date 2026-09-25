@@ -56,9 +56,10 @@ enum class ClockLockRefusal : std::uint8_t {
     Plausibility = 2,  // voted timestamp implausibly far from the reference
     Staleness    = 3,  // no range-valid frame recent enough (or none at all),
                        // including a window of minutes that never decoded
-    Contested    = 4,  // window disagrees with itself: minute-increment chain
-                       // short among live decodes, or a static field carries
-                       // zero winning margin
+    Contested    = 4,  // window disagrees with itself: two decoded minutes
+                       // name different times, or a static field carries zero
+                       // winning margin. A chain short only for undecoded
+                       // minutes is None (collecting) or Staleness
 };
 
 // One BCD map entry: which second-of-frame carries which weight. A field's

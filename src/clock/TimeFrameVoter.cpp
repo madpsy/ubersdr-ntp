@@ -534,14 +534,23 @@ TimeFrameVoter::LockVerdict TimeFrameVoter::lockVerdict() const {
         }
     }
 
-    // A short increment chain is only a contest when there is something to
-    // contest. A window of undecoded minutes (all-Unknown frames read as
-    // minute 0) fails the chain too, and names the wrong cause: nothing has
-    // decoded lately, which is staleness. The verdict is unchanged -- both
-    // refuse -- only the tag.
+    // A short increment chain is only a contest when two decoded minutes
+    // disagree: brought forward to the newest slot (ext), they name different
+    // times. Undecoded minutes (all-Unknown frames read as minute 0) break the
+    // chain too, and are not a contest: with no fresh decode that is
+    // staleness, and with one decode and gaps round it the window is still
+    // collecting. The verdict is unchanged -- all three refuse -- only the tag.
     if (increments < m_cfg.minFramesForLock - 1) {
-        return {false, fresh && !frames.empty() ? ClockLockRefusal::Contested
-                                                : ClockLockRefusal::Staleness};
+        if (!fresh) return {false, ClockLockRefusal::Staleness};
+        const NormalizedFrame* first = nullptr;
+        for (const NormalizedFrame& nf : frames) {
+            if (!nf.valid) continue;
+            if (!first) { first = &nf; continue; }
+            if (minutesSince2000(nf.ext) != minutesSince2000(first->ext)) {
+                return {false, ClockLockRefusal::Contested};
+            }
+        }
+        return {false, ClockLockRefusal::None};
     }
 
     if (frames.empty() || !fresh) {
