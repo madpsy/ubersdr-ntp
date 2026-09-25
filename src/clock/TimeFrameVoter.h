@@ -85,6 +85,12 @@ struct ClockSecondInfo {
     // accuracy -- but nothing in THIS second measured it, so a consumer that
     // wants only measured edges should skip it.
     bool edgeMeasured = true;
+    // False when the edge was measured, but by a means not good enough to serve
+    // time from: DCF77's AM, whose 15% carrier reduction through a high-Q
+    // antenna is a ramp of a millisecond or more, read late by an amount that
+    // wanders with the path. It still frames the minute and checks PM; only
+    // the timing is refused. True for every other decoder.
+    bool edgeServable = true;
     ClockSymbol symbol = ClockSymbol::Unknown;
     float confidence = 0.0f;     // matched-filter margin (best - runner-up), >= 0
     int secondOfFrame = -1;      // 0..59 once frame-synced, else -1

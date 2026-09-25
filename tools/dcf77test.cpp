@@ -181,6 +181,9 @@ struct Result {
     std::vector<double> pmExactErrMs;
     ClockDecoderDiagnostics diag;
     std::vector<std::uint8_t> from;
+    // Measured seconds offered to serve time from (edgeServable), and any whose
+    // flag disagreed with who was timing that second: only PM may serve.
+    int servable = 0, servableMismatch = 0;
 };
 
 void fail(Result& r, const std::string& why) {
@@ -218,6 +221,8 @@ Result run(const Scenario& sc) {
     };
     dec.onSecond = [&](const ClockSecondInfo& i) {
         if (!i.edgeMeasured) return;
+        if (i.edgeServable) ++r.servable;
+        if (i.edgeServable != dec.diagnostics().timingFromPm) ++r.servableMismatch;
         const double t = static_cast<double>(i.edgeSample) / sc.rate;
         const Sec* s = nearest(secs, t);
         if (!s || std::fabs(s->t - t) > 0.1) return;
@@ -299,6 +304,13 @@ Result run(const Scenario& sc) {
     if (!sc.expectLock && r.labels > 0) fail(r, "certified a time it should have refused");
     if (sc.expectLock && sc.expectPmTiming && !r.diag.timingFromPm) fail(r, "not timed by PM at the end");
     if (sc.expectLock && !sc.expectPmTiming && r.diag.timingFromPm) fail(r, "timed by PM with no PM on air");
+    // Only PM's edges may serve time: every measured second says so exactly
+    // when PM timed it, and with no PM on air none does, locked or not.
+    if (r.servableMismatch > 0)
+        fail(r, std::to_string(r.servableMismatch) + " second(s) servable other than exactly when PM timed them");
+    if (!sc.pm && r.servable > 0)
+        fail(r, std::to_string(r.servable) + " AM-timed second(s) offered to serve time");
+    if (sc.pm && sc.expectLock && sc.expectPmTiming && r.servable == 0) fail(r, "PM timing, yet nothing servable");
     // PM past its tracker's first five edges -- the first is one raw
     // measurement, and nothing downstream uses an edge that early (Source
     // needs a locked, anchored minute first).

@@ -358,10 +358,16 @@ spread spectrum, and correlated here to find the second to tens of
 microseconds and to hold on through noise that buries the AM. Both run every
 second, and each checks the other:
 
-- **Timing** comes from PM whenever its correlator is tracking, from AM
-  otherwise. The log says which each time it changes, and the status page
-  shows it with the two edges' difference — AM's edge minus PM's is the one
-  check AM timing has, and reads a fraction of a millisecond on a healthy path.
+- **Timing** comes from PM, and only PM. AM's second marker is the carrier
+  cut to 15% through a high-Q antenna — a ramp a millisecond or more long,
+  read late by an amount that wanders with the path — so while PM's
+  correlator is not tracking, the decoder keeps edges from AM to frame the
+  minute and hold its place, but none of them becomes an offset sample, and
+  the source is not ready: `AM only: the time code decodes, but phase
+  modulation is not locked`. Its jitter, offset and history are PM's alone,
+  and it serves again by itself when PM locks. The log says which is timing
+  each time it changes, and the status page shows it with the two edges'
+  difference, AM's edge minus PM's.
 - **The minute** is decoded twice, from PM's bits and from AM's, each through
   its own parity checks. Both valid and the same: taken. One valid: taken from
   that one — which is AM carrying on when PM fades, or PM when the AM cut is

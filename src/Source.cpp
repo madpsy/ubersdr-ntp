@@ -2187,6 +2187,11 @@ void Source::onClockSecond(const clockdec::ClockSecondInfo& i) {
     // is the tracker's opinion counted again, and it would weigh the median
     // towards the estimate instead of the signal.
     if (!i.edgeMeasured) return;
+    // Nor one the decoder says is not fit to serve from: DCF77 timed by AM.
+    // Kept out of the estimator entirely, so its jitter, offset, dispersion
+    // and history are PM's alone; the source is not ready meanwhile (see
+    // snapshot()), and comes back by itself when PM locks again.
+    if (!i.edgeServable) return;
 
     // When the sample carrying this edge was observed here, on the daemon clock
     // the fit is taken on and the offset is measured against.
@@ -2587,7 +2592,9 @@ SourceSnapshot Source::snapshot() const {
     // with no earlier anchor still extending, has nothing to offer -- and
     // "still filtering" would hide that it is refusing a jump.
     const bool heldOut = !m_snap.timeCheck.empty() && !m_haveAnchor;
-    s.ready = s.enabled && s.active && s.clockState == "locked" && !heldOut;
+    // DCF77 serves only while PM times the second: see edgeServable.
+    const bool amOnly = m_dcf77 && s.clockState == "locked" && !s.timingFromPm;
+    s.ready = s.enabled && s.active && s.clockState == "locked" && !heldOut && !amOnly;
     if (!s.enabled) {
         s.notReadyReason = "disabled in the configuration";
     } else if (!s.active) {
@@ -2616,6 +2623,9 @@ SourceSnapshot Source::snapshot() const {
                                            : "decoder not locked yet";
     } else if (heldOut) {
         s.notReadyReason = m_snap.timeCheck;
+    } else if (amOnly) {
+        s.notReadyReason = "AM only: the time code decodes, but phase modulation is not locked, "
+                           "and AM's second edge is too coarse to serve time from";
     } else {
         s.notReadyReason.clear();
     }

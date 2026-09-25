@@ -1526,6 +1526,7 @@ struct Dcf77Decoder::Impl {
         si.edgeSample = r.edge;
         si.edgeSampleExact = r.edgeExact;
         si.edgeMeasured = measured;
+        si.edgeServable = timingFromPm;
         si.symbol = r.am;
         si.confidence = r.amConf;
         si.secondOfFrame = sof;
