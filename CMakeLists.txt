@@ -110,6 +110,8 @@ target_compile_options(ubersdr-ntp-iqrecord PRIVATE -Wall -Wextra)
 add_executable(ubersdr-ntp-clocktest
     tools/clocktest.cpp
     src/TimeContinuity.cpp
+    src/Uncertainty.cpp
+    src/Propagation.cpp
     src/Config.cpp
     src/OffsetEstimator.cpp
     src/SampleClock.cpp
@@ -220,6 +222,7 @@ add_executable(ubersdr-ntp
     src/NtpServer.cpp
     src/RateLimiter.cpp
     src/ClientTally.cpp
+    src/Uncertainty.cpp
     src/OffsetEstimator.cpp
     src/Propagation.cpp
     src/SampleClock.cpp

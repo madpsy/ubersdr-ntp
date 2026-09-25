@@ -1,4 +1,5 @@
 #include "Source.h"
+#include "Uncertainty.h"
 
 #include "CivilTime.h"
 #include "Log.h"
@@ -219,57 +220,9 @@ constexpr double kTimingPendingSec = 5.0;
 // small multiple of brings within this of a 20 ms frame.
 constexpr double kCaptureFrameToleranceSec = 50e-6;
 
-// Floor on how well the delay model can be trusted, whatever it computed. The
-// receiver's own buffering between radiod and the WebSocket is inside this and
-// nothing here can see it.
-//
-// Set from the worst errors measured against an absolute reference, with
-// margin, rather than guessed. Two north-eastern US receivers, ~65 ms of
-// modelled delay each: against a PPS-disciplined stratum 1 on 2026-09-17 the
-// worst single receiver was 9.0 ms out and the served time 5.3 ms; against
-// ntpd on 2026-09-13 the served time was at worst +8.6 ms, about 7.6 ms after
-// the chain constant was corrected. With the 1-3 ms each source measures of
-// itself on top, a 10 ms floor still covers every one of those by about 1.4x.
-// It was 15 ms, which covered them about 2x and left the served dispersion
-// near 21 ms for an error that has not been seen past 9.
-constexpr double kDelayUncertaintyFloorSec = 0.010;
-// And a proportional part, because a long path is a worse-known path: more
-// hops, more spread between them, more of the virtual height assumption. At
-// 15% it only overtakes the floor past about 67 ms of delay, i.e. on paths
-// longer than the ones the floor was measured on.
-constexpr double kDelayUncertaintyFraction = 0.15;
-// The floor above is the doubt in an HF skywave path timed by packet arrival,
-// with UberSDR's buffering inside it. None of that is in a DCF77 source that is
-// capture-timed and timed from its phase modulation on a groundwave path:
-// radiod stamps the samples at the RX888 (so no chain, network or buffering is
-// in the path), the groundwave delay is geometry at a known velocity (the
-// night-time skywave off the D/E layer is at most ~90 us later; Propagation.h),
-// and the PM correlator's edge is exact to the decoder test's resolution. What
-// is left is that skywave bias, the RX888's own latency (50-300 us, not yet
-// taken off in radiod) and the decoder's residual. Measured on M9PSY-1 at
-// 1061 km against a GPS-fed stratum 1 on 2026-09-24: within 0.03 ms smoothed
-// over 30 settled minutes, jitter spikes to 0.2 ms, which the jitter term
-// carries on top. 1 ms covers the unmeasured terms together about twice over.
-// Only inside the groundwave service area; past it the modes interfere.
-constexpr double kDelayUncertaintyFloorLfPmSec = 0.001;
-constexpr double kLfGroundwaveServiceM = 2000e3;
 // How long a 60 kHz source waits on a receiver description that failed before
 // deciding WWVB without it (resolveLf60).
 constexpr double kLf60DescriptionWaitSec = 60.0;
-// WWV and WWVH, capture-timed, from a receiver whose decoder has named the
-// station. The 10 ms floor was measured on arrival-timed WWV, where the chain
-// and the receiver's buffering were inside the error; capture timing takes both
-// out. What is left is the skywave geometry, bounded from the model itself by
-// skywaveModeSpreadSeconds() (Propagation.h), and the decoder's edge on live
-// ticks, whose bias was measured on synthetic ones: this allowance is for
-// that, not yet measured against a reference. Until the decoder names the
-// station the transmitter is a guess worth ~14 ms, and the 10 ms stands.
-constexpr double kWwvDecoderAllowanceSec = 0.001;
-
-// The smallest uncertainty a source may claim when it is being weighed against
-// the others. See the use site.
-constexpr double kWeightDispersionFloorSec = 0.001;
-
 // m_jsonPingSentAt's "do not time the next pong" marker. See the ping in run().
 constexpr double kPingUntimed = -1.0;
 
@@ -2320,32 +2273,17 @@ void Source::recomputeOffset() {
     //   delay           how wrong the delay model could be, which is the term
     //                   nothing can measure and therefore the one that usually
     //                   dominates
-    // The tight floor only while every condition that earns it holds: timing
-    // falling back to AM, or capture timing pausing, puts the 10 ms back at once.
-    const bool lfPmCapture = m_cfg.autoDelay && m_broadcast == Broadcast::Dcf77 &&
-                             m_snap.timingMode == "capture" && m_snap.pmLocked && m_snap.timingFromPm &&
-                             !m_snap.capturePaused && m_snap.receiverLocation.valid &&
-                             greatCircleMeters(m_snap.receiverLocation, dcf77Site()) <= kLfGroundwaveServiceM;
-    const bool wwvCapture = m_cfg.autoDelay && m_broadcast == Broadcast::Wwv &&
-                            m_snap.timingMode == "capture" && !m_snap.capturePaused &&
-                            (m_snap.station == "wwv" || m_snap.station == "wwvh") &&
-                            m_snap.receiverLocation.valid;
-    // Allouis, likewise: timed by its phase, capture-timed, and inside the
-    // groundwave's reach of Allouis.
-    const bool allouisCapture = m_cfg.autoDelay && m_broadcast == Broadcast::Allouis &&
-                                m_snap.timingMode == "capture" && m_snap.pmLocked && m_snap.timingFromPm &&
-                                !m_snap.capturePaused && m_snap.receiverLocation.valid &&
-                                greatCircleMeters(m_snap.receiverLocation, allouisSite()) <= kLfGroundwaveServiceM;
-    double delayUncertainty;
-    if (lfPmCapture || allouisCapture) {
-        delayUncertainty = std::max(kDelayUncertaintyFloorLfPmSec, m_snap.delaySec * kDelayUncertaintyFraction);
-    } else if (wwvCapture) {
-        const GeoPoint tx = m_snap.station == "wwvh" ? wwvhSite() : wwvSite();
-        delayUncertainty = skywaveModeSpreadSeconds(greatCircleMeters(m_snap.receiverLocation, tx)) +
-                           kWwvDecoderAllowanceSec;
-    } else {
-        delayUncertainty = std::max(kDelayUncertaintyFloorSec, m_snap.delaySec * kDelayUncertaintyFraction);
-    }
+    // The delay term's rule, and which sources earn the tight LF floor, is in
+    // Uncertainty.cpp with the measurements behind it.
+    UncertaintyInputs ui;
+    ui.broadcast = m_broadcast;
+    ui.station = m_snap.station;
+    ui.autoDelay = m_cfg.autoDelay;
+    ui.captureTimed = m_snap.timingMode == "capture" && !m_snap.capturePaused;
+    ui.timedByPhase = m_snap.pmLocked && m_snap.timingFromPm;
+    ui.receiver = m_snap.receiverLocation;
+    ui.delaySec = m_snap.delaySec;
+    const double delayUncertainty = delayUncertaintySec(ui);
     const double own = e.jitterSec + m_snap.clockResidualSec + m_snap.clockSlopeUncSec + e.rateTermSec;
     m_snap.dispersionSec = own + delayUncertainty;
 
@@ -2356,11 +2294,9 @@ void Source::recomputeOffset() {
     // sample clock has just been rebuilt or whose slope was refused says so
     // here rather than waiting to be noticed by hand.
     //
-    // The floor keeps a source that reports a suspiciously perfect zero -- a
-    // synthetic stream, or a window too short to have scattered yet -- from
-    // taking an unbounded share of the weight. A millisecond is about the
-    // decoder's own edge resolution, so no honest source is below it.
-    m_snap.weightDispersionSec = std::max(kWeightDispersionFloorSec, own);
+    // Floored, against a source reporting a suspiciously perfect zero; the
+    // floor and why it is where it is are in Uncertainty.cpp.
+    m_snap.weightDispersionSec = weightDispersionSec(own);
 
     // Fewer than a handful of measurements is not a filtered value, whatever
     // its spread happens to be.

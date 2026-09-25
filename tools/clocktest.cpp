@@ -26,6 +26,7 @@
 #include "OffsetEstimator.h"
 #include "SampleClock.h"
 #include "Selector.h"
+#include "Uncertainty.h"
 #include "TimeContinuity.h"
 
 #include <algorithm>
@@ -1263,6 +1264,109 @@ void testJitterSpikeHold() {
           "holds %d, usual jitter %.2f ms", hf.estimate().holds, hf.estimate().jitterBaselineSec * 1e3);
 }
 
+// --- what a source claims: delay doubt and weight floor --------------------
+void testUncertainty() {
+    std::printf("\nDelay uncertainty and weight floor (Uncertainty.cpp)\n");
+
+    GeoPoint m9psy;  // M9PSY-1, near Edinburgh: 1061 km from DCF77, 125 km from MSF
+    m9psy.lat = 56.036568; m9psy.lon = -3.351259; m9psy.valid = true;
+    GeoPoint boulder;  // Colorado: WWVB country, far from every European station
+    boulder.lat = 40.0; boulder.lon = -105.3; boulder.valid = true;
+    GeoPoint athens;   // about 2800 km from Anthorn: past MSF's groundwave
+    athens.lat = 37.98; athens.lon = 23.73; athens.valid = true;
+
+    auto lf = [&](Broadcast b, const char* station, bool phase) {
+        UncertaintyInputs in;
+        in.broadcast = b; in.station = station; in.autoDelay = true; in.captureTimed = true;
+        in.timedByPhase = phase; in.receiver = m9psy; in.delaySec = 0.0035;
+        return in;
+    };
+    auto ms = [](double s) { return s * 1e3; };
+
+    UncertaintyInputs dcf = lf(Broadcast::Dcf77, "dcf77", true);
+    check("DCF77 by PM, capture-timed, inside the groundwave: 1 ms",
+          delayUncertaintySec(dcf) == kDelayUncertaintyFloorLfSec, "%.3f ms", ms(delayUncertaintySec(dcf)));
+    UncertaintyInputs x = dcf; x.timedByPhase = false;
+    check("...timed by AM instead: 10 ms", delayUncertaintySec(x) == kDelayUncertaintyFloorSec,
+          "%.3f ms", ms(delayUncertaintySec(x)));
+    x = dcf; x.captureTimed = false;
+    check("...timed by arrival instead: 10 ms", delayUncertaintySec(x) == kDelayUncertaintyFloorSec);
+    x = dcf; x.autoDelay = false;
+    check("...with a configured delay: 10 ms", delayUncertaintySec(x) == kDelayUncertaintyFloorSec);
+    x = dcf; x.receiver.valid = false;
+    check("...with no receiver location: 10 ms", delayUncertaintySec(x) == kDelayUncertaintyFloorSec);
+    x = dcf; x.receiver = boulder;
+    check("...beyond the groundwave (Colorado): 10 ms", delayUncertaintySec(x) == kDelayUncertaintyFloorSec);
+
+    UncertaintyInputs als = lf(Broadcast::Allouis, "allouis", true);
+    check("Allouis by its phase correlation: 1 ms", delayUncertaintySec(als) == kDelayUncertaintyFloorLfSec);
+    als.timedByPhase = false;
+    check("...not correlating: 10 ms", delayUncertaintySec(als) == kDelayUncertaintyFloorSec);
+
+    UncertaintyInputs msf = lf(Broadcast::Lf60, "msf", false);
+    check("MSF on its carrier-off edge, capture-timed, 125 km: 1 ms (was 10)",
+          delayUncertaintySec(msf) == kDelayUncertaintyFloorLfSec, "%.3f ms", ms(delayUncertaintySec(msf)));
+    x = msf; x.captureTimed = false;
+    check("...timed by arrival: 10 ms", delayUncertaintySec(x) == kDelayUncertaintyFloorSec);
+    x = msf; x.receiver = athens;
+    check("...from Athens, past its groundwave: 10 ms", delayUncertaintySec(x) == kDelayUncertaintyFloorSec);
+
+    UncertaintyInputs wwvb = lf(Broadcast::Lf60, "wwvb", false);
+    wwvb.receiver = boulder;
+    check("WWVB on 60 kHz, not measured against a reference: 10 ms",
+          delayUncertaintySec(wwvb) == kDelayUncertaintyFloorSec);
+    wwvb.broadcast = Broadcast::Wwvb;
+    check("...nor over USB audio", delayUncertaintySec(wwvb) == kDelayUncertaintyFloorSec);
+
+    UncertaintyInputs wwv;
+    wwv.broadcast = Broadcast::Wwv; wwv.station = "wwv"; wwv.captureTimed = true;
+    wwv.receiver = m9psy; wwv.delaySec = 0.030;
+    const double w = delayUncertaintySec(wwv);
+    check("WWV named and capture-timed: its skywave bound, between the two floors",
+          w > kDelayUncertaintyFloorLfSec && w < kDelayUncertaintyFloorSec, "%.3f ms", ms(w));
+    wwv.station = "unknown";
+    check("...until the decoder names the station: 10 ms", delayUncertaintySec(wwv) == kDelayUncertaintyFloorSec);
+    wwv.delaySec = 0.080;
+    check("a long path takes 15% of its delay over the floor: 80 ms -> 12 ms",
+          std::abs(delayUncertaintySec(wwv) - 0.012) < 1e-12, "%.3f ms", ms(delayUncertaintySec(wwv)));
+
+    check("the weight floor is 0.1 ms", kWeightDispersionFloorSec == 0.0001);
+    check("a perfect zero claims the floor, not zero", weightDispersionSec(0.0) == kWeightDispersionFloorSec);
+    check("5 us of jitter claims the floor", weightDispersionSec(5e-6) == kWeightDispersionFloorSec);
+    check("1.5 ms is taken as it is", weightDispersionSec(0.0015) == 0.0015);
+
+    // The combine itself, as on M9PSY-1 on 2026-09-25 from 15:17 to 15:45: MSF and
+    // Allouis agree to 30 us with ~10 us of jitter, while a third source with
+    // 1.5 ms of jitter sits 1.4 ms off them. Its weight must be all but nothing
+    // -- under the old 1 ms floor it had a quarter of it and moved the answer
+    // 0.25 ms.
+    auto served = [&](double floorSec) {
+        ClockConfig k;
+        Selector sel(3600.0, 15.0, 1, k);
+        double now = 1000.0;
+        std::vector<SourceSnapshot> snaps = {snapshotAt("msf", now, 0.0, 0.0, now),
+                                             snapshotAt("allouis", now, 0.00003, 0.0, now),
+                                             snapshotAt("dcf77", now, -0.0014, 0.0, now)};
+        snaps[0].station = "msf"; snaps[1].station = "allouis"; snaps[2].station = "dcf77";
+        const double own[] = {10e-6, 10e-6, 0.0015};
+        for (int i = 0; i < 3; ++i) {
+            snaps[static_cast<std::size_t>(i)].jitterSec = own[i];
+            snaps[static_cast<std::size_t>(i)].dispersionSec = 0.001 + own[i];
+            snaps[static_cast<std::size_t>(i)].weightDispersionSec = std::max(floorSec, own[i]);
+        }
+        const Combined c = run(sel, snaps, now, 600.0, [](std::vector<SourceSnapshot>& v, double t) {
+            for (SourceSnapshot& s : v) { s.offsetAtSec = t; s.offsetAgeSec = 0.0; }
+        });
+        return c;
+    };
+    const Combined now01 = served(kWeightDispersionFloorSec);
+    const Combined old1 = served(0.001);
+    check("at 0.1 ms the served time stays on the two that agree (within 20 us of them)",
+          now01.valid && std::abs(now01.offsetSec - 0.000015) < 20e-6, "%+.3f ms", now01.offsetSec * 1e3);
+    check("...where the old 1 ms floor let the noisy one pull it over 0.1 ms",
+          old1.valid && old1.offsetSec < -0.0001, "%+.3f ms", old1.offsetSec * 1e3);
+}
+
 int main() {
     std::printf("ubersdr-ntp clock test\n");
     testDrift();
@@ -1283,6 +1387,7 @@ int main() {
     testColdActivation();
     testTieBreak();
     testTimeContinuity();
+    testUncertainty();
     std::printf("\n%d ok, %d failed\n", g_ok, g_failed);
     return g_failed ? 1 : 0;
 }
