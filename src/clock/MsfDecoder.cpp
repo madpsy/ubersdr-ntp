@@ -212,7 +212,6 @@ struct SecRec {
 };
 
 bool confMarker(const SecRec& r, float c) { return r.read && r.marker && r.markConf >= c; }
-bool confNotMarker(const SecRec& r, float c) { return r.read && !r.marker && r.markConf >= c; }
 
 // One minute's time code.
 struct Decoded {

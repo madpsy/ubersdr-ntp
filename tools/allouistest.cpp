@@ -119,11 +119,11 @@ long long lastSundayUtc(int y, unsigned m) {
     const long long wd = civ::floorMod(d + 3, 7);   // 0 = Monday
     return (d - civ::floorMod(wd - 6, 7)) * 86400LL + 3600LL;
 }
-bool cestAt(long long unix) {
-    const long long days = civ::floorDiv(unix, 86400);
+bool cestAt(long long ut) {
+    const long long days = civ::floorDiv(ut, 86400);
     int y = 0; unsigned m = 0, dd = 0;
     civ::civilFromDays(days, y, m, dd);
-    return unix >= lastSundayUtc(y, 3) && unix < lastSundayUtc(y, 10);
+    return ut >= lastSundayUtc(y, 3) && ut < lastSundayUtc(y, 10);
 }
 
 struct Scenario {
