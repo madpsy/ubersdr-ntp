@@ -82,6 +82,9 @@ enum class EventType {
     // One upstream NTP server.
     UpstreamChanged,
     KissOfDeath,
+
+    PpsPulsing,
+    PpsStopped,
 };
 
 // What the page shows in its filter, and what a reader of the API can learn

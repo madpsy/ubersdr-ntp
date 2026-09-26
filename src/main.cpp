@@ -34,6 +34,7 @@
 #include "Mqtt.h"
 #include "NtpClient.h"
 #include "NtpServer.h"
+#include "Pps.h"
 #include "SampleClock.h"
 #include "Selector.h"
 #include "Source.h"
@@ -123,6 +124,8 @@ void usage() {
         "\n"
         "Other:\n"
         "      --check              Load the configuration, report it, and exit\n"
+        "      --pps-device         Print the 1PPS output's device if it is enabled, nothing\n"
+        "                           if not, and exit (for the scripts that map it into Docker)\n"
         "      --version, --help\n"
         "\n"
         "Signals:\n"
@@ -254,7 +257,7 @@ int main(int argc, char** argv) {
     int cliPort = -1, cliHttpPort = -1;
     std::string cliHttpListen, cliLogFile, cliLogLevel;
     double cliStatusInterval = -1.0;
-    bool cliQuiet = false, checkOnly = false;
+    bool cliQuiet = false, checkOnly = false, ppsDeviceOnly = false;
 
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -281,6 +284,7 @@ int main(int argc, char** argv) {
         else if (a == "--status-interval") cliStatusInterval = std::atof(next("--status-interval").c_str());
         else if (a == "--quiet") cliQuiet = true;
         else if (a == "--check") checkOnly = true;
+        else if (a == "--pps-device") ppsDeviceOnly = true;
         else {
             std::fprintf(stderr, "unknown option: %s\nTry --help.\n", a.c_str());
             return 2;
@@ -348,6 +352,13 @@ int main(int argc, char** argv) {
     if (!cfg.finalise(err)) {
         std::fprintf(stderr, "configuration: %s\n", err.c_str());
         return 1;
+    }
+
+    // The device alone, read through the real parser -- the file allows
+    // comments, so nothing simpler reads it reliably -- for pps-compose.sh.
+    if (ppsDeviceOnly) {
+        if (cfg.pps.enabled) std::printf("%s\n", cfg.pps.device.c_str());
+        return 0;
     }
 
     // Silent with no file is a daemon nobody can support.
@@ -523,6 +534,32 @@ int main(int argc, char** argv) {
     MetricHistory metrics;
     double lastMetricSecond = 0.0;
 
+    // The 1PPS output, when the configuration asks for one; nothing otherwise.
+    // Its position for NMEA RMC: the configuration's, or else that of a
+    // receiver on this host -- capture-timed, so the one the daemon runs beside
+    // -- that publishes its coordinates. A remote receiver's position is not
+    // this station's.
+    std::unique_ptr<PpsOutput> pps;
+    if (cfg.pps.enabled) {
+        auto position = [&cfg, &snapshots](std::string& from) {
+            PpsPosition p;
+            if (cfg.pps.positionGiven) {
+                p = {true, cfg.pps.latitude, cfg.pps.longitude};
+                from = "config";
+                return p;
+            }
+            for (const SourceSnapshot& s : snapshots()) {
+                if (s.kind != SourceKind::Radio || s.timingMode != "capture" || !s.receiverLocation.valid) continue;
+                p = {true, s.receiverLocation.lat, s.receiverLocation.lon};
+                from = "receiver " + s.name;
+                return p;
+            }
+            return p;
+        };
+        pps = std::make_unique<PpsOutput>(cfg.pps, [&selector] { return selector.current(); }, position,
+                                          &events, cfg.ntp.realtimePriority, startedAt);
+    }
+
     // Set once the HTTP service exists, which is after the provider it is
     // handed; read only through the provider, never before then.
     const HttpApi* httpApi = nullptr;
@@ -543,6 +580,7 @@ int main(int argc, char** argv) {
         in.eventsLatestId = events.latestId();
         in.eventCounts = events.countsByType();
         in.httpStreamClients = httpApi && cfg.http.enabled ? httpApi->streamClients() : -1;
+        if (pps) in.pps = pps->stats();
         return in;
     };
 
@@ -563,6 +601,7 @@ int main(int argc, char** argv) {
     }
 
     for (auto& s : sources) s->start();
+    if (pps) pps->start();
 
     // MQTT through the receiver's addon ingest port. Dormant, and quiet about
     // it, wherever there is no such port; see Mqtt.h.
@@ -710,6 +749,7 @@ int main(int argc, char** argv) {
     }
 
     LOG_INFO(kTag, "shutting down");
+    if (pps) pps->stop();
     mqtt.stop();
     for (auto& s : sources) s->stop();
     ntp.stop();

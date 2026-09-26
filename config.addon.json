@@ -145,6 +145,33 @@
   },
 
   // =====================================================================
+  // 1PPS OUTPUT (optional; off unless "enabled" is true)
+  //
+  // One pulse per second on a serial port's DTR (or RTS) line, at the start
+  // of every second of the served time, for another machine's PPS input
+  // (DCD) or a lab instrument. Optionally with NMEA 0183 on the same port's
+  // TX, naming each second: RMC, ZDA, or both. Nothing is sent while the
+  // daemon is not synchronised, except RMC with status V.
+  //
+  // In Docker, ./restart.sh maps the device into the container when this is
+  // enabled; a device given by /dev/serial/by-id/... keeps its name across
+  // reboots and USB ports. A motherboard or PCIe UART (ttyS*) marks the
+  // second to tens of microseconds; a USB adapter to about a millisecond.
+  // See "1PPS output" in the README.
+  // =====================================================================
+  "pps": {
+    "enabled": false,
+    "device": "/dev/ttyS0",
+    "line": "dtr",          // or "rts"
+    "width_ms": 100,
+    "invert": false,        // true: asserted is the line's LOW level
+    "nmea": [],             // any of "rmc", "zda"; empty: pulses only
+    "baud": 4800            // NMEA 0183's rate; 9600 to 115200 also offered
+    // "latitude": 51.5, "longitude": -0.12   // RMC's position; otherwise a
+    //                                          // receiver on this host's
+  },
+
+  // =====================================================================
   // THE TWO CLASSES OF SOURCE
   //
   // There are two kinds of reference here: the radio sources below, and

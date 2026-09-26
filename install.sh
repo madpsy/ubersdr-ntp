@@ -245,7 +245,7 @@ chmod 644 "${CONFIG_FILE}"
 # Fetch helper scripts
 # ---------------------------------------------------------------------------
 
-for script in update.sh start.sh stop.sh restart.sh; do
+for script in update.sh start.sh stop.sh restart.sh pps-compose.sh; do
     echo "Fetching ${script}..."
     curl -fsSL "${REPO_RAW}/${script}" -o "${script}"
     chmod +x "${script}"
@@ -258,6 +258,9 @@ done
 
 echo "Pulling latest Docker image..."
 docker compose pull
+
+# The 1PPS output's serial port, mapped in when it is enabled (pps-compose.sh).
+./pps-compose.sh || true
 
 echo "Starting ubersdr-ntp..."
 docker compose up -d --remove-orphans --force-recreate

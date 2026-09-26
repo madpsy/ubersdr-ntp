@@ -14,6 +14,7 @@
 // disagree about what the state was.
 
 #include "NtpServer.h"
+#include "Pps.h"
 #include "Selector.h"
 #include "Source.h"
 
@@ -21,6 +22,7 @@
 
 #include <cstdint>
 #include <map>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -53,6 +55,9 @@ struct StatusInput {
     // Status pages and other followers holding /api/events open; -1 with the
     // HTTP service off.
     int httpStreamClients = -1;
+
+    // The 1PPS output's state; absent when it is not enabled.
+    std::optional<PpsStats> pps;
 };
 
 // The multi-line block for the log. No trailing newline; Log::block indents it.

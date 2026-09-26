@@ -65,6 +65,11 @@ LogsDirectory=ubersdr-ntp
 DynamicUser=yes
 NoNewPrivileges=yes
 PrivateTmp=yes
+# The 1PPS output (pps in the configuration) needs its serial port. To use it,
+# replace PrivateDevices=yes with these three, naming the port:
+#   PrivateDevices=no
+#   DeviceAllow=/dev/ttyS0 rw
+#   SupplementaryGroups=dialout
 PrivateDevices=yes
 ProtectSystem=strict
 ProtectHome=yes

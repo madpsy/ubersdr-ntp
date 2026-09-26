@@ -5,6 +5,7 @@
 #include "../third_party/json.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
@@ -239,6 +240,39 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         if (!getOpt(m, "ingest_url", c.mqtt.ingestUrl, err)) return false;
     }
 
+    if (auto it = j.find("pps"); it != j.end() && !it->is_null()) {
+        if (!it->is_object()) { err = "pps must be an object"; return false; }
+        const json& p = *it;
+        if (!getOpt(p, "enabled", c.pps.enabled, err)) return false;
+        if (!getOpt(p, "device", c.pps.device, err)) return false;
+        if (!getOpt(p, "line", c.pps.line, err)) return false;
+        if (!getOpt(p, "width_ms", c.pps.widthMs, err)) return false;
+        if (!getOpt(p, "invert", c.pps.invert, err)) return false;
+        if (!getOpt(p, "baud", c.pps.baud, err)) return false;
+        if (auto nit = p.find("nmea"); nit != p.end() && !nit->is_null()) {
+            // A single sentence may be given as a string, several as a list.
+            if (nit->is_string()) {
+                c.pps.nmea.push_back(nit->get<std::string>());
+            } else if (nit->is_array()) {
+                for (const json& v : *nit) {
+                    if (!v.is_string()) { err = "pps.nmea must list sentence names (\"rmc\", \"zda\")"; return false; }
+                    c.pps.nmea.push_back(v.get<std::string>());
+                }
+            } else {
+                err = "pps.nmea must be a list of sentence names (\"rmc\", \"zda\")";
+                return false;
+            }
+        }
+        const bool haveLat = p.contains("latitude") && !p["latitude"].is_null();
+        const bool haveLon = p.contains("longitude") && !p["longitude"].is_null();
+        if (haveLat != haveLon) { err = "pps.latitude and pps.longitude go together: give both or neither"; return false; }
+        if (haveLat) {
+            if (!getOpt(p, "latitude", c.pps.latitude, err)) return false;
+            if (!getOpt(p, "longitude", c.pps.longitude, err)) return false;
+            c.pps.positionGiven = true;
+        }
+    }
+
     if (auto it = j.find("clock"); it != j.end() && it->is_object()) {
         const json& k = *it;
         std::string v;
@@ -365,6 +399,39 @@ bool Config::finalise(std::string& err) {
         return false;
     }
     if (ntp.minSources < 1) ntp.minSources = 1;
+
+    // The PPS output is checked only when it is on: a half-written block left
+    // disabled must not stop the daemon starting.
+    if (pps.enabled) {
+        for (char& ch : pps.line) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (pps.device.empty()) { err = "pps.enabled is true but pps.device is empty"; return false; }
+        if (pps.line != "dtr" && pps.line != "rts") {
+            err = "pps.line \"" + pps.line + "\" is not dtr or rts";
+            return false;
+        }
+        if (pps.widthMs < 1 || pps.widthMs > 900) {
+            err = "pps.width_ms " + std::to_string(pps.widthMs) + " out of range (1 to 900)";
+            return false;
+        }
+        static const int kBauds[] = {4800, 9600, 19200, 38400, 57600, 115200};
+        if (std::find(std::begin(kBauds), std::end(kBauds), pps.baud) == std::end(kBauds)) {
+            err = "pps.baud " + std::to_string(pps.baud) + " is not one of 4800, 9600, 19200, 38400, 57600, 115200";
+            return false;
+        }
+        for (std::string& n : pps.nmea) {
+            for (char& ch : n) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+            if (n != "rmc" && n != "zda") { err = "pps.nmea: unknown sentence \"" + n + "\" (rmc, zda)"; return false; }
+        }
+        for (std::size_t i = 0; i < pps.nmea.size(); ++i)
+            for (std::size_t k = i + 1; k < pps.nmea.size(); ++k)
+                if (pps.nmea[i] == pps.nmea[k]) { err = "pps.nmea lists \"" + pps.nmea[i] + "\" twice"; return false; }
+        if (pps.positionGiven &&
+            !(std::isfinite(pps.latitude) && std::fabs(pps.latitude) <= 90.0 &&
+              std::isfinite(pps.longitude) && std::fabs(pps.longitude) <= 180.0)) {
+            err = "pps.latitude/longitude out of range";
+            return false;
+        }
+    }
 
     // Numbers that are NaN, infinite or negative where negative means nothing
     // are refused rather than clamped. JSON cannot spell NaN, but the command

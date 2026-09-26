@@ -142,6 +142,13 @@ const std::vector<EventTypeInfo>& eventTypes() {
          "synchronised to something else."},
         {EventType::KissOfDeath, "kiss_of_death", "Kiss-o'-death", "ntp", S::Error,
          "An upstream server told this daemon to go away (RATE, DENY or RSTR)."},
+
+        {EventType::PpsPulsing, "pps_pulsing", "1PPS output pulsing", "pps", S::Notice,
+         "The serial 1PPS output is marking every second of the served time: for the first "
+         "time, or again after the daemon synchronised or the port came back."},
+        {EventType::PpsStopped, "pps_stopped", "1PPS output stopped", "pps", S::Warning,
+         "The serial 1PPS output stopped pulsing: the daemon is not synchronised, or the "
+         "port is missing or failing. The message says which."},
     };
     return kTypes;
 }

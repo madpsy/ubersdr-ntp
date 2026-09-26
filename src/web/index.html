@@ -261,6 +261,9 @@ tr.fresh td { animation:fresh 4s ease-out; }
         <div class="note">since the newest fix</div></div>
       <div><div class="label">NTP requests, past hour</div><div class="figure" id="ntpreq">—</div>
         <div class="note" id="ntpnote">&nbsp;</div></div>
+      <div id="ppstile" hidden><div class="label">1PPS output</div>
+        <div id="ppspill" style="margin-top:6px"></div>
+        <div class="note" id="ppsnote">&nbsp;</div></div>
     </div>
     <div class="trends">
       <div><div class="trendhead"><span class="label">Clock offset</span>
@@ -477,6 +480,29 @@ function dcf77Text(p) {
     ", last minute from " + (p.frame_from ? from[p.frame_from] || esc(p.frame_from) : "none yet") +
     (p.pm_refused_locks ? ", " + p.pm_refused_locks + " PM lock(s) refused for contradicting AM (interference?)" : "") +
     (p.pm_aided_locks ? ", " + p.pm_aided_locks + " PM lock(s) found with AM's help" : "");
+}
+
+// The serial 1PPS output, when it is configured: whether it is pulsing, and
+// how late the line was set against the second it marks -- which is the
+// port's figure, not the daemon's: tens of microseconds on a UART, up to a
+// millisecond through USB.
+function renderPps(p) {
+  $("ppstile").hidden = !p.enabled;
+  if (!p.enabled) return;
+  const tone = p.state === "pulsing" ? "ok" : p.state === "waiting" ? "warn" : "bad";
+  const words = { pulsing: "pulsing", waiting: "waiting", "no device": "no device", error: "error" };
+  $("ppspill").innerHTML = '<span class="pill ' + tone + '" title="' + esc(p.device) + '">' +
+    esc(words[p.state] || p.state) + "</span>" +
+    (p.last_was_leap ? ' <span class="pill warn">23:59:60</span>' : "");
+  const us = (v) => v < 1000 ? Math.round(v) + " µs" : (v / 1000).toFixed(2) + " ms";
+  const what = (p.line || "dtr").toUpperCase() + " on " + p.device +
+    (p.nmea && p.nmea.length ? ", NMEA " + p.nmea.join("+").toUpperCase() + " at " + p.baud : "");
+  $("ppsnote").textContent = p.state === "pulsing" && p.latency_us
+    ? what + " · late " + us(p.latency_us.mean) + " avg, " + us(p.latency_us.max) + " max"
+    : (p.detail || what);
+  $("ppsnote").title = what + (p.position_from ? "; RMC position from " + p.position_from : "") +
+    (p.pulses ? "; " + p.pulses.toLocaleString() + " pulses" : "") +
+    (p.skipped ? ", " + p.skipped + " skipped as too late" : "");
 }
 
 // Whether a source is received as IQ, by the daemon's rule (Config.h,
@@ -1286,6 +1312,8 @@ function peerRows(x) {
 }
 
 function onStatus(d) {
+  // From the full status: the second-by-second tick does not carry it.
+  renderPps(d.pps || {});
   const firstStatus = !Object.keys(srcConfigured).length;
   srcConfigured = {};
   ntpRoundTrips = [];
@@ -1452,7 +1480,8 @@ function buildTypeFilter(types) {
     (groups[t.category] = groups[t.category] || []).push(t);
   }
   const catLabel = { daemon: "Daemon", clock: "Served time", class: "Primary and secondary",
-                     source: "Any source", radio: "Radio sources", ntp: "NTP sources" };
+                     source: "Any source", radio: "Radio sources", ntp: "NTP sources",
+                     pps: "1PPS output" };
   let html = '<option value="">All types</option>';
   for (const cat of Object.keys(groups)) {
     html += '<option value="cat:' + esc(cat) + '">All ' + esc((catLabel[cat] || cat).toLowerCase()) +

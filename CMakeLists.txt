@@ -176,6 +176,24 @@ target_include_directories(ubersdr-ntp-eventtest PRIVATE
 target_link_libraries(ubersdr-ntp-eventtest PRIVATE Threads::Threads)
 target_compile_options(ubersdr-ntp-eventtest PRIVATE -Wall -Wextra)
 
+# Offline test of the 1PPS output: NMEA 0183 against published sentences, the
+# naming of seconds across a leap second, the configuration, the output thread
+# against a recording port in real time, and a real port's open path on a
+# pseudo-terminal. About fifteen seconds. Not installed.
+add_executable(ubersdr-ntp-ppstest
+    tools/ppstest.cpp
+    src/Pps.cpp
+    src/Events.cpp
+    src/Config.cpp
+    src/SampleClock.cpp
+    src/Selector.cpp
+    src/Log.cpp)
+target_include_directories(ubersdr-ntp-ppstest PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_link_libraries(ubersdr-ntp-ppstest PRIVATE Threads::Threads)
+target_compile_options(ubersdr-ntp-ppstest PRIVATE -Wall -Wextra)
+
 # ---------------------------------------------------------------------------
 # The page is a real file in src/web/ and is served from the binary. This is
 # the one line of build glue that costs; a 400-line page living as a string
@@ -220,6 +238,7 @@ add_executable(ubersdr-ntp
     src/Mqtt.cpp
     src/NtpClient.cpp
     src/NtpServer.cpp
+    src/Pps.cpp
     src/RateLimiter.cpp
     src/ClientTally.cpp
     src/Uncertainty.cpp
@@ -235,6 +254,7 @@ add_dependencies(ubersdr-ntp index_html version_header)
 add_dependencies(ubersdr-ntp-clocktest version_header)
 add_dependencies(ubersdr-ntp-configtest version_header)
 add_dependencies(ubersdr-ntp-eventtest version_header)
+add_dependencies(ubersdr-ntp-ppstest version_header)
 add_dependencies(ubersdr-ntp-ntptest version_header)   # Selector.h reaches Config.h, which needs it
 
 target_include_directories(ubersdr-ntp PRIVATE

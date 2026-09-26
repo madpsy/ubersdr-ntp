@@ -689,6 +689,32 @@ json statusJson(const StatusInput& in) {
     j["ntp"] = std::move(ntp);
 
     j["events"] = {{"latest_id", in.eventsLatestId}, {"counts", in.eventCounts}};
+
+    // The 1PPS output: {"enabled": false} and nothing else when it is off.
+    json pps;
+    pps["enabled"] = in.pps.has_value();
+    if (in.pps) {
+        const PpsStats& p = *in.pps;
+        pps["device"] = p.device;
+        pps["line"] = p.line;
+        pps["width_ms"] = p.widthMs;
+        pps["invert"] = p.invert;
+        pps["baud"] = p.baud;
+        pps["nmea"] = p.nmea;
+        pps["state"] = p.state;
+        pps["detail"] = p.detail.empty() ? json(nullptr) : json(p.detail);
+        pps["pulses"] = p.pulses;
+        pps["sentences"] = p.sentences;
+        pps["skipped"] = p.skipped;
+        pps["label_resyncs"] = p.labelResyncs;
+        pps["last_pulse_utc"] = p.pulses ? json(iso8601(static_cast<long long>(p.lastPulseUtc) * 1000)) : json(nullptr);
+        pps["last_was_leap"] = p.lastWasLeap;
+        pps["latency_us"] = p.pulses ? json({{"last", p.lastLatencyUs}, {"mean", p.meanLatencyUs},
+                                             {"max", p.maxLatencyUs}})
+                                     : json(nullptr);
+        pps["position_from"] = p.positionFrom.empty() ? json(nullptr) : json(p.positionFrom);
+    }
+    j["pps"] = std::move(pps);
     j["http"] = {{"stream_clients", in.httpStreamClients >= 0 ? json(in.httpStreamClients)
                                                               : json(nullptr)}};
 

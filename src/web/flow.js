@@ -1,8 +1,9 @@
 "use strict";
 // ---------------------------------------------------------------------------
 // The signal path, drawn: every transmitter and upstream server, the receivers
-// and peers that hear them, this daemon, and what it serves -- NTP clients and
-// the browser showing this page -- with each link coloured by whether it is
+// and peers that hear them, this daemon, and what it serves -- NTP clients, the
+// serial 1PPS output when there is one, and the browser showing this page --
+// with each link coloured by whether it is
 // feeding the served time, measured but standing by, or down.
 //
 // Nothing here is fetched. The page already holds everything on the event
@@ -47,7 +48,7 @@ const freq = (hz) => !fin(hz) || !hz ? "" : hz < 1e6 ? (hz / 1e3).toFixed(0) + "
 let root = null, scroller, grid, svg, canvas, ctx, chipLayer, summary, detail;
 // The node whose full box is shown under the diagram in its compact form.
 let selected = "core", fullHtml = {}, kindOf = {};
-let tick = null, status = {}, browser = null, linkOk = false;
+let tick = null, status = {}, pps = null, browser = null, linkOk = false;
 let shape = "", nodeEls = {}, links = [], linkEls = [];
 let hist = {}, reqHist = [], particles = [], raf = 0, lastSpawnSec = null;
 
@@ -274,6 +275,38 @@ function model(d) {
   });
   L.push({ from: "core", to: "ntpc", kind: "out", serving: d.synchronised, state: !d.synchronised ? "down" : ntp.requests ? "live" : "standby",
            label: rate == null ? "" : num(rate, rate < 10 ? 1 : 0) + "/min" });
+
+  // The serial 1PPS output, when it is configured: the port it pulses and
+  // how late the line was set against each second -- the port's own figure.
+  if (pps) {
+    const p = pps;
+    const pulsing = p.state === "pulsing";
+    const st = pulsing ? "live" : p.state === "waiting" ? "standby" : "down";
+    const us = (v) => !fin(v) ? "—" : v < 1000 ? num(v, 0) + " µs" : num(v / 1000, 2) + " ms";
+    const line = (p.line || "dtr").toUpperCase() + (p.invert ? ", inverted" : "");
+    const nmea = p.nmea && p.nmea.length ? p.nmea.join("+").toUpperCase() : "off";
+    const lat = p.latency_us || {};
+    cols[3].push({
+      key: "pps", kind: "out", state: st,
+      title: "1PPS output", short: "1PPS", tag: line.split(",")[0] + (nmea !== "off" ? " + NMEA" : ""),
+      sub: p.device,
+      pill: pulsing ? null : [p.state === "waiting" ? "waiting for sync" : p.state, p.state === "waiting" ? "warn" : "bad"],
+      kf: pulsing ? us(lat.mean) : p.state, kl: pulsing ? "late, avg" : "",
+      hint: p.detail || (p.device + ", " + line + ", NMEA " + nmea + (nmea !== "off" ? " at " + p.baud + " baud" : "")),
+      body: metrics([
+        ["port", esc(p.device)],
+        ["line", esc(line)],
+        ["pulse", p.width_ms + " ms"],
+        ["NMEA", esc(nmea)],
+        ["baud", nmea !== "off" ? String(p.baud) : "—"],
+        ["late, avg", pulsing ? us(lat.mean) : "—"],
+        ["late, max", pulsing ? us(lat.max) : "—", pulsing && lat.max > 1000 ? "fl-warn" : ""],
+        ["pulses", cntHtml(p.pulses || 0)],
+      ]) + (p.detail ? '<div class="fl-sub">' + esc(p.detail) + "</div>" : ""),
+    });
+    L.push({ from: "core", to: "pps", kind: "out", serving: pulsing, state: st,
+             label: pulsing ? "1 Hz" : p.state === "waiting" ? "waiting" : "down" });
+  }
 
   const b = browser;
   const dev = !b ? "—" : Math.abs(b.device) <= b.within ? "±" + num(b.within, b.within < 1 ? 1 : 0) + " ms"
@@ -647,6 +680,8 @@ window.Flow = {
   status(d) {
     status = {};
     for (const s of d.sources || []) status[s.name] = s;
+    // The 1PPS output comes only with the full status; the tick lacks it.
+    pps = d.pps && d.pps.enabled ? d.pps : null;
   },
   browser(b) { browser = b; },
   link(ok) {

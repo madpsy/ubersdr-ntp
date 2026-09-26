@@ -161,6 +161,7 @@ need no receiver and no network, and are built alongside the daemon:
 ./build-native/ubersdr-ntp-ntptest       # the NTP client, against a fake server
 ./build-native/ubersdr-ntp-configtest    # the configuration reader
 ./build-native/ubersdr-ntp-eventtest     # the event log's transitions, and the metric history's bounds
+./build-native/ubersdr-ntp-ppstest       # the 1PPS output: NMEA, leap seconds, the thread, a port
 python3 tools/selftest.py ./build-native/ubersdr-ntp
 ```
 
@@ -1464,6 +1465,79 @@ operator has moved the port from 6926:
 The environment variable `UBERSDR_INGEST_URL` overrides it, as it does for the
 receiver's other addons. The ingest API itself is `addon_mqtt.md` in the
 ka9q_ubersdr repository.
+
+## 1PPS output
+
+Optional, and off unless configured: one pulse per second on a serial port's
+DTR (or RTS) line, at the start of every second of the served time, for
+another machine's PPS input or an instrument. With NMEA asked for, the same
+port's TX carries the sentences naming each second, straight after its pulse
+-- the pairing chrony, gpsd, ntpd's NMEA driver and most lab equipment expect
+from a GPS receiver.
+
+```jsonc
+"pps": {
+  "enabled": true,
+  "device": "/dev/serial/by-id/usb-FTDI_FT232R_USB_UART_A10K1234-if00-port0",
+  "line": "dtr",          // or "rts"
+  "width_ms": 100,
+  "invert": false,        // true: asserted is the line's LOW level
+  "nmea": ["rmc", "zda"], // either, both, or [] for pulses only
+  "baud": 4800            // NMEA 0183's rate; 9600 to 115200 also offered
+}
+```
+
+- **Only while synchronised.** The line pulses only while NTP answers as
+  synchronised. A PPS that is confidently wrong is worse than none, so there
+  is no holdover of its own. While unsynchronised, RMC goes out with status
+  `V`, as a GPS receiver without a fix sends it. ZDA is not sent at all, since
+  it has no field to say the time is not good.
+- **NMEA 0183, strictly.** 8N1, the `$GP` talker, the checksum and CR LF on
+  every sentence.
+  - `$GPRMC` is the v2.3 form with the mode indicator: status `A` with mode `M`
+    (a fixed position, entered rather than measured) when synchronised.
+  - `$GPZDA` carries the date and a zone of `00,00`.
+  - A leap second is sent as `23:59:60`: the label is counted from pulse to
+    pulse and checked against the served clock, so the pulses stay evenly
+    spaced through it.
+- **RMC's position** is `latitude`/`longitude` from this block if given.
+  Otherwise it is the published position of a receiver on this host
+  (capture-timed), since a remote receiver's position is not this station's.
+  With neither, the fields are left empty, which NMEA allows.
+- **How exact it is depends on the port.** The pulse is timed in software: the
+  thread sleeps to within 2 ms of the second and spins the rest, at the NTP
+  replies' real-time priority. Each pulse's lateness is measured and shown on
+  the status page and in `/api/status` under `pps`:
+  - a motherboard or PCIe UART (`ttyS*`) is late by tens of microseconds;
+  - a USB adapter by up to a millisecond, because its modem-control lines go
+    over USB frames.
+- **It fixes itself.** A port that is missing, busy or fails is retried every
+  five seconds, and the page and the event log (`pps_pulsing`, `pps_stopped`)
+  say why it is not pulsing.
+
+Wiring for a Linux consumer: DTR (or RTS) to its DCD, ground to ground, and TX
+to its RX when NMEA is on.
+
+**In Docker** the device has to be mapped into the container, and it cannot be
+written into `docker-compose.yml`: Compose refuses to start a container whose
+device is missing. So `pps-compose.sh`, run by `start.sh`, `restart.sh`,
+`update.sh` and `install.sh`, handles it:
+
+- It reads `pps.device` from `config/config.json`, through the daemon's own
+  parser.
+- When the output is enabled and the device exists, it writes
+  `docker-compose.override.yml`, mapping the device and adding its group by
+  number (the container's user is not in the host's `dialout` by name).
+- When it is not, it removes that file.
+
+Edit the block, then `./restart.sh`. An install from before this existed gets
+the script by running `./install.sh` once more; it keeps your configuration. A
+USB adapter's device is mapped when the container is created, so after
+unplugging it, `./restart.sh`. A `/dev/serial/by-id/...` path keeps its name
+across reboots and ports.
+
+**As a service**, the unit's `PrivateDevices=yes` hides serial ports. The unit
+file says what to change.
 
 ## What is in here from elsewhere
 

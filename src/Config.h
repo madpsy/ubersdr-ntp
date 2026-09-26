@@ -358,6 +358,22 @@ struct MqttConfig {
     std::string ingestUrl = "http://ubersdr:6926";
 };
 
+// One pulse per second on a serial port, and NMEA with it (Pps.h). Off unless
+// enabled; nothing is opened or started otherwise.
+struct PpsConfig {
+    bool enabled = false;
+    std::string device;               // e.g. /dev/ttyS0, /dev/serial/by-id/...
+    std::string line = "dtr";         // the modem-control line pulsed: dtr or rts
+    int widthMs = 100;                // how long it stays asserted
+    bool invert = false;              // asserted is the line's LOW level
+    int baud = 4800;                  // NMEA 0183's own rate
+    std::vector<std::string> nmea;    // any of "rmc", "zda", in the order sent; empty: none
+    // RMC's position. Otherwise that of a receiver on this host, if it
+    // publishes one; otherwise RMC's position fields are left empty.
+    bool positionGiven = false;
+    double latitude = 0.0, longitude = 0.0;
+};
+
 struct LogConfig {
     std::string file;                  // empty: no file
     LogLevel level = LogLevel::Info;
@@ -370,6 +386,7 @@ struct Config {
     NtpConfig ntp;
     HttpConfig http;
     MqttConfig mqtt;
+    PpsConfig pps;
     ClockConfig clock;
     std::vector<SourceConfig> sources;
     std::vector<NtpSourceConfig> ntpSources;
