@@ -86,6 +86,8 @@ struct Scenario {
     double qrmAmp = 0.0;          // ...at this amplitude (the carrier is 1)
     bool fade = false;            // the carrier gone for seconds 53-58 of minutes 3 and 6
     bool fillCut = false;         // second 42 of minutes 3 and 6 sent with no cut
+    int fillMinute = -1;          // this minute (from 0) sent with no cut at...
+    std::vector<int> fillSecs;    // ...these seconds
     bool am = true, pm = true;
     bool invert = false;          // conjugate I/Q, as a flipped spectrum would give
     bool conflict = false;        // AM sends a different minute from PM
@@ -95,6 +97,7 @@ struct Scenario {
     bool expectLock = true;
     bool expectPmTiming = true;
     double maxLabelGapSec = 0.0;  // once labelling, never longer than this without (0: unchecked)
+    double minLabelGapSec = 0.0;  // once labelling, at least once this long without (0: unchecked)
     unsigned seed = 1;
 };
 
@@ -164,6 +167,8 @@ std::vector<Sec> buildSeconds(const Scenario& sc) {
             // A cut filled in -- what a burst of interference does to one
             // second's envelope -- which reads as a marker where none belongs.
             if (sc.fillCut && (m == 3 || m == 6) && s == 42) x.amBit = 2;
+            if (m == sc.fillMinute && std::find(sc.fillSecs.begin(), sc.fillSecs.end(), s) != sc.fillSecs.end())
+                x.amBit = 2;
             out.push_back(x);
         }
         if (leapMin) shift += 1.0;
@@ -301,6 +306,8 @@ Result run(const Scenario& sc) {
     if (sc.expectLock && r.labels < 60) fail(r, "never locked (" + std::to_string(r.labels) + " labels)");
     if (sc.maxLabelGapSec > 0.0 && worstGap > sc.maxLabelGapSec)
         fail(r, "went " + std::to_string(static_cast<int>(worstGap)) + " s without a label once locked");
+    if (sc.minLabelGapSec > 0.0 && worstGap < sc.minLabelGapSec)
+        fail(r, "never stopped labelling (worst gap " + std::to_string(static_cast<int>(worstGap)) + " s)");
     if (!sc.expectLock && r.labels > 0) fail(r, "certified a time it should have refused");
     if (sc.expectLock && sc.expectPmTiming && !r.diag.timingFromPm) fail(r, "not timed by PM at the end");
     if (sc.expectLock && !sc.expectPmTiming && r.diag.timingFromPm) fail(r, "timed by PM with no PM on air");
@@ -529,6 +536,23 @@ int main(int argc, char** argv) {
         // (nothing certifies after a contradiction until s59), not the lock.
         Scenario s; s.note = "AM only, a cut filled"; s.pm = false; s.fillCut = true; s.cn0 = 40;
         s.startUnix = kDay; s.minutes = 9; s.expectPmTiming = false; s.maxLabelGapSec = 30.0; s.seed = seed++;
+        scs.push_back(s);
+    }
+    {
+        // The same misread once the lock is up (AM only locks by minute 7).
+        // One confident misread is noise on a count s59 has confirmed: the
+        // lock rides through it rather than losing the rest of the minute.
+        Scenario s; s.note = "AM only, cut filled, locked"; s.pm = false; s.cn0 = 40;
+        s.fillMinute = 9; s.fillSecs = {42};
+        s.startUnix = kDay; s.minutes = 12; s.expectPmTiming = false; s.maxLabelGapSec = 2.0; s.seed = seed++;
+        scs.push_back(s);
+    }
+    {
+        // Two in one minute are a slipped count until s59 says otherwise:
+        // nothing certifies from the second until the minute ends.
+        Scenario s; s.note = "AM only, 2 cuts filled, locked"; s.pm = false; s.cn0 = 40;
+        s.fillMinute = 9; s.fillSecs = {23, 42};
+        s.startUnix = kDay; s.minutes = 12; s.expectPmTiming = false; s.minLabelGapSec = 15.0; s.seed = seed++;
         scs.push_back(s);
     }
     {

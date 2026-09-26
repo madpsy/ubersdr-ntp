@@ -142,6 +142,8 @@ constexpr int kMaxBlindSeconds = 90;
 // over one s59 is ordinary, and nothing here certifies while it lasts, but a
 // count kept on no evidence at all for longer is a count to find again.
 constexpr int kMaxUnconfirmedMinutes = 2;
+// Skeleton contradictions in one minute that stop certifying before s59 (checkStructure).
+constexpr int kMaxStructFaults = 2;
 
 // WWVB's layout, for the synthetic frames the voter is fed (finalizeFrame).
 constexpr std::array<int, 7> kVoterMarkers = {0, 9, 19, 29, 39, 49, 59};
@@ -1165,6 +1167,7 @@ struct Dcf77Decoder::Impl {
         for (auto& f : frame) f = SecRec{};
         frFilled = 0;
         unconfirmedRun = 0;
+        structFaults = 0;
     }
 
     void demote() {
@@ -1228,15 +1231,22 @@ struct Dcf77Decoder::Impl {
         }
     }
 
-    // A confident symbol that contradicts the minute's skeleton means the
-    // count of seconds has slipped. Stop certifying now; s59 decides.
+    // Symbols that contradict the minute's skeleton mean the count of seconds
+    // has slipped. Stop certifying once two have in one minute; s59 decides.
+    // One is not enough: this only runs Locked, on an anchor s59 has already
+    // confirmed, and the count cannot slip without a resegmentation, which
+    // drops the anchor itself. Seen live at 1061 km through dusk fading, one
+    // confident misread at a time demoted the lock five times in 13 minutes,
+    // and s59 confirmed the count every time.
     void checkStructure(const SecRec& r, int sof) {
+        if (sof == 0) structFaults = 0;
         if (haveContrast() && r.amConf >= kStructConf) {
             const bool expectMark = (sof == 59 && !leapMinute) || sof == 60;
-            if ((r.am == ClockSymbol::Marker) != expectMark) { demote(); return; }
+            if ((r.am == ClockSymbol::Marker) != expectMark) ++structFaults;
         }
         const int fixed = pmFixedBit(sof);
-        if (polarityKnown && fixed >= 0 && r.pmSign != 0 && r.pmConf >= kPmStructConf && pmBitOf(r) != fixed) demote();
+        if (polarityKnown && fixed >= 0 && r.pmSign != 0 && r.pmConf >= kPmStructConf && pmBitOf(r) != fixed) ++structFaults;
+        if (structFaults >= kMaxStructFaults) demote();
     }
 
     // ---- the time code ---------------------------------------------------
@@ -1637,6 +1647,7 @@ struct Dcf77Decoder::Impl {
     std::uint8_t prevFrameFrom = 0;
     int pmRefusedLocks = 0;       // PM locks refused for contradicting a decoding AM
     int unconfirmedRun = 0;       // consecutive minutes neither confirmed nor contradicted
+    int structFaults = 0;         // skeleton contradictions so far this minute
 
     bool haveVoted = false;
     int votedMinute = -1, votedHour = -1, votedDoy = -1, votedYear = -1;
