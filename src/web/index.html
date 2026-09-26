@@ -1599,7 +1599,14 @@ function fmtVal(v, unit, step) {
   const a = Math.abs(v);
   // Axis ticks by their step; a value read off the chart to 10 us, which is
   // what the offsets carry -- "-590 ms" hid everything past the millisecond.
-  const p = step != null ? Math.max(0, Math.min(3, -Math.floor(Math.log10(step) + 1e-9))) :
+  // A step of 2.5 x 10^n needs one place more than its magnitude, or 0.025
+  // and 0.075 label as 0.03 and 0.08.
+  const stepPlaces = (st) => {
+    let q = -Math.floor(Math.log10(st) + 1e-9);
+    if (Math.abs(st * Math.pow(10, q) - Math.round(st * Math.pow(10, q))) > 1e-6) q += 1;
+    return q;
+  };
+  const p = step != null ? Math.max(0, Math.min(3, stepPlaces(step))) :
     a >= 10000 ? 0 : a >= 1 ? 2 : 3;
   return (v < 0 ? "−" : "") + a.toFixed(p) + (unit ? " " + unit : "");
 }
@@ -1837,6 +1844,11 @@ function chart(id, opts) {
   return charts[id];
 }
 
+// The narrowest an offset chart zooms to, in ms. The default half a millisecond
+// flattened a receiver whose offsets sit within 50 us of each other into a
+// line through the middle of the plot.
+const kOffsetMinSpan = 0.1;
+
 function renderMetrics() {
   if (!mData) return;
   const d = mData, width = d.bucket_seconds;
@@ -1850,7 +1862,7 @@ function renderMetrics() {
   tlState = { spans: d.serving || [], x0, x1, now: d.now, width };
   renderTimeline();
 
-  chart("ch-offset", { unit: "ms", band: true, signed: true, title: "Clock offset" })
+  chart("ch-offset", { unit: "ms", minSpan: kOffsetMinSpan, band: true, signed: true, title: "Clock offset" })
     .update(frame(one("served.offset_ms", slot(0))));
   chart("ch-disp", { unit: "ms", band: true, floorZero: true, title: "Root dispersion" })
     .update(frame(one("served.dispersion_ms", slot(0))));
@@ -1860,8 +1872,8 @@ function renderMetrics() {
   // middle.
   const pSeries = one("class.primary_ms", slot(0)), sSeries = one("class.secondary_ms", slot(2));
   const shared = pSeries.concat(sSeries);
-  const pc = chart("ch-primary", { unit: "ms", band: true, signed: true, title: "Primary median offset" });
-  const sc = chart("ch-secondary", { unit: "ms", band: true, signed: true, title: "Secondary median offset" });
+  const pc = chart("ch-primary", { unit: "ms", minSpan: kOffsetMinSpan, band: true, signed: true, title: "Primary median offset" });
+  const sc = chart("ch-secondary", { unit: "ms", minSpan: kOffsetMinSpan, band: true, signed: true, title: "Secondary median offset" });
   // Scale sharing: pad each with the other's extremes as invisible bounds.
   const bounds = (list) => {
     let lo = Infinity, hi = -Infinity;
@@ -1873,7 +1885,7 @@ function renderMetrics() {
     ? list.concat([{ name: "", color: "transparent", points: [], bounds: b }]) : list;
   pc.update(frame(withBounds(pSeries)));
   sc.update(frame(withBounds(sSeries)));
-  chart("ch-delta", { unit: "ms", band: true, signed: true, title: "Primary minus secondary" })
+  chart("ch-delta", { unit: "ms", minSpan: kOffsetMinSpan, band: true, signed: true, title: "Primary minus secondary" })
     .update(frame(one("class.delta_ms", cssVar("--muted")), { emptyText: "needs both classes measured" }));
 
   // Per source: one colour per source, in configuration order, so a receiver
@@ -1892,8 +1904,8 @@ function renderMetrics() {
     });
     return frame(list, { omitted: Math.max(0, names.length - 8) });
   };
-  chart("ch-radio-offset", { unit: "ms", signed: true, legend: true, title: "Radio offset" }).update(perSource("radio", "offset_ms"));
-  chart("ch-radio-resid", { unit: "ms", signed: true, legend: true, title: "Radio agreement" })
+  chart("ch-radio-offset", { unit: "ms", minSpan: kOffsetMinSpan, signed: true, legend: true, title: "Radio offset" }).update(perSource("radio", "offset_ms"));
+  chart("ch-radio-resid", { unit: "ms", minSpan: kOffsetMinSpan, signed: true, legend: true, title: "Radio agreement" })
     .update(Object.assign(perSource("radio", "residual_ms"), { emptyText: "needs two receivers locked" }));
   chart("ch-radio-jitter", { unit: "µs", floorZero: true, legend: true, title: "Radio jitter", minSpan: 2 })
     .update(perSource("radio", "jitter_us"));
@@ -1909,7 +1921,7 @@ function renderMetrics() {
     floorZero: true, legend: true, title: "Refused decoded times", minSpan: 2,
     tipText: (p) => p[5] === p[6] ? "off by " + jumpText(p[5]) : "off by " + jumpText(p[5]) + " to " + jumpText(p[6]),
   }).update(Object.assign(rejected, { emptyText: "none refused in this window" }));
-  chart("ch-ntp-offset", { unit: "ms", signed: true, legend: true, title: "NTP offset" }).update(perSource("ntp", "offset_ms"));
+  chart("ch-ntp-offset", { unit: "ms", minSpan: kOffsetMinSpan, signed: true, legend: true, title: "NTP offset" }).update(perSource("ntp", "offset_ms"));
   chart("ch-ntp-jitter", { unit: "µs", floorZero: true, legend: true, title: "NTP jitter", minSpan: 20 })
     .update(perSource("ntp", "jitter_us"));
   chart("ch-ntp-delay", { unit: "ms", floorZero: true, legend: true, title: "NTP round trip" }).update(perSource("ntp", "delay_ms"));
