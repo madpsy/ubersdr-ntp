@@ -1835,6 +1835,8 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
         m_snap.frameFrom = kFrom[std::min<int>(d.lastFrameFrom, 4)];
         m_snap.pmRefusedLocks = d.pmRefusedLocks;
         m_snap.pmInterference = d.pmInterference;
+        m_snap.pmHolding = d.pmHolding;
+        m_snap.pmAidedLocks = d.pmAidedLocks;
         // Which of the two is timing the second is the most useful thing the
         // log can say about a DCF77 source -- once it has held for half a
         // minute. On a marginal path PM comes and goes by the second, and a

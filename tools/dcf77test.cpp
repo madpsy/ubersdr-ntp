@@ -82,6 +82,7 @@ struct Scenario {
     double offsetSamples = 0.0;   // where second edges fall off the sample grid
     double cn0 = std::numeric_limits<double>::quiet_NaN();   // dB-Hz; NaN = clean
     double carrierHz = 0.0;       // carrier's offset in the baseband
+    double clockPpm = 0.0;        // the receiver's sample clock this fast
     double qrmHz = 0.0;           // a steady interfering tone, this far off DC...
     double qrmAmp = 0.0;          // ...at this amplitude (the carrier is 1)
     bool fade = false;            // the carrier gone for seconds 53-58 of minutes 3 and 6
@@ -89,6 +90,9 @@ struct Scenario {
     int fillMinute = -1;          // this minute (from 0) sent with no cut at...
     std::vector<int> fillSecs;    // ...these seconds
     bool am = true, pm = true;
+    double pmDev = 1.0;           // PM deviation, as a fraction of PTB's 15.6 deg...
+    double weakFrom = -1.0, weakTo = -1.0;   // ...and over [from, to) stream seconds,
+    double weakDev = 1.0;                    // this fraction instead (0: PM off air)
     bool invert = false;          // conjugate I/Q, as a flipped spectrum would give
     bool conflict = false;        // AM sends a different minute from PM
     long long startUnix = 0;
@@ -98,6 +102,10 @@ struct Scenario {
     bool expectPmTiming = true;
     double maxLabelGapSec = 0.0;  // once labelling, never longer than this without (0: unchecked)
     double minLabelGapSec = 0.0;  // once labelling, at least once this long without (0: unchecked)
+    int maxPmDrops = -1;          // PM locks lost after the first (-1: unchecked)
+    double maxDropDelaySec = 0.0; // PM lost within this long of weakFrom (0: unchecked)
+    bool expectAided = false;     // PM found by the AM-aided search at least once
+    double pmMaxErrMs = 0.25;     // every PM edge past the tracker's first five within this
     unsigned seed = 1;
 };
 
@@ -189,6 +197,8 @@ struct Result {
     // Measured seconds offered to serve time from (edgeServable), and any whose
     // flag disagreed with who was timing that second: only PM may serve.
     int servable = 0, servableMismatch = 0;
+    int pmDrops = 0;
+    double firstDropAt = -1.0;    // stream seconds
 };
 
 void fail(Result& r, const std::string& why) {
@@ -209,6 +219,8 @@ Result run(const Scenario& sc) {
     const auto secs = buildSeconds(sc);
     const auto ch = chips();
     Dcf77Decoder dec(sc.rate, 0.0);
+    // Samples a true second: more than nominal when the receiver clock is fast.
+    const double rate = sc.rate * (1.0 + sc.clockPpm * 1e-6);
 
     long long frameStart = 0;
     bool haveFrame = false;
@@ -220,30 +232,38 @@ Result run(const Scenario& sc) {
         r.from.push_back(dec.diagnostics().lastFrameFrom);
         if (std::getenv("DCF77_STATS")) {
             const auto d = dec.diagnostics();
-            std::printf("    frame from=%d state=%d pm=%d refusal=%d vote=%d q=%.2f\n", d.lastFrameFrom,
-                        static_cast<int>(dec.state()), d.pmLocked, d.refusalReason, d.framesInWindow, d.voteQuality);
+            std::printf("    frame from=%d state=%d pm=%d%s snr=%.1fdB aided=%d refusal=%d vote=%d q=%.2f\n", d.lastFrameFrom,
+                        static_cast<int>(dec.state()), d.pmLocked, d.pmHolding ? " (holding)" : "", d.pmSnrDb,
+                        d.pmAidedLocks, d.refusalReason, d.framesInWindow, d.voteQuality);
         }
     };
+    bool pmWas = false;
     dec.onSecond = [&](const ClockSecondInfo& i) {
+        const bool pmNow = dec.diagnostics().pmLocked;
+        if (pmWas && !pmNow) {
+            ++r.pmDrops;
+            if (r.firstDropAt < 0.0) r.firstDropAt = static_cast<double>(i.edgeSample) / rate;
+        }
+        pmWas = pmNow;
         if (!i.edgeMeasured) return;
         if (i.edgeServable) ++r.servable;
         if (i.edgeServable != dec.diagnostics().timingFromPm) ++r.servableMismatch;
-        const double t = static_cast<double>(i.edgeSample) / sc.rate;
+        const double t = static_cast<double>(i.edgeSample) / rate;
         const Sec* s = nearest(secs, t);
         if (!s || std::fabs(s->t - t) > 0.1) return;
         const auto d = dec.diagnostics();
         (d.timingFromPm ? r.pmErrMs : r.amErrMs).push_back((t - s->t) * 1000.0);
         if (d.timingFromPm && std::isfinite(i.edgeSampleExact))
-            r.pmExactErrMs.push_back((i.edgeSampleExact / sc.rate - s->t) * 1000.0);
+            r.pmExactErrMs.push_back((i.edgeSampleExact / rate - s->t) * 1000.0);
     };
     dec.onTime = [&](const ClockTimeInfo& t) {
         if (!haveFrame) return;
         const long long base = civ::utcMsFromFields(t.year2, t.doy, t.hour, t.minute);
-        const long long el = std::llround(static_cast<double>(t.lastEdgeSample - frameStart) / sc.rate);
+        const long long el = std::llround(static_cast<double>(t.lastEdgeSample - frameStart) / rate);
         const long long got = base + el * 1000LL;
-        const Sec* s = nearest(secs, static_cast<double>(t.lastEdgeSample) / sc.rate);
+        const Sec* s = nearest(secs, static_cast<double>(t.lastEdgeSample) / rate);
         if (lastLabelSample >= 0)
-            worstGap = std::max(worstGap, static_cast<double>(t.lastEdgeSample - lastLabelSample) / sc.rate);
+            worstGap = std::max(worstGap, static_cast<double>(t.lastEdgeSample - lastLabelSample) / rate);
         lastLabelSample = t.lastEdgeSample;
         ++r.labels;
         if (!s || s->label != got) {
@@ -259,14 +279,14 @@ Result run(const Scenario& sc) {
     const double sigma = std::isnan(sc.cn0) ? 0.0 : std::sqrt(sc.rate / std::pow(10.0, sc.cn0 / 10.0) / 2.0);
     std::normal_distribution<double> g(0.0, 1.0);
     const double endT = secs.back().t + 1.5;
-    const long long total = static_cast<long long>(endT * sc.rate);
+    const long long total = static_cast<long long>(endT * rate);
     std::vector<float> buf;
     std::size_t si = 0;
     const int block = sc.rate / 50;
     for (long long n0 = 0; n0 < total; n0 += block) {
         buf.clear();
         for (long long n = n0; n < n0 + block && n < total; ++n) {
-            const double t = static_cast<double>(n) / sc.rate;
+            const double t = static_cast<double>(n) / rate;
             while (si + 1 < secs.size() && secs[si + 1].t <= t) ++si;
             double amp = 1.0, ph = 0.0;
             if (t >= secs[0].t) {
@@ -277,7 +297,8 @@ Result run(const Scenario& sc) {
                 const double pt = dt - 0.2;
                 if (sc.pm && pt >= 0.0 && pt < 512 * kChipSec) {
                     const int k = static_cast<int>(pt / kChipSec);
-                    ph = (ch[static_cast<std::size_t>(k)] ^ s.pmBit) ? -kDev : kDev;
+                    const double dev = kDev * (t >= sc.weakFrom && t < sc.weakTo ? sc.weakDev : sc.pmDev);
+                    ph = (ch[static_cast<std::size_t>(k)] ^ s.pmBit) ? -dev : dev;
                 }
             }
             ph += 2.0 * kPi * sc.carrierHz * t;
@@ -309,6 +330,17 @@ Result run(const Scenario& sc) {
     if (sc.minLabelGapSec > 0.0 && worstGap < sc.minLabelGapSec)
         fail(r, "never stopped labelling (worst gap " + std::to_string(static_cast<int>(worstGap)) + " s)");
     if (!sc.expectLock && r.labels > 0) fail(r, "certified a time it should have refused");
+    if (sc.maxPmDrops >= 0 && r.pmDrops > sc.maxPmDrops)
+        fail(r, "PM lost its lock " + std::to_string(r.pmDrops) + " time(s)");
+    if (sc.maxDropDelaySec > 0.0 &&
+        (r.firstDropAt < sc.weakFrom || r.firstDropAt - sc.weakFrom > sc.maxDropDelaySec))
+        fail(r, "PM off air at " + std::to_string(static_cast<int>(sc.weakFrom)) + " s, lock let go at " +
+                    std::to_string(static_cast<int>(r.firstDropAt)) + " s");
+    if (sc.expectAided && r.diag.pmAidedLocks == 0) fail(r, "the AM-aided search never locked PM");
+    // With no PM on air, or once it has gone, any aided lock is on noise.
+    const bool pmGone = !sc.pm || (sc.weakDev == 0.0 && sc.weakTo > secs.back().t);
+    if (pmGone && r.diag.pmAidedLocks > 0)
+        fail(r, std::to_string(r.diag.pmAidedLocks) + " aided PM lock(s) with no PM on air");
     if (sc.expectLock && sc.expectPmTiming && !r.diag.timingFromPm) fail(r, "not timed by PM at the end");
     if (sc.expectLock && !sc.expectPmTiming && r.diag.timingFromPm) fail(r, "timed by PM with no PM on air");
     // Only PM's edges may serve time: every measured second says so exactly
@@ -324,7 +356,7 @@ Result run(const Scenario& sc) {
     if (sc.expectPmTiming && r.pmErrMs.size() > 5) {
         double w = 0;
         for (std::size_t i = 5; i < r.pmErrMs.size(); ++i) w = std::max(w, std::fabs(r.pmErrMs[i]));
-        if (w > 0.25) fail(r, "PM edge error " + std::to_string(w) + " ms");
+        if (w > sc.pmMaxErrMs) fail(r, "PM edge error " + std::to_string(w) + " ms");
     }
     // The unrounded edge (ClockSecondInfo::edgeSampleExact) must be unbiased:
     // its signed mean error within 20 us, wherever on the sample grid the true
@@ -553,6 +585,49 @@ int main(int argc, char** argv) {
         Scenario s; s.note = "AM only, 2 cuts filled, locked"; s.pm = false; s.cn0 = 40;
         s.fillMinute = 9; s.fillSecs = {23, 42};
         s.startUnix = kDay; s.minutes = 12; s.expectPmTiming = false; s.minLabelGapSec = 15.0; s.seed = seed++;
+        scs.push_back(s);
+    }
+    // PM at a fraction of its deviation, AM at full strength: what fading on a
+    // long path does, where the AM still reads and the PM, a second at a time,
+    // does not. At 35 dB-Hz full deviation correlates at about 17 sigma a
+    // second, so 0.15 is 2.6 and 0.1 is 1.7 -- under the 3.35 the plain search
+    // needs, and found by the AM-aided one once AM has read a minute. One
+    // second in thirty is measured at this strength, and the tracker between
+    // them is steered by weak seconds: its edges spread about 0.1 ms, so they
+    // are held to 0.4 ms rather than the 0.25 of a PM measured every second.
+    for (double ppm : {0.0, 20.0}) {
+        Scenario s; s.note = ppm == 0.0 ? "PM 2.6 sigma/s, AM good" : "PM 2.6 sigma/s, AM good, 20 ppm";
+        s.pmDev = 0.15; s.clockPpm = ppm; s.cn0 = 35; s.startUnix = kDay; s.minutes = 12;
+        s.expectAided = true; s.pmMaxErrMs = 0.4; s.seed = seed++;
+        scs.push_back(s);
+    }
+    // Locked on a strong PM that then weakens to 1.7 sigma a second for a
+    // minute and a half: held throughout on the stretch's own evidence, the
+    // tracker steered by the weak seconds rather than coasting off them.
+    for (double ppm : {0.0, 25.0}) {
+        Scenario s; s.note = ppm == 0.0 ? "PM 1.7 sigma/s for 90 s" : "PM 1.7 sigma/s for 90 s, 25 ppm";
+        s.clockPpm = ppm; s.cn0 = 35; s.startUnix = kDay; s.minutes = 9;
+        s.weakFrom = 240.0; s.weakTo = 330.0; s.weakDev = 0.1; s.maxPmDrops = 0; s.seed = seed++;
+        scs.push_back(s);
+    }
+    {
+        // PM gone for good while AM still decodes: the lock must be let go
+        // (ten seconds of misses, and the stretch's evidence noise), and
+        // neither search may find anything in the noise after.
+        Scenario s; s.note = "PM goes off air"; s.cn0 = 40; s.startUnix = kDay; s.minutes = 9;
+        s.weakFrom = 300.0; s.weakTo = 1e9; s.weakDev = 0.0; s.maxDropDelaySec = 15.0;
+        s.expectPmTiming = false; s.seed = seed++;
+        scs.push_back(s);
+    }
+    {
+        // Twenty minutes of AM decoding and no PM: the aided search runs on
+        // noise every second, and must never lock. Nor may the plain one,
+        // which on AM and noise alone once locked 10-30 ms into the second
+        // every time: y was normalised by the reference's power, which dips
+        // with every carrier cut, so its noise rose there and the median of
+        // all lags under-read it (see feedSteady).
+        Scenario s; s.note = "PM off air, 20 min"; s.pm = false; s.cn0 = 40; s.startUnix = kDay; s.minutes = 20;
+        s.expectPmTiming = false; s.seed = seed++;
         scs.push_back(s);
     }
     {

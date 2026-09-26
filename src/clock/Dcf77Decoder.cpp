@@ -24,6 +24,16 @@
 // constant in y correlates to zero. The same balance is why the PM does not
 // pull the reference -- every second's burst averages to the unmodulated phase
 // whichever bit it carries.
+//
+// y is normalised by |r|, not |r|^2: r only says which way the carrier points.
+// The noise in Im(z conj(r)) is |r| times the noise in z, so dividing by |r|
+// leaves it the same in every sample, and the burst's part goes as |z| -- the
+// weighting that correlates best. Divided by |r|^2, as y once was, it was the
+// phase in radians, and its noise went as 1/|r|: up by 70% through the AM cut
+// and the 0.2 s after it while r recovered, every second. Every lag whose
+// burst window took that stretch in was then noisier than the median of all
+// lags said, and on AM and noise alone, no PM on air, the search "locked"
+// 10-30 ms into the second in ten runs out of ten.
 
 #include "Dcf77Decoder.h"
 
@@ -33,6 +43,7 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <limits>
 #include <utility>
 #include <vector>
@@ -91,7 +102,8 @@ constexpr double kFreqGain = 0.2;  // per-second fraction of the residual taken
 
 // ---- PM correlator -------------------------------------------------------
 // SNR is |C| / sigma_C, linear. Tracking keeps a lock through ten seconds under
-// the floor before giving it up to a full search.
+// the floor, and past that for as long as the weak stretch's own evidence says
+// the burst is still there (pmHoldEvidence).
 // Acquisition sums correlation power over six seconds and wants the best lag at
 // an rms of 3.5 sigma a second: on noise alone, 12000 lags of a chi-square with
 // six degrees of freedom pass that about once in 10^9 searches, and on a real
@@ -109,6 +121,58 @@ constexpr double kPmNoiseJump   = 4.0;
 // A PM lock that puts the second more than this far from where AM had it
 // re-segments: the count of seconds from AM is not to be trusted across it.
 constexpr double kResegTolSec   = 0.030;
+
+// ---- PM through weak stretches (pmHoldEvidence) ----------------------------
+// Once ten seconds in a row have missed the per-second floor, the lock is
+// judged on every second of the weak stretch together (up to the last thirty),
+// read at the tracker's prediction -- one lag, not a search, so no multiplicity
+// to pay for. Known bits: the sum of the sign-corrected correlations over the
+// root of their count, which is N(0,1) on noise, wanted at 2.5 (noise passes
+// 0.6% of the time, and holding on noise costs only the coasting: nothing is
+// measured while it lasts). Unknown bits: the powers against the chi-square
+// they would sum to on noise, 3.5 of its sigmas above its mean. Each second's
+// part is clipped at 4 sigma so that one static crash cannot hold a lock.
+constexpr int    kPmHoldWindow   = 30;
+constexpr double kPmHoldCoherent = 2.5;
+constexpr double kPmHoldPowerK   = 3.5;
+constexpr double kPmEvClip       = 4.0;
+// While the tracker has the burst, a second is measured only inside half a
+// chip of where it is expected, unless its peak is this strong. A search of
+// one and a half chips either side is 57 lags at 12 kHz: noise alone puts one
+// past 4 sigma about one second in three hundred, and in a long weak stretch
+// that would be an edge a millisecond out, served.
+constexpr double kPmStrongSnr    = 8.0;
+
+// ---- PM acquisition aided by AM (aidedAcquire) -----------------------------
+// While AM frames the minute and PM is not locked, every second's PM bit is
+// known -- the fixed word, and the rest predicted from the last minute decoded
+// -- and AM puts the burst within a few milliseconds. So the correlations are
+// summed COHERENTLY, sign-corrected by the predicted bit, over the last thirty
+// such seconds, at the lags 25 ms either side of where AM puts the burst. On
+// noise the sum over the root of its count is N(0,1) at each of ~600 lags
+// (about 70 independent ones), and each slope searched (aidedAcquire) is
+// another look; 6 sigma passes on noise about one decision in 10^6, and a
+// decision is re-made every second on data that is 29/30 the same. The plain search wants 3.5 sigma a second on its own; this locks on
+// 6/sqrt(30) = 1.1 sigma a second, 10 dB further down, where fading on a long
+// path leaves AM readable and PM, seen a second at a time, is not.
+constexpr double kAidHalfSec     = 0.025;
+constexpr int    kAidSeconds     = 30;
+constexpr int    kAidMinSeconds  = 10;
+constexpr double kAidScore       = 6.0;
+constexpr double kAidClip        = 4.0;
+// The seconds summed must sit on one grid of whole seconds, fixed when the sum
+// starts (aidedAcquire). AM's edge wandering further from that grid than this,
+// or the sum spanning more than kAidSpanSeconds, restarts it.
+constexpr double kAidDriftSec    = 0.005;
+constexpr int    kAidSpanSeconds = 90;
+// The receiver clock errors searched, in samples a second: 0.5 is 42 ppm at
+// 12 kHz, twice what any receiver here has shown. Once PM has tracked for
+// kPeriodLearnSeconds the second's length is known far better than thirty weak
+// seconds can measure it (to a fifth of a sample a second, which is a chip of
+// drift over a weak stretch), and only this much either side of it is searched.
+constexpr double kAidMaxSlope    = 0.5;
+constexpr double kAidKnownSlope  = 0.05;
+constexpr int    kPeriodLearnSeconds = 32;
 
 // ---- symbols & sync ------------------------------------------------------
 // AM confidence is a z-score mapped (z - 1)/5 (classifyAm): 0.5 is 3.5 sigma.
@@ -161,6 +225,54 @@ int pmFixedBit(int sof) {
     if (sof >= 0 && sof <= 9) return 1;
     if (sof >= 10 && sof <= 14) return 0;
     return -1;
+}
+
+// EU summer time, which DCF77 follows: from 01:00 UTC on the last Sunday of
+// March to 01:00 UTC on the last Sunday of October.
+bool cestAt(long long unixSec) {
+    int y = 0; unsigned m = 0, d = 0;
+    ubersdr_ntp::civilFromDays(ubersdr_ntp::floorDiv(unixSec, 86400), y, m, d);
+    auto lastSunday = [&](unsigned mon) {
+        const long long day = ubersdr_ntp::daysFromCivil(y, mon, 31);
+        return (day - ubersdr_ntp::floorMod(ubersdr_ntp::floorMod(day + 3, 7) - 6, 7)) * 86400LL + 3600LL;
+    };
+    return unixSec >= lastSunday(3) && unixSec < lastSunday(10);
+}
+
+// The PM bits of the minute whose second 0 is utcS0Ms, as far as they can be
+// known in advance: the fixed word, the zone, the start-of-time bit, and the
+// time and date with their parities. -1 for the call bit, the changeover and
+// leap announcements (15, 16, 19) and s60. The code names the minute that
+// begins at the NEXT minute mark, in local time.
+std::array<int, 61> predictTimeCode(long long utcS0Ms) {
+    std::array<int, 61> b{};
+    b.fill(-1);
+    for (int s = 0; s < 60; ++s) b[static_cast<std::size_t>(s)] = pmFixedBit(s);
+    const long long next = ubersdr_ntp::floorDiv(utcS0Ms, 1000) + 60;
+    const bool cest = cestAt(next);
+    const long long local = next + (cest ? 7200 : 3600);
+    const long long days = ubersdr_ntp::floorDiv(local, 86400);
+    const long long rem = ubersdr_ntp::floorMod(local, 86400);
+    int y = 0; unsigned mo = 0, d = 0;
+    ubersdr_ntp::civilFromDays(days, y, mo, d);
+    auto put = [&](int s, int n, int v) {
+        for (int i = 0; i < n; ++i) b[static_cast<std::size_t>(s + i)] = (v >> i) & 1;
+    };
+    auto bcd = [](int v) { return (v / 10) << 4 | (v % 10); };
+    auto par = [&](int a, int z) { int p = 0; for (int s = a; s < z; ++s) p ^= b[static_cast<std::size_t>(s)]; return p; };
+    b[17] = cest ? 1 : 0;
+    b[18] = cest ? 0 : 1;
+    b[20] = 1;
+    put(21, 7, bcd(static_cast<int>(rem / 60 % 60)));
+    b[28] = par(21, 28);
+    put(29, 6, bcd(static_cast<int>(rem / 3600)));
+    b[35] = par(29, 35);
+    put(36, 6, bcd(static_cast<int>(d)));
+    put(42, 3, static_cast<int>(ubersdr_ntp::floorMod(days + 3, 7)) + 1);
+    put(45, 5, bcd(static_cast<int>(mo)));
+    put(50, 8, bcd(y % 100));
+    b[58] = par(36, 58);
+    return b;
 }
 
 // The chip sequence as +1 (a 0 chip, +15.6 deg) / -1 (a 1 chip). The Galois
@@ -233,6 +345,18 @@ struct EdgeTracker {
             period = std::clamp(period + kTrkBeta * r, nominal * (1.0 - 2e-4), nominal * (1.0 + 2e-4));
         }
     }
+
+    // A second too weak to be measured on its own, still read where the burst
+    // is expected: the loop is pulled by it at weight w, (SNR / floor)^2 --
+    // what a measurement is worth against one at the floor. Enough, summed
+    // over a weak stretch, to keep the edge and the period on the burst rather
+    // than coasting off it; not counted as a measurement.
+    void nudge(double raw, double w, double nominal) {
+        const double pred = edge + period;
+        const double r = raw - pred;
+        edge = pred + w * kTrkAlpha * r;
+        period = std::clamp(period + w * kTrkBeta * r, nominal * (1.0 - 2e-4), nominal * (1.0 + 2e-4));
+    }
 };
 
 // One classified second, kept so a PM sync found at second 14 can fill in the
@@ -245,6 +369,16 @@ struct SecRec {
     int pmSign = 0;          // +1 / -1 raw correlation sign, 0 when no PM this second
     float pmConf = 0.0f;
 };
+
+// One tracked PM second's evidence (pushPmEvidence): its SNR squared, and its
+// correlation signed by the bit it should carry, when that is known.
+struct PmEv { float z2 = 0.0f; float e = 0.0f; bool known = false; };
+
+// An AM-framed second for the aided search: where AM puts its burst, and
+// +1/-1 for the PM bit it should carry (0 / 1).
+struct AidPending { bool valid = false; double burst = 0.0; int sign = 0; };
+// One such second's normalised correlations, on the sum's grid of seconds.
+struct AidSec { int64_t j = 0; std::vector<float> v; };
 
 // One minute's time code, decoded from one demodulator's bits.
 struct Decoded {
@@ -352,6 +486,9 @@ struct Dcf77Decoder::Impl {
         segValid = false; segEdge = 0.0; scanPos = 0; blindSeconds = 0;
         amTrk.reset(); pmTrk.reset();
         pmLocked = false; pmMiss = 0; lastSearchEnd = 0; acqPint = 0; acqHistN = 0; acqHistNext = 0;
+        pmEv.clear(); pmHolding = false;
+        aidPending = AidPending{}; aid.clear(); pmAidedLocks = 0;
+        periodKnown = false; periodLearnt = 0.0;
         lastPmSnr = std::numeric_limits<float>::quiet_NaN();
         amMinusPm = 0.0; amMinusPmHave = false;
         lowFrac = 0.15;
@@ -485,7 +622,7 @@ struct Dcf77Decoder::Impl {
         refRe += aRef * (zr - refRe);
         refIm += aRef * (zi - refIm);
         const double rp = refRe * refRe + refIm * refIm;
-        double y = rp > 1e-30 ? (zi * refRe - zr * refIm) / rp : 0.0;
+        double y = rp > 1e-30 ? (zi * refRe - zr * refIm) / std::sqrt(rp) : 0.0;
         yDc += aDc * (y - yDc);
         y -= yDc;
         const std::size_t i0 = static_cast<std::size_t>(k & mask);
@@ -804,6 +941,9 @@ struct Dcf77Decoder::Impl {
     void pmLockAt(double tau, double P) {
         pmLocked = true;
         pmMiss = 0;
+        pmEv.clear();
+        aid.clear();
+        aidPending = AidPending{};
         noiseRaw = NoiseEst{}; noiseHp = NoiseEst{};
         acqPint = 0;
         pmTrk.reset();
@@ -863,7 +1003,8 @@ struct Dcf77Decoder::Impl {
         const double tau = refine(bestTau, tc, best >= 0.0 ? 1.0 : -1.0);
         const double C = corrAt(tau, tc);
         const double snr = snrOf(C);
-        if (snr >= kPmMinSnr && std::fabs(tau - pred) <= win) {
+        const double gate = pmTrk.valid && snr < kPmStrongSnr ? 0.5 * tc : win;
+        if (snr >= kPmMinSnr && std::fabs(tau - pred) <= gate) {
             tauOut = tau; Cout = C; snrOut = snr;
             return true;
         }
@@ -1047,21 +1188,32 @@ struct Dcf77Decoder::Impl {
         double amEdge = 0.0;
         const bool amMeas = findFallingEdgeNear(std::llround(envPos(pred)), kEdgeTol, amEdge);
 
+        const int sofHere = anchored ? sofNext : -1;
         bool pmMeas = false;
         double pmTau = 0.0, pmC = 0.0, pmSnr = 0.0;
         const bool pmWas = pmLocked;
         if (pmLocked) {
             pmMeas = pmTrack(pred + kPmStartSec * P, P, pmTau, pmC, pmSnr);
             lastPmSnr = static_cast<float>(20.0 * std::log10(std::max(pmSnr, 1e-3)));
+            pushPmEvidence(pmC, pmSnr, sofHere);
             if (pmMeas) pmMiss = 0;
-            else if (++pmMiss >= kPmMissLimit) {
+            else if (++pmMiss >= kPmMissLimit && !pmHoldEvidence()) {
                 pmLocked = false;
                 pmTrk.reset();
+                pmEv.clear();
                 lastSearchEnd = samplesConsumed;
             }
         }
+        pmHolding = pmLocked && pmMiss >= kPmMissLimit;
         const double pmEdge = pmTau - kPmStartSec * P;
-        if (pmLocked) pmTrk.update(pmMeas, pmEdge, P, kChipSec * P);
+        if (pmLocked) {
+            // A new tracker's second starts nominal: AM's, on a weak cut, can
+            // be a couple of samples out.
+            const double nominal = pmTrk.valid ? P : static_cast<double>(sr);
+            if (pmMeas || !pmTrk.valid || !(pmSnr > 0.0)) pmTrk.update(pmMeas, pmEdge, nominal, kChipSec * P);
+            else pmNudge(pmTau, pmC, pmSnr, sofHere, P);
+            if (pmTrk.valid && pmTrk.count >= kPeriodLearnSeconds) { periodKnown = true; periodLearnt = pmTrk.period; }
+        }
         amTrk.update(amMeas, amEdge, amTrk.valid ? amTrk.period : static_cast<double>(sr), decim);
         if (pmMeas && amMeas) {
             const double d = (amEdge - pmEdge) * 1000.0 / sr;
@@ -1078,7 +1230,6 @@ struct Dcf77Decoder::Impl {
         r.edge = static_cast<int64_t>(std::llround(edge));
         r.edgeExact = edge;
         std::array<float, kEnvRateHz> w{};
-        const int sofHere = anchored ? sofNext : -1;
         classifyAm(edge, sofHere >= 0 && sofHere < 59, r.am, r.amConf, w);
         if (pmWas && pmSnr > 0.0) {
             r.pmSign = pmC >= 0.0 ? 1 : -1;
@@ -1104,6 +1255,182 @@ struct Dcf77Decoder::Impl {
             dropAnchor();
             hist.clear();
         }
+
+        // This second's burst, framed by AM, goes to the aided search a
+        // second from now, when every lag of its window is in the ring.
+        if (aidPending.valid && !pmLocked) aidedAcquire(aidPending);
+        aidPending = AidPending{};
+        if (pmLocked || !segValid) {
+            aid.clear();
+        } else if (!timingFromPm && amTrk.valid && sofHere >= 0) {
+            const int bit = predictedPmBit(sofHere);
+            if (bit >= 0) aidPending = {true, edge + kPmStartSec * P, bit == 0 ? 1 : -1};
+        }
+    }
+
+    // ---- PM held through weak stretches -----------------------------------
+
+    // An unmeasured second, read by early-late at the tracker's prediction
+    // `tau` (EdgeTracker::nudge). The sign it should have is the predicted
+    // bit's when that is known, and the correlation's own otherwise.
+    void pmNudge(double tau, double C, double snr, int sof, double P) {
+        const double tc = kChipSec * P, d = 0.5 * tc;
+        const int bit = polarityKnown ? predictedPmBit(sof) : -1;
+        const double sign = bit >= 0 ? polarity * (bit == 0 ? 1.0 : -1.0) : (C >= 0.0 ? 1.0 : -1.0);
+        const double E = sign * corrAt(tau - d, tc);
+        const double L = sign * corrAt(tau + d, tc);
+        if (!(E + L > 0.0)) { pmTrk.update(false, 0.0, P, tc); return; }
+        const double eps = std::clamp((E - L) / (E + L) * (tc - d), -d, d);
+        const double w = std::min(1.0, (snr / kPmMinSnr) * (snr / kPmMinSnr));
+        pmTrk.nudge(tau - eps - kPmStartSec * P, w, static_cast<double>(sr));
+    }
+
+    // One tracked second's evidence, read at the tracker's own prediction when
+    // the second was not measured: its SNR squared, and when the bit it
+    // carries is known and the polarity with it, the correlation signed so
+    // that the burst being there makes it positive.
+    void pushPmEvidence(double C, double snr, int sof) {
+        if (C == 0.0) return;   // nothing correlated: the burst was not in the ring
+        PmEv e;
+        e.z2 = std::min(snr * snr, kPmEvClip * kPmEvClip);
+        const int bit = polarityKnown ? predictedPmBit(sof) : -1;
+        if (bit >= 0) {
+            e.known = true;
+            const double sign = (C >= 0.0 ? 1.0 : -1.0) * polarity * (bit == 0 ? 1.0 : -1.0);
+            e.e = sign * std::min(snr, kPmEvClip);
+        }
+        pmEv.push_back(e);
+        while (pmEv.size() > static_cast<std::size_t>(kPmHoldWindow)) pmEv.pop_front();
+    }
+
+    // Whether the seconds since the last measured one say, together, that the
+    // burst is still where the tracker has it (kPmHoldCoherent, kPmHoldPowerK).
+    // Judged on the weak stretch alone -- the last pmMiss seconds, up to
+    // kPmHoldWindow -- so the strong seconds before a fade cannot carry a lock
+    // through a signal that has gone: that is ten seconds of noise and a drop,
+    // as before.
+    bool pmHoldEvidence() const {
+        const std::size_t w = std::min(pmEv.size(), static_cast<std::size_t>(std::min(pmMiss, kPmHoldWindow)));
+        int n = 0, nk = 0;
+        double z2 = 0.0, se = 0.0;
+        for (std::size_t i = pmEv.size() - w; i < pmEv.size(); ++i) {
+            ++n;
+            z2 += pmEv[i].z2;
+            if (pmEv[i].known) { ++nk; se += pmEv[i].e; }
+        }
+        if (nk >= kPmMissLimit && se / std::sqrt(static_cast<double>(nk)) >= kPmHoldCoherent) return true;
+        return n >= kPmMissLimit && z2 >= n + kPmHoldPowerK * std::sqrt(2.0 * n);
+    }
+
+    // ---- PM acquisition aided by AM ----------------------------------------
+
+    // The PM bit second `sof` carries, when it can be known: -1 otherwise.
+    int predictedPmBit(int sof) const {
+        if (sof < 0 || sof > 59) return -1;
+        const int fixed = pmFixedBit(sof);
+        if (fixed >= 0) return fixed;
+        return codeKnown ? codeBits[static_cast<std::size_t>(sof)] : -1;
+    }
+
+    // Add one AM-framed second to the coherent sum (kAidHalfSec and the rest),
+    // and lock PM where the sum clears kAidScore.
+    //
+    // The seconds are filed on a grid of the second PM last tracked, or the
+    // nominal one, sr samples, from the first one summed -- not AM's period,
+    // which on a weak or fading cut wanders by a couple of samples a second
+    // and would smear thirty seconds of burst across a chip. What error that
+    // leaves is searched: every slope within kAidMaxSlope samples a second
+    // (kAidKnownSlope when PM's is known), in steps that leave at most half a
+    // sample of misalignment across the span summed. The one that wins is the
+    // period the tracker starts from.
+    void aidedAcquire(const AidPending& p) {
+        const double P0 = periodKnown ? periodLearnt : static_cast<double>(sr);
+        const double maxSlope = periodKnown ? kAidKnownSlope : kAidMaxSlope;
+        const int W = static_cast<int>(std::llround(kAidHalfSec * sr));
+        if (!aid.empty()) {
+            const double j = (p.burst - aidE0) / P0;
+            if (std::fabs(p.burst - (aidE0 + std::round(j) * P0)) > kAidDriftSec * sr ||
+                std::llround(j) - aid.front().j > kAidSpanSeconds)
+                aid.clear();
+        }
+        if (aid.empty()) { aidE0 = p.burst; aidP0 = P0; }
+        if (P0 != aidP0) { aid.clear(); aidE0 = p.burst; aidP0 = P0; }
+        const int64_t j = std::llround((p.burst - aidE0) / P0);
+        const int64_t base = std::llround(aidE0 + static_cast<double>(j) * P0) - W;
+        const double tc = kChipSec * P0;
+        if (!burstInRing(static_cast<double>(base), tc) || !burstInRing(static_cast<double>(base + 2 * W), tc)) return;
+
+        std::vector<double> c(static_cast<std::size_t>(2 * W + 1));
+        std::vector<double> sq(c.size());
+        for (int i = 0; i <= 2 * W; ++i) {
+            c[static_cast<std::size_t>(i)] = corrAt(static_cast<double>(base + i), tc);
+            sq[static_cast<std::size_t>(i)] = c[static_cast<std::size_t>(i)] * c[static_cast<std::size_t>(i)];
+        }
+        // sigma^2 from the median, as the plain search takes it: the burst's
+        // triangle is two chips of a window of thirty-two.
+        std::nth_element(sq.begin(), sq.begin() + sq.size() / 2, sq.end());
+        const double sigma = std::sqrt(std::max(1e-30, sq[sq.size() / 2] / 0.455));
+        AidSec a;
+        a.j = j;
+        a.v.resize(c.size());
+        for (std::size_t i = 0; i < c.size(); ++i)
+            a.v[i] = static_cast<float>(std::clamp(p.sign * c[i] / sigma, -kAidClip, kAidClip));
+        aid.push_back(std::move(a));
+        while (aid.size() > static_cast<std::size_t>(kAidSeconds)) aid.pop_front();
+        if (aid.size() < static_cast<std::size_t>(kAidMinSeconds)) return;
+
+        // Indexed at the newest second: slope d puts an older second's burst
+        // d samples a second earlier in its own window.
+        const int64_t span = aid.back().j - aid.front().j;
+        const double step = span > 0 ? std::min(maxSlope, 1.0 / static_cast<double>(span)) : maxSlope;
+        const int margin = static_cast<int>(std::ceil(maxSlope * static_cast<double>(span))) + 1;
+        const double root = std::sqrt(static_cast<double>(aid.size()));
+        std::vector<double> S(c.size());
+        int best = -1;
+        double bestScore = 0.0, bestSlope = 0.0;
+        std::vector<double> bestS;
+        for (double d = -maxSlope; d <= maxSlope + 1e-9; d += step) {
+            std::fill(S.begin(), S.end(), 0.0);
+            for (const AidSec& e : aid) {
+                const int sh = static_cast<int>(std::llround(d * static_cast<double>(e.j - aid.back().j)));
+                for (int i = margin; i <= 2 * W - margin; ++i)
+                    S[static_cast<std::size_t>(i)] += e.v[static_cast<std::size_t>(i + sh)];
+            }
+            // A positive sum is a 0 bit reading positive: polarity +1. Once
+            // the polarity is known, only a sum the right way round counts.
+            for (int i = margin; i <= 2 * W - margin; ++i) {
+                const double v = S[static_cast<std::size_t>(i)];
+                const double sc = (polarityKnown ? polarity * v : std::fabs(v)) / root;
+                if (sc > bestScore) { bestScore = sc; best = i; bestSlope = d; bestS = S; }
+            }
+        }
+        if (best < 0 || bestScore < kAidScore) return;
+        const int sign = bestS[static_cast<std::size_t>(best)] >= 0.0 ? 1 : -1;
+
+        // Early-late on the sum, half a chip either side, as refine() does on
+        // one second: the sum is the better measurement by far.
+        double frac = 0.0;
+        const int h = static_cast<int>(std::llround(0.5 * tc));
+        if (best - h >= margin && best + h <= 2 * W - margin) {
+            const double E = sign * bestS[static_cast<std::size_t>(best - h)];
+            const double L = sign * bestS[static_cast<std::size_t>(best + h)];
+            if (E + L > 0.0) frac = -std::clamp((E - L) / (E + L) * (tc - h), -0.5 * h, 0.5 * h);
+        }
+        const double tau = static_cast<double>(base + best) + frac;
+        const double P = P0 + bestSlope;
+
+        aid.clear();
+        pmLockAt(tau, P);
+        if (!pmLocked) return;   // refused (pmLockAt)
+        if (!polarityKnown) { polarity = sign; polarityKnown = true; }
+        // The sum measured the burst to a fraction of a chip, and the second's
+        // length with it: the tracker starts from both, at the second just
+        // processed (one after this burst).
+        pmTrk.update(true, tau + P - kPmStartSec * P, P, kChipSec * P);
+        // Worth as many measurements at the floor as its SNR is floors
+        // squared: the next ones average into it at that weight, not 1:1.
+        pmTrk.count = std::clamp(static_cast<int>((bestScore / kPmMinSnr) * (bestScore / kPmMinSnr)), 1, kTrkWarm);
+        ++pmAidedLocks;
     }
 
     // ---- sync & frames ---------------------------------------------------
@@ -1168,6 +1495,7 @@ struct Dcf77Decoder::Impl {
         frFilled = 0;
         unconfirmedRun = 0;
         structFaults = 0;
+        codeKnown = false;
     }
 
     void demote() {
@@ -1435,6 +1763,14 @@ struct Dcf77Decoder::Impl {
         else if (am.ok) { use = &am; lastFrameFrom = 1; }
         else lastFrameFrom = 0;
 
+        // What the next minute will carry, from this one or, when this one
+        // was not read, from the last that was.
+        if (use || codeKnown) {
+            codeS0UtcMs = use ? use->utcMs + 60000 : codeS0UtcMs + 60000;
+            codeKnown = true;
+            codeBits = predictTimeCode(codeS0UtcMs);
+        }
+
         ClockFrameInfo fi;
         fi.frameStartSample = frStart;
         fi.station = ClockStation::Dcf77;
@@ -1620,6 +1956,18 @@ struct Dcf77Decoder::Impl {
     float lastPmSnr = std::numeric_limits<float>::quiet_NaN();
     int polarity = 1;          // +1: a positive correlation is a 0 bit
     bool polarityKnown = false;
+    std::deque<PmEv> pmEv;              // tracked seconds' evidence (pushPmEvidence)
+    bool pmHolding = false;             // locked on the weak stretch's evidence alone
+    // The aided search (aidedAcquire): one AM-framed second waiting for its
+    // window to be in the ring, and the seconds summed so far on one grid.
+    AidPending aidPending;
+    std::deque<AidSec> aid;
+    double aidE0 = 0.0, aidP0 = 0.0;    // the grid: its first burst and its second
+    // The second's length in samples, from a tracker that has held for
+    // kPeriodLearnSeconds: the receiver clock's, kept across unlocks.
+    bool periodKnown = false;
+    double periodLearnt = 0.0;
+    int pmAidedLocks = 0;
 
     // segmentation
     bool segValid = false;
@@ -1648,6 +1996,11 @@ struct Dcf77Decoder::Impl {
     int pmRefusedLocks = 0;       // PM locks refused for contradicting a decoding AM
     int unconfirmedRun = 0;       // consecutive minutes neither confirmed nor contradicted
     int structFaults = 0;         // skeleton contradictions so far this minute
+    // The minute being received, predicted from the last one decoded
+    // (predictTimeCode): its PM bits, for the aided search and the hold.
+    bool codeKnown = false;
+    long long codeS0UtcMs = 0;
+    std::array<int, 61> codeBits{};
 
     bool haveVoted = false;
     int votedMinute = -1, votedHour = -1, votedDoy = -1, votedYear = -1;
@@ -1699,6 +2052,8 @@ ClockDecoderDiagnostics Dcf77Decoder::diagnostics() const {
     g.lastFrameFrom = d.lastFrameFrom;
     g.pmRefusedLocks = d.pmRefusedLocks;
     g.pmInterference = d.useHp;
+    g.pmHolding = d.pmHolding;
+    g.pmAidedLocks = d.pmAidedLocks;
     return g;
 }
 

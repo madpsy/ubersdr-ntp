@@ -396,10 +396,34 @@ happening. And a PM lock that puts the second somewhere AM — while decoding
 valid minutes — does not, is refused rather than allowed to throw away AM's
 count of seconds, and the refusals are counted on the page.
 
+PM is also kept through fading that leaves it too weak to see one second at
+a time, which is how a long path behaves at dusk:
+
+- **Holding.** A second is measured only when its correlation clears
+  4 σ, close to where the tracker expects it. After ten seconds in a row
+  below that, the lock is not dropped straight away. It is judged on the
+  whole weak stretch taken together, read where the tracker expects the
+  burst. Once the minute is known, each second's bit is known too, and the
+  stretch is summed coherently. That holds PM down to about 1 σ a second,
+  against 3–4 before. Weak seconds still steer the tracker at the weight
+  their SNR earns, but only measured seconds become offsets. While this
+  lasts the page says PM is `holding through a weak stretch`. When PM has
+  actually gone, the stretch reads as noise and the lock is let go after
+  ten seconds, as before.
+- **Finding PM again with AM's help.** While AM frames the minute and PM is
+  not locked, the correlations near where AM puts the burst are summed
+  coherently over thirty seconds, each sign-corrected by its predicted bit.
+  That finds PM at about 1.1 σ a second, where the plain search needs 3.5,
+  roughly 10 dB further down. The page counts these locks.
+
 `tools/dcf77test.cpp` synthesises all of that — noise down to 24 dB-Hz, a
 carrier off DC, a tone twice the carrier's strength 10 Hz from it, five-second
 fades at the end of a minute, AM with no PM, PM with no AM, inverted I/Q, a leap
-second, the changeover, and AM and PM that disagree — and then decodes
+second, the changeover, AM and PM that disagree, PM at a sixth of its
+deviation with AM at full strength, a strong PM that weakens to 1.7 σ a second
+for ninety seconds, a receiver clock 20–25 ppm fast, PM going off air, and
+twenty minutes of AM with no PM, in which neither search may lock — and then
+decodes
 `tools/testdata/dcf77_live.wav`, five minutes of real DCF77 from a KiwiSDR
 35 km from the transmitter. On that recording AM and PM agree on every minute,
 PM's edges sit on a straight line to better than the 0.08 ms sample grid can

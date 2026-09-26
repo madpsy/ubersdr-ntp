@@ -194,6 +194,8 @@ struct SourceSnapshot {
     std::string frameFrom;
     int pmRefusedLocks = 0;
     bool pmInterference = false;
+    bool pmHolding = false;
+    int pmAidedLocks = 0;
 
     // The continuity check on decoded times (Source.cpp, admitDecodedTime):
     // UTC does not jump, so a decoded time that does has been misread. Empty

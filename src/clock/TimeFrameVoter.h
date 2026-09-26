@@ -175,6 +175,11 @@ struct ClockDecoderDiagnostics {
     // The last PM correlation needed the interference high-pass: y carried
     // more than twice its high-passed power, i.e. a strong tone near the carrier.
     bool pmInterference = false;
+    // PM is held through a weak stretch on the stretch's evidence taken
+    // together, with no second measured on its own: the edges coast.
+    bool pmHolding = false;
+    // PM locks found by the coherent search AM frames, rather than the plain one.
+    int pmAidedLocks = 0;
 };
 
 // A complete broadcast timestamp decoded from a single frame. minute/hour are

@@ -468,14 +468,15 @@ function dcf77Text(p) {
   const from = { both: "AM and PM, agreeing", pm: "PM only", am: "AM only",
                  conflict: "<b>refused: AM and PM read different times</b>" };
   return "timing from <b>" + (p.timing === "pm" ? "PM" : "AM") + "</b>, PM " +
-    (p.pm_locked ? "tracking" : "searching") +
+    (p.pm_locked ? (p.pm_holding ? "holding through a weak stretch" : "tracking") : "searching") +
     (p.pm_snr_db != null ? " at " + p.pm_snr_db.toFixed(1) + " dB" : "") +
     (p.pm_interference ? " (strong interference near the carrier: correlating high-passed)" : "") +
     (p.am_minus_pm_ms != null ? ", AM edge " + (p.am_minus_pm_ms >= 0 ? "+" : "−") +
       Math.abs(p.am_minus_pm_ms).toFixed(2) + " ms from PM's" : "") +
     (p.carrier_offset_hz != null ? ", carrier " + p.carrier_offset_hz.toFixed(2) + " Hz off the dial" : "") +
     ", last minute from " + (p.frame_from ? from[p.frame_from] || esc(p.frame_from) : "none yet") +
-    (p.pm_refused_locks ? ", " + p.pm_refused_locks + " PM lock(s) refused for contradicting AM (interference?)" : "");
+    (p.pm_refused_locks ? ", " + p.pm_refused_locks + " PM lock(s) refused for contradicting AM (interference?)" : "") +
+    (p.pm_aided_locks ? ", " + p.pm_aided_locks + " PM lock(s) found with AM's help" : "");
 }
 
 // Whether a source is received as IQ, by the daemon's rule (Config.h,

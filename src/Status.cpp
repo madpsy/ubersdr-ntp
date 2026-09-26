@@ -793,6 +793,8 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
         d["frame_from"] = s.frameFrom.empty() ? json(nullptr) : json(s.frameFrom);
         d["pm_refused_locks"] = s.pmRefusedLocks;
         d["pm_interference"] = s.pmInterference;
+        d["pm_holding"] = s.pmHolding;
+        d["pm_aided_locks"] = s.pmAidedLocks;
         dec["dcf77"] = std::move(d);
     }
     if (s.station == "allouis" || s.station == "msf") {
