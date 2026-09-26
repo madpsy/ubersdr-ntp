@@ -660,6 +660,10 @@ void HttpApi::serveConnection(int fd) {
     }
 
     if (path == "/api/time") {
+        {
+            std::lock_guard<std::mutex> lk(m_countMu);
+            m_timeCount.add(static_cast<long long>(monotonicNow() / 60.0));
+        }
         double clientSec = 0.0;
         // `t` in Unix seconds, or `t_ms` in milliseconds — whichever the client
         // finds easier. Only echoed back as the originate timestamp, so a
@@ -674,6 +678,26 @@ void HttpApi::serveConnection(int fd) {
                                                 truthy(queryValue(query, "pretty")));
         writeAll(fd, httpResponse(200, "OK", "application/json; charset=utf-8",
                                   body + "\n", headOnly));
+        return;
+    }
+
+    if (path == "/api/rfc3339") {
+        // The time and nothing else, read as late as it can be: one line a
+        // shell, a microcontroller or `date -s "$(curl -s ...)"` can take as
+        // it is. 503 while unsynchronised, with the best guess still in the
+        // body, so `curl -f` fails rather than set a clock from it.
+        const Combined c = m_selector.current();
+        {
+            std::lock_guard<std::mutex> lk(m_countMu);
+            m_rfc3339Count.add(static_cast<long long>(monotonicNow() / 60.0));
+        }
+        const double d = daemonNow();
+        const double now = c.valid ? c.utcAt(d) : d - daemonMinusRealtime();
+        char extra[128];
+        std::snprintf(extra, sizeof extra, "X-Synchronised: %s\r\nX-Dispersion-Ms: %.3f",
+                      c.synchronised ? "true" : "false", c.dispersionSec * 1000.0);
+        writeAll(fd, httpResponse(c.synchronised ? 200 : 503, c.synchronised ? "OK" : "Service Unavailable",
+                                  "text/plain; charset=utf-8", rfc3339Ms(now) + "\n", headOnly, extra));
         return;
     }
 
@@ -744,12 +768,34 @@ void HttpApi::serveConnection(int fd) {
                               "  /              status page\n"
                               "  /api/events    one event per corrected second (SSE)\n"
                               "  /api/time      the time, for clients that do not speak NTP\n"
+                              "  /api/rfc3339   the time alone, as one line of RFC 3339\n"
                               "  /api/status    everything this daemon knows\n"
                               "  /api/sources   just the per-source array\n"
                               "  /api/eventlog  the last 100 events worth knowing about\n"
                               "  /api/metrics   recent history: ?range=hour or ?range=day\n"
                               "  /api/health    200 when synchronised, 503 when not\n",
                               headOnly));
+}
+
+void HttpApi::HourCounter::advance(long long now) {
+    if (now <= minute) return;
+    const long long gap = std::min<long long>(now - minute, 60);
+    for (long long k = 1; k <= gap; ++k) minutes[static_cast<std::size_t>((minute + k) % 60)] = 0;
+    minute = now;
+}
+
+HttpTimeCounts HttpApi::HourCounter::read(long long now) {
+    advance(now);
+    HttpTimeCounts out;
+    out.total = total;
+    for (std::uint64_t m : minutes) out.pastHour += m;
+    return out;
+}
+
+HttpTimeStats HttpApi::timeStats() const {
+    const long long now = static_cast<long long>(monotonicNow() / 60.0);
+    std::lock_guard<std::mutex> lk(m_countMu);
+    return HttpTimeStats{m_rfc3339Count.read(now), m_timeCount.read(now)};
 }
 
 void HttpApi::serveEvents(int fd) {

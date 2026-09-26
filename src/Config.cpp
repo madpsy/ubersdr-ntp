@@ -135,6 +135,58 @@ bool getNtpSource(const json& j, NtpSourceConfig& s, std::string& err) {
     return true;
 }
 
+// NMEA sentence names, as pps.nmea and nmea_tcp.sentences take them: a list, or
+// a single one as a string. Appended to `out`; checkSentences() validates.
+bool getSentences(const json& j, const char* key, const char* what, std::vector<std::string>& out,
+                  std::string& err) {
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) return true;
+    if (it->is_string()) {
+        out.push_back(it->get<std::string>());
+        return true;
+    }
+    if (it->is_array()) {
+        for (const json& v : *it) {
+            if (!v.is_string()) { err = std::string(what) + " must list sentence names (\"rmc\", \"zda\")"; return false; }
+            out.push_back(v.get<std::string>());
+        }
+        return true;
+    }
+    err = std::string(what) + " must be a list of sentence names (\"rmc\", \"zda\")";
+    return false;
+}
+
+// Lower-cases the names, and refuses one that is unknown or given twice.
+bool checkSentences(std::vector<std::string>& names, const char* what, std::string& err) {
+    for (std::string& n : names) {
+        for (char& ch : n) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        if (n != "rmc" && n != "zda") { err = std::string(what) + ": unknown sentence \"" + n + "\" (rmc, zda)"; return false; }
+    }
+    for (std::size_t i = 0; i < names.size(); ++i)
+        for (std::size_t k = i + 1; k < names.size(); ++k)
+            if (names[i] == names[k]) { err = std::string(what) + " lists \"" + names[i] + "\" twice"; return false; }
+    return true;
+}
+
+// RMC's position: latitude and longitude together, or neither.
+bool getPosition(const json& j, const char* what, bool& given, double& lat, double& lon, std::string& err) {
+    const bool haveLat = j.contains("latitude") && !j["latitude"].is_null();
+    const bool haveLon = j.contains("longitude") && !j["longitude"].is_null();
+    if (haveLat != haveLon) {
+        err = std::string(what) + ".latitude and " + what + ".longitude go together: give both or neither";
+        return false;
+    }
+    if (!haveLat) return true;
+    if (!getOpt(j, "latitude", lat, err)) return false;
+    if (!getOpt(j, "longitude", lon, err)) return false;
+    given = true;
+    return true;
+}
+
+bool positionInRange(double lat, double lon) {
+    return std::isfinite(lat) && std::fabs(lat) <= 90.0 && std::isfinite(lon) && std::fabs(lon) <= 180.0;
+}
+
 } // namespace
 
 bool Config::load(const std::string& path, Config& out, std::string& err) {
@@ -249,28 +301,25 @@ bool Config::load(const std::string& path, Config& out, std::string& err) {
         if (!getOpt(p, "width_ms", c.pps.widthMs, err)) return false;
         if (!getOpt(p, "invert", c.pps.invert, err)) return false;
         if (!getOpt(p, "baud", c.pps.baud, err)) return false;
-        if (auto nit = p.find("nmea"); nit != p.end() && !nit->is_null()) {
-            // A single sentence may be given as a string, several as a list.
-            if (nit->is_string()) {
-                c.pps.nmea.push_back(nit->get<std::string>());
-            } else if (nit->is_array()) {
-                for (const json& v : *nit) {
-                    if (!v.is_string()) { err = "pps.nmea must list sentence names (\"rmc\", \"zda\")"; return false; }
-                    c.pps.nmea.push_back(v.get<std::string>());
-                }
-            } else {
-                err = "pps.nmea must be a list of sentence names (\"rmc\", \"zda\")";
-                return false;
-            }
+        if (!getSentences(p, "nmea", "pps.nmea", c.pps.nmea, err)) return false;
+        if (!getPosition(p, "pps", c.pps.positionGiven, c.pps.latitude, c.pps.longitude, err)) return false;
+    }
+
+    if (auto it = j.find("nmea_tcp"); it != j.end() && !it->is_null()) {
+        if (!it->is_object()) { err = "nmea_tcp must be an object"; return false; }
+        const json& n = *it;
+        if (!getOpt(n, "enabled", c.nmeaTcp.enabled, err)) return false;
+        if (auto lit = n.find("listen"); lit != n.end() && !lit->is_null()) {
+            if (!getOpt(n, "listen", c.nmeaTcp.listen, err)) return false;
         }
-        const bool haveLat = p.contains("latitude") && !p["latitude"].is_null();
-        const bool haveLon = p.contains("longitude") && !p["longitude"].is_null();
-        if (haveLat != haveLon) { err = "pps.latitude and pps.longitude go together: give both or neither"; return false; }
-        if (haveLat) {
-            if (!getOpt(p, "latitude", c.pps.latitude, err)) return false;
-            if (!getOpt(p, "longitude", c.pps.longitude, err)) return false;
-            c.pps.positionGiven = true;
+        if (!getOpt(n, "port", c.nmeaTcp.port, err)) return false;
+        if (!getOpt(n, "max_clients", c.nmeaTcp.maxClients, err)) return false;
+        if (n.contains("sentences") && !n["sentences"].is_null()) {
+            c.nmeaTcp.sentences.clear();
+            if (!getSentences(n, "sentences", "nmea_tcp.sentences", c.nmeaTcp.sentences, err)) return false;
         }
+        if (!getPosition(n, "nmea_tcp", c.nmeaTcp.positionGiven, c.nmeaTcp.latitude, c.nmeaTcp.longitude, err))
+            return false;
     }
 
     if (auto it = j.find("clock"); it != j.end() && it->is_object()) {
@@ -418,17 +467,38 @@ bool Config::finalise(std::string& err) {
             err = "pps.baud " + std::to_string(pps.baud) + " is not one of 4800, 9600, 19200, 38400, 57600, 115200";
             return false;
         }
-        for (std::string& n : pps.nmea) {
-            for (char& ch : n) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
-            if (n != "rmc" && n != "zda") { err = "pps.nmea: unknown sentence \"" + n + "\" (rmc, zda)"; return false; }
-        }
-        for (std::size_t i = 0; i < pps.nmea.size(); ++i)
-            for (std::size_t k = i + 1; k < pps.nmea.size(); ++k)
-                if (pps.nmea[i] == pps.nmea[k]) { err = "pps.nmea lists \"" + pps.nmea[i] + "\" twice"; return false; }
-        if (pps.positionGiven &&
-            !(std::isfinite(pps.latitude) && std::fabs(pps.latitude) <= 90.0 &&
-              std::isfinite(pps.longitude) && std::fabs(pps.longitude) <= 180.0)) {
+        if (!checkSentences(pps.nmea, "pps.nmea", err)) return false;
+        if (pps.positionGiven && !positionInRange(pps.latitude, pps.longitude)) {
             err = "pps.latitude/longitude out of range";
+            return false;
+        }
+    }
+
+    // Likewise the NMEA service, checked only when on.
+    if (nmeaTcp.enabled) {
+        if (nmeaTcp.port < 1 || nmeaTcp.port > 65535) {
+            err = "nmea_tcp.port " + std::to_string(nmeaTcp.port) + " out of range";
+            return false;
+        }
+        if (http.enabled && http.port == nmeaTcp.port) {
+            err = "http.port and nmea_tcp.port are both " + std::to_string(http.port) + "; set one of them elsewhere";
+            return false;
+        }
+        if (nmeaTcp.listen.empty()) {
+            err = "nmea_tcp.listen is empty; set \"enabled\": false to turn the NMEA service off";
+            return false;
+        }
+        if (nmeaTcp.maxClients < 1 || nmeaTcp.maxClients > 256) {
+            err = "nmea_tcp.max_clients " + std::to_string(nmeaTcp.maxClients) + " out of range (1 to 256)";
+            return false;
+        }
+        if (nmeaTcp.sentences.empty()) {
+            err = "nmea_tcp.sentences is empty; set \"enabled\": false to turn the NMEA service off";
+            return false;
+        }
+        if (!checkSentences(nmeaTcp.sentences, "nmea_tcp.sentences", err)) return false;
+        if (nmeaTcp.positionGiven && !positionInRange(nmeaTcp.latitude, nmeaTcp.longitude)) {
+            err = "nmea_tcp.latitude/longitude out of range";
             return false;
         }
     }

@@ -2,7 +2,8 @@
 // ---------------------------------------------------------------------------
 // The signal path, drawn: every transmitter and upstream server, the receivers
 // and peers that hear them, this daemon, and what it serves -- NTP clients, the
-// serial 1PPS output when there is one, and the browser showing this page --
+// serial 1PPS output when there is one, NMEA over TCP, RFC 3339 over HTTP, and
+// the browser showing this page --
 // with each link coloured by whether it is
 // feeding the served time, measured but standing by, or down.
 //
@@ -48,7 +49,7 @@ const freq = (hz) => !fin(hz) || !hz ? "" : hz < 1e6 ? (hz / 1e3).toFixed(0) + "
 let root = null, scroller, grid, svg, canvas, ctx, chipLayer, summary, detail;
 // The node whose full box is shown under the diagram in its compact form.
 let selected = "core", fullHtml = {}, kindOf = {};
-let tick = null, status = {}, pps = null, browser = null, linkOk = false;
+let tick = null, status = {}, pps = null, nmea = null, http = null, browser = null, linkOk = false;
 let shape = "", nodeEls = {}, links = [], linkEls = [];
 let hist = {}, reqHist = [], particles = [], raf = 0, lastSpawnSec = null;
 
@@ -306,6 +307,66 @@ function model(d) {
     });
     L.push({ from: "core", to: "pps", kind: "out", serving: pulsing, state: st,
              label: pulsing ? "1 Hz" : p.state === "waiting" ? "waiting" : "down" });
+  }
+
+  // NMEA 0183 over TCP, for gpsd and the like: who is connected, and how
+  // late each second's sentences left against the second they name.
+  if (nmea) {
+    const n = nmea;
+    const clients = n.clients || [];
+    const serving = n.state === "serving";
+    const st = n.state === "error" ? "down" : serving && clients.length ? "live" : "standby";
+    const us = (v) => !fin(v) ? "—" : v < 1000 ? num(v, 0) + " µs" : num(v / 1000, 2) + " ms";
+    const late = n.late_us || {};
+    const sent = (n.sentences || []).map((x) => x.toUpperCase()).join("+");
+    const who = clients.length + " client" + (clients.length === 1 ? "" : "s");
+    cols[3].push({
+      key: "nmea", kind: "out", state: st,
+      title: "NMEA over TCP", short: "NMEA", tag: "TCP :" + n.port,
+      sub: sent + (serving ? " each second, for gpsd" : n.state === "waiting" ? ", RMC status V only" : ""),
+      pill: n.state === "error" ? ["not listening", "bad"] : n.state === "waiting" ? ["not synchronised", "warn"] : null,
+      kf: String(clients.length), kl: clients.length === 1 ? "client" : "clients",
+      hint: n.detail || (clients.length ? "Connected now\n" + clients.map((c) => c.address + "  " +
+        (typeof dur === "function" ? dur(c.connected_seconds) : c.connected_seconds + " s")).join("\n")
+        : "No NMEA clients connected. For gpsd: gpsd tcp://<this host>:" + n.port),
+      body: metrics([
+        ["port", "TCP " + n.port],
+        ["sentences", esc(sent)],
+        ["clients", clients.length + " of " + n.max_clients],
+        ["late, avg", n.late_us ? us(late.mean) : "—"],
+        ["late, max", n.late_us ? us(late.max) : "—", n.late_us && late.max > 1000 ? "fl-warn" : ""],
+        ["sent", cntHtml(n.sentences_sent || 0)],
+        ["refused", cntHtml((n.refused || 0) + (n.dropped || 0))],
+      ]) + (n.detail ? '<div class="fl-sub">' + esc(n.detail) + "</div>" : ""),
+    });
+    L.push({ from: "core", to: "nmea", kind: "out", serving: serving && clients.length > 0, state: st,
+             label: n.state === "error" ? "down" : who });
+  }
+
+  // RFC 3339 over HTTP: the time as one line of text, for a shell or a
+  // microcontroller. 503 while unsynchronised, so a client does not set a
+  // clock from it then.
+  if (http && http.rfc3339) {
+    const r = http.rfc3339;
+    const st = !d.synchronised ? "down" : r.past_hour ? "live" : "standby";
+    const now = fin(d.unix) ? new Date(Math.floor(d.unix) * 1000).toISOString().replace(/\.\d+Z$/, "Z") : "";
+    cols[3].push({
+      key: "rfc", kind: "out", state: st,
+      title: "RFC 3339 over HTTP", short: "RFC 3339", tag: "HTTP",
+      sub: r.path,
+      pill: d.synchronised ? null : ["503 until synchronised", "warn"],
+      kf: cnt(r.past_hour), kl: "requests / hour",
+      hint: "GET " + r.path + " returns the served time as one line of text, to the millisecond:\n" +
+        "YYYY-MM-DDThh:mm:ss.sssZ. 200 while synchronised, 503 otherwise",
+      body: metrics([
+        ["path", esc(r.path)],
+        ["requests / hour", cntHtml(r.past_hour)],
+        ["since start", cntHtml(r.requests)],
+        ["answers", d.synchronised ? "200 OK" : "503", d.synchronised ? "" : "fl-warn"],
+      ]) + (now ? '<div class="fl-sub">' + esc(now) + "</div>" : ""),
+    });
+    L.push({ from: "core", to: "rfc", kind: "out", serving: d.synchronised && r.past_hour > 0, state: st,
+             label: d.synchronised ? cnt(r.past_hour) + "/h" : "503" });
   }
 
   const b = browser;
@@ -680,8 +741,11 @@ window.Flow = {
   status(d) {
     status = {};
     for (const s of d.sources || []) status[s.name] = s;
-    // The 1PPS output comes only with the full status; the tick lacks it.
+    // The 1PPS output, NMEA over TCP and the HTTP time counts come only with
+    // the full status; the tick lacks them.
     pps = d.pps && d.pps.enabled ? d.pps : null;
+    nmea = d.nmea_tcp && d.nmea_tcp.enabled ? d.nmea_tcp : null;
+    http = d.http && d.http.enabled ? d.http : null;
   },
   browser(b) { browser = b; },
   link(ok) {

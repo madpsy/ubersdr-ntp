@@ -39,9 +39,10 @@ services:
     #   UBERSDR_INGEST_URL: "http://ubersdr:6926"
     #
     # The status page is reached through the receiver at /addon/ntp/, over the
-    # sdr-network, and is never published. NTP (123/udp) is published on the
-    # host by install.sh, which adds a ports: entry here when nothing else on
-    # the host has port 123; otherwise it listens only inside the network.
+    # sdr-network, and is never published. NTP (123/udp) and NMEA 0183 over
+    # TCP (10110/tcp, for gpsd) are published on the host by install.sh, which
+    # adds a ports: entry here for each when nothing else on the host has that
+    # port; otherwise it listens only inside the network.
     sysctls:
       # Lets the unprivileged user inside bind NTP's port 123. Docker sets this
       # by default for a container's own network namespace; stated here so it

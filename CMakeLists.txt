@@ -182,6 +182,7 @@ target_compile_options(ubersdr-ntp-eventtest PRIVATE -Wall -Wextra)
 # pseudo-terminal. About fifteen seconds. Not installed.
 add_executable(ubersdr-ntp-ppstest
     tools/ppstest.cpp
+    src/NmeaServer.cpp
     src/Pps.cpp
     src/Events.cpp
     src/Config.cpp
@@ -238,6 +239,7 @@ add_executable(ubersdr-ntp
     src/Mqtt.cpp
     src/NtpClient.cpp
     src/NtpServer.cpp
+    src/NmeaServer.cpp
     src/Pps.cpp
     src/RateLimiter.cpp
     src/ClientTally.cpp

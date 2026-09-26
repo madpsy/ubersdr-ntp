@@ -6,7 +6,8 @@
 // Three audiences.
 //
 // A CLIENT that wants the time but does not speak NTP — a microcontroller, a
-// script, a browser — asks GET /api/time. NTP over UDP remains the primary and
+// script, a browser — asks GET /api/time, or GET /api/rfc3339 for the time
+// alone as one line of RFC 3339 text (the internet profile of ISO 8601). NTP over UDP remains the primary and
 // the better interface: it is what disciplines a system clock, and TCP plus TLS
 // make HTTP asymmetric in a way that costs accuracy. But an HTTP answer
 // carrying the same receive/transmit pair lets such a client do the same
@@ -52,7 +53,9 @@
 #include "Source.h"
 #include "Status.h"
 
+#include <array>
 #include <atomic>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -82,6 +85,7 @@ public:
     void stop();
 
     int streamClients() const { return m_streams.load(); }
+    HttpTimeStats timeStats() const;
 
 private:
     void accept();
@@ -110,6 +114,18 @@ private:
     // reach zero before returning.
     mutable std::mutex m_fdMu;
     std::set<int> m_liveFds;
+
+    // A running total and sixty minute buckets, as the NTP server keeps.
+    struct HourCounter {
+        std::uint64_t total = 0;
+        std::array<std::uint64_t, 60> minutes{};
+        long long minute = 0;
+        void advance(long long now);
+        void add(long long now) { advance(now); ++total; ++minutes[static_cast<std::size_t>(minute % 60)]; }
+        HttpTimeCounts read(long long now);
+    };
+    mutable std::mutex m_countMu;
+    mutable HourCounter m_rfc3339Count, m_timeCount;
 };
 
 } // namespace ubersdr_ntp

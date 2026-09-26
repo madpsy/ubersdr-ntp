@@ -172,6 +172,29 @@
   },
 
   // =====================================================================
+  // NMEA 0183 OVER TCP
+  //
+  // The same sentences as the 1PPS output's NMEA, to anything that
+  // connects: RMC and ZDA at the start of every second of the served time,
+  // as a networked GPS receiver sends them. gpsd takes it as a GPS --
+  //     gpsd tcp://<this host>:10110
+  // -- and hands the time on to chrony or ntpd through its usual SHM. On
+  // by default, on every interface like NTP; read-only, and anything a
+  // client sends is ignored. While unsynchronised, RMC says status V and
+  // ZDA is not sent. In Docker, install.sh publishes the port on the host
+  // when nothing else there has it. See "NMEA over TCP" in the README.
+  // =====================================================================
+  "nmea_tcp": {
+    "enabled": true,
+    "port": 10110,               // registered for NMEA 0183 over TCP
+    "sentences": ["rmc", "zda"], // either or both, in the order sent
+    "max_clients": 16
+    // , "listen": ["0.0.0.0", "::"]
+    // , "latitude": 51.5, "longitude": -0.12  // RMC's position; otherwise
+    //                                           // pps's, or a receiver on this host's
+  },
+
+  // =====================================================================
   // THE TWO CLASSES OF SOURCE
   //
   // There are two kinds of reference here: the radio sources below, and

@@ -15,12 +15,16 @@
 //      reported rather than fought.
 //   5. A real serial port's open path, on a pseudo-terminal and on a device
 //      that is not there.
+//   6. NMEA over TCP (NmeaServer.h): its configuration, then the server on the
+//      loopback with real clients -- the sentences at the served seconds,
+//      the same rules while unsynchronised, and the cap on clients.
 //
-// Takes about fifteen seconds: the thread is tested in real time.
+// Takes about twenty seconds: the thread and the server are tested in real time.
 // Exit status 0 when every check passes.
 
 #include "CivilTime.h"
 #include "Config.h"
+#include "NmeaServer.h"
 #include "Pps.h"
 #include "SampleClock.h"
 
@@ -31,7 +35,11 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <arpa/inet.h>
 #include <fcntl.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -199,9 +207,9 @@ std::string writeTemp(const std::string& text) {
     std::ofstream(p) << text;
     return p;
 }
-bool loadCfg(const std::string& ppsBlock, Config& c, std::string& err) {
+bool loadCfg(const std::string& ppsBlock, Config& c, std::string& err, const char* key = "pps") {
     const std::string p = writeTemp(std::string("{\"sources\":[{\"url\":\"http://x:8080\",\"carrier_hz\":10000000}]") +
-                                    (ppsBlock.empty() ? "" : ",\"pps\":" + ppsBlock) + "}");
+                                    (ppsBlock.empty() ? "" : ",\"" + std::string(key) + "\":" + ppsBlock) + "}");
     c = Config{};
     return Config::load(p, c, err) && c.finalise(err);
 }
@@ -423,6 +431,162 @@ void testSerial() {
 
 } // namespace
 
+// ---- NMEA over TCP -------------------------------------------------------------
+
+void testNmeaTcpConfig() {
+    std::printf("\nNMEA over TCP: configuration\n");
+    Config c;
+    std::string err;
+    auto loads = [&](const std::string& name, const std::string& block, bool want) {
+        err.clear();
+        const bool ok = loadCfg(block, c, err, "nmea_tcp");
+        check(name, ok == want, "%s", err.c_str());
+    };
+    loads("no nmea_tcp block: on", "", true);
+    check("defaults: on, every interface, port 10110, RMC then ZDA, 16 clients",
+          c.nmeaTcp.enabled && c.nmeaTcp.port == 10110 && c.nmeaTcp.listen.size() == 2 &&
+          c.nmeaTcp.sentences == std::vector<std::string>{"rmc", "zda"} && c.nmeaTcp.maxClients == 16);
+    loads("off, with a half-written block", "{\"enabled\":false,\"sentences\":[\"gga\"],\"port\":0}", true);
+    check("...is off", !c.nmeaTcp.enabled);
+    loads("sentences in capitals, as one string", "{\"sentences\":\"ZDA\"}", true);
+    check("...is ZDA alone", c.nmeaTcp.sentences == std::vector<std::string>{"zda"});
+    loads("an unknown sentence is refused", "{\"sentences\":[\"gga\"]}", false);
+    loads("no sentences at all is refused", "{\"sentences\":[]}", false);
+    loads("a port out of range is refused", "{\"port\":70000}", false);
+    loads("the status page's port is refused", "{\"port\":1234}", false);
+    loads("max_clients 0 is refused", "{\"max_clients\":0}", false);
+    loads("a position of its own", "{\"latitude\":-33.87,\"longitude\":151.21}", true);
+    check("...as given", c.nmeaTcp.positionGiven && c.nmeaTcp.latitude == -33.87);
+}
+
+// A client on the loopback that records every line and when it arrived.
+struct TcpReader {
+    int fd = -1;
+    std::string partial;
+    std::vector<std::pair<double, std::string>> lines;   // daemon time, sentence with CR LF
+    bool closed = false;
+    explicit TcpReader(int port) {
+        fd = ::socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in sa{};
+        sa.sin_family = AF_INET;
+        sa.sin_port = htons(static_cast<std::uint16_t>(port));
+        sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (::connect(fd, reinterpret_cast<struct sockaddr*>(&sa), sizeof sa) != 0) { ::close(fd); fd = -1; }
+    }
+    ~TcpReader() { if (fd >= 0) ::close(fd); }
+    // Reads whatever arrives for `sec` seconds.
+    void pump(double sec) {
+        const double end = daemonNow() + sec;
+        while (fd >= 0 && !closed && daemonNow() < end) {
+            struct pollfd p{fd, POLLIN, 0};
+            if (::poll(&p, 1, static_cast<int>((end - daemonNow()) * 1000.0) + 1) <= 0) continue;
+            const double t = daemonNow();
+            char buf[2048];
+            const ssize_t n = ::recv(fd, buf, sizeof buf, 0);
+            if (n <= 0) { closed = true; break; }
+            partial.append(buf, static_cast<std::size_t>(n));
+            for (std::size_t e; (e = partial.find("\r\n")) != std::string::npos;) {
+                lines.push_back({t, partial.substr(0, e + 2)});
+                partial.erase(0, e + 2);
+            }
+        }
+    }
+};
+
+void testNmeaTcp() {
+    std::printf("\nNMEA over TCP: the server, in real time\n");
+    std::mutex cmu;
+    Combined clock;
+    clock.valid = true;
+    clock.synchronised = true;
+    clock.offsetSec = 1.79e9 + 0.38197;
+    clock.atSec = daemonNow();
+    clock.rate = 0.0;
+    auto clockFn = [&] { std::lock_guard<std::mutex> lk(cmu); return clock; };
+    auto posFn = [](std::string& from) { from = "config"; return PpsPosition{true, 56.0, -3.0}; };
+
+    NmeaTcpConfig cfg;
+    cfg.listen = {"127.0.0.1"};
+    cfg.port = 0;
+    cfg.maxClients = 2;
+    NmeaServer srv(cfg, clockFn, posFn, 0);
+    std::string err;
+    const bool started = srv.start(err);
+    check("binds the loopback on a port of the kernel's choosing", started && srv.boundPort() > 0, "%s", err.c_str());
+    if (!started) return;
+
+    TcpReader a(srv.boundPort()), b(srv.boundPort());
+    check("two clients connect", a.fd >= 0 && b.fd >= 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    TcpReader over(srv.boundPort());
+    over.pump(1.5);
+    check("a third, over max_clients, is closed", over.closed && over.lines.empty(), "%zu lines", over.lines.size());
+
+    // Drained first: what queued while the third client was tried would be
+    // stamped with when it was read, not when it arrived.
+    a.pump(0.05);
+    b.pump(0.05);
+    a.lines.clear();
+    b.lines.clear();
+    a.pump(3.2);
+    b.pump(0.05);
+    int seconds = 0, onTime = 0, named = 0;
+    double worst = 0.0;
+    for (std::size_t i = 0; i + 1 < a.lines.size(); ++i) {
+        const Parsed r = parse(a.lines[i].second), z = parse(a.lines[i + 1].second);
+        if (!r.ok || r.f[0] != "GPRMC") continue;
+        ++seconds;
+        const double u = clock.utcAt(a.lines[i].first);
+        const double late = u - std::floor(u);
+        worst = std::max(worst, late);
+        if (late < 0.005) ++onTime;
+        const long long rem = floorMod(static_cast<long long>(std::floor(u)), 86400);
+        char hms[64];
+        std::snprintf(hms, sizeof hms, "%02lld%02lld%02lld.00", rem / 3600, rem / 60 % 60, rem % 60);
+        if (z.ok && z.f[0] == "GPZDA" && r.f[1] == hms && z.f[1] == hms && r.f[2] == "A" && r.f[3] == "5600.0000")
+            ++named;
+    }
+    check("an RMC every second", seconds >= 3 && seconds <= 4, "%d", seconds);
+    check("each arriving at a served second, within 5 ms even unprivileged", onTime == seconds,
+          "worst %.3f ms", worst * 1e3);
+    check("RMC status A with the position, then ZDA, naming that second", named == seconds, "%d of %d", named, seconds);
+    check("the other client has them too", b.lines.size() >= a.lines.size() - 2, "%zu vs %zu",
+          b.lines.size(), a.lines.size());
+    NmeaTcpStats st = srv.stats();
+    check("stats: serving, two clients, one refused, sentences counted",
+          st.state == "serving" && st.clients.size() == 2 && st.refused == 1 && st.sent >= 2u * a.lines.size() - 4 &&
+          st.positionFrom == "config",
+          "%s %zu %llu %llu", st.state.c_str(), st.clients.size(), static_cast<unsigned long long>(st.refused),
+          static_cast<unsigned long long>(st.sent));
+
+    { std::lock_guard<std::mutex> lk(cmu); clock.synchronised = false; clock.note = "testing"; }
+    // A second's sentences may already have left before the change.
+    a.pump(1.1);
+    a.lines.clear();
+    a.pump(2.2);
+    b.pump(0.05);
+    bool onlyV = !a.lines.empty();
+    for (const auto& l : a.lines) {
+        const Parsed r = parse(l.second);
+        onlyV = onlyV && r.ok && r.f[0] == "GPRMC" && r.f[2] == "V";
+    }
+    check("unsynchronised: RMC with status V, and no ZDA", onlyV, "%zu lines", a.lines.size());
+    st = srv.stats();
+    check("stats: waiting, with the reason", st.state == "waiting" && st.detail.find("testing") != std::string::npos,
+          "%s", st.detail.c_str());
+
+    // A client that leaves is noticed and its place freed.
+    ::close(b.fd);
+    b.fd = -1;
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    TcpReader c2(srv.boundPort());
+    c2.pump(1.3);
+    check("a client that leaves frees its place", !c2.closed && !c2.lines.empty() && srv.stats().clients.size() == 2,
+          "%zu lines, %zu clients", c2.lines.size(), srv.stats().clients.size());
+    srv.stop();
+    check("stops", true);
+}
+
 int main() {
     char tmpl[] = "/tmp/ppstest.XXXXXX";
     const char* d = ::mkdtemp(tmpl);
@@ -433,6 +597,8 @@ int main() {
     testConfig();
     testSerial();
     testThread();
+    testNmeaTcpConfig();
+    testNmeaTcp();
     std::printf("\n%d ok, %d failed\n", g_ok, g_failed);
     return g_failed ? 1 : 0;
 }

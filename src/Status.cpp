@@ -715,8 +715,41 @@ json statusJson(const StatusInput& in) {
         pps["position_from"] = p.positionFrom.empty() ? json(nullptr) : json(p.positionFrom);
     }
     j["pps"] = std::move(pps);
-    j["http"] = {{"stream_clients", in.httpStreamClients >= 0 ? json(in.httpStreamClients)
-                                                              : json(nullptr)}};
+
+    // NMEA over TCP: {"enabled": false} and nothing else when it is off.
+    json nmea;
+    nmea["enabled"] = in.nmeaTcp.has_value();
+    if (in.nmeaTcp) {
+        const NmeaTcpStats& n = *in.nmeaTcp;
+        nmea["port"] = n.port;
+        nmea["listen"] = n.listen;
+        nmea["sentences"] = n.sentences;
+        nmea["max_clients"] = n.maxClients;
+        nmea["state"] = n.state;
+        nmea["detail"] = n.detail.empty() ? json(nullptr) : json(n.detail);
+        json clients = json::array();
+        for (const NmeaClientInfo& c : n.clients)
+            clients.push_back({{"address", c.address}, {"connected_seconds", std::floor(c.connectedSec)}});
+        nmea["clients"] = std::move(clients);
+        nmea["connections"] = n.connections;
+        nmea["refused"] = n.refused;
+        nmea["dropped"] = n.dropped;
+        nmea["sentences_sent"] = n.sent;
+        nmea["late_us"] = n.sent ? json({{"last", n.lastLateUs}, {"mean", n.meanLateUs}, {"max", n.maxLateUs}})
+                                 : json(nullptr);
+        nmea["position_from"] = n.positionFrom.empty() ? json(nullptr) : json(n.positionFrom);
+    }
+    j["nmea_tcp"] = std::move(nmea);
+
+    json http = {{"enabled", in.httpStreamClients >= 0},
+                 {"stream_clients", in.httpStreamClients >= 0 ? json(in.httpStreamClients) : json(nullptr)}};
+    if (in.httpStreamClients >= 0) {
+        http["rfc3339"] = {{"path", "/api/rfc3339"}, {"requests", in.httpTime.rfc3339.total},
+                           {"past_hour", in.httpTime.rfc3339.pastHour}};
+        http["time"] = {{"path", "/api/time"}, {"requests", in.httpTime.json.total},
+                        {"past_hour", in.httpTime.json.pastHour}};
+    }
+    j["http"] = std::move(http);
 
     json arr = json::array();
     for (const SourceSnapshot& s : in.sources) arr.push_back(sourceJson(s, in.combined));

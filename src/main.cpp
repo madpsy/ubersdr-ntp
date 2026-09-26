@@ -34,6 +34,7 @@
 #include "Mqtt.h"
 #include "NtpClient.h"
 #include "NtpServer.h"
+#include "NmeaServer.h"
 #include "Pps.h"
 #include "SampleClock.h"
 #include "Selector.h"
@@ -539,25 +540,45 @@ int main(int argc, char** argv) {
     // receiver on this host -- capture-timed, so the one the daemon runs beside
     // -- that publishes its coordinates. A remote receiver's position is not
     // this station's.
+    //
+    // NMEA over TCP takes its own position first, then the 1PPS output's.
+    auto receiverPosition = [&snapshots](std::string& from) {
+        PpsPosition p;
+        for (const SourceSnapshot& s : snapshots()) {
+            if (s.kind != SourceKind::Radio || s.timingMode != "capture" || !s.receiverLocation.valid) continue;
+            p = {true, s.receiverLocation.lat, s.receiverLocation.lon};
+            from = "receiver " + s.name;
+            return p;
+        }
+        return p;
+    };
     std::unique_ptr<PpsOutput> pps;
     if (cfg.pps.enabled) {
-        auto position = [&cfg, &snapshots](std::string& from) {
-            PpsPosition p;
+        auto position = [&cfg, receiverPosition](std::string& from) {
             if (cfg.pps.positionGiven) {
-                p = {true, cfg.pps.latitude, cfg.pps.longitude};
                 from = "config";
-                return p;
+                return PpsPosition{true, cfg.pps.latitude, cfg.pps.longitude};
             }
-            for (const SourceSnapshot& s : snapshots()) {
-                if (s.kind != SourceKind::Radio || s.timingMode != "capture" || !s.receiverLocation.valid) continue;
-                p = {true, s.receiverLocation.lat, s.receiverLocation.lon};
-                from = "receiver " + s.name;
-                return p;
-            }
-            return p;
+            return receiverPosition(from);
         };
         pps = std::make_unique<PpsOutput>(cfg.pps, [&selector] { return selector.current(); }, position,
                                           &events, cfg.ntp.realtimePriority, startedAt);
+    }
+    std::unique_ptr<NmeaServer> nmeaTcp;
+    if (cfg.nmeaTcp.enabled) {
+        auto position = [&cfg, receiverPosition](std::string& from) {
+            if (cfg.nmeaTcp.positionGiven) {
+                from = "config";
+                return PpsPosition{true, cfg.nmeaTcp.latitude, cfg.nmeaTcp.longitude};
+            }
+            if (cfg.pps.positionGiven) {
+                from = "config";
+                return PpsPosition{true, cfg.pps.latitude, cfg.pps.longitude};
+            }
+            return receiverPosition(from);
+        };
+        nmeaTcp = std::make_unique<NmeaServer>(cfg.nmeaTcp, [&selector] { return selector.current(); }, position,
+                                               cfg.ntp.realtimePriority);
     }
 
     // Set once the HTTP service exists, which is after the provider it is
@@ -581,6 +602,8 @@ int main(int argc, char** argv) {
         in.eventCounts = events.countsByType();
         in.httpStreamClients = httpApi && cfg.http.enabled ? httpApi->streamClients() : -1;
         if (pps) in.pps = pps->stats();
+        if (nmeaTcp) in.nmeaTcp = nmeaTcp->stats();
+        if (httpApi && cfg.http.enabled) in.httpTime = httpApi->timeStats();
         return in;
     };
 
@@ -602,6 +625,10 @@ int main(int argc, char** argv) {
 
     for (auto& s : sources) s->start();
     if (pps) pps->start();
+    // Not fatal, as for the status page: NTP is what this is for.
+    if (nmeaTcp && !nmeaTcp->start(err)) {
+        LOG_ERROR(kTag, "%s — continuing without NMEA over TCP", err.c_str());
+    }
 
     // MQTT through the receiver's addon ingest port. Dormant, and quiet about
     // it, wherever there is no such port; see Mqtt.h.
@@ -750,6 +777,7 @@ int main(int argc, char** argv) {
 
     LOG_INFO(kTag, "shutting down");
     if (pps) pps->stop();
+    if (nmeaTcp) nmeaTcp->stop();
     mqtt.stop();
     for (auto& s : sources) s->stop();
     ntp.stop();

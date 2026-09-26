@@ -177,49 +177,62 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# Publish NTP on the host, when port 123 is free for it
+# Publish NTP, and NMEA over TCP, on the host when their ports are free
 # ---------------------------------------------------------------------------
 
 # 123/udp on the host goes to this container only if nothing else there has it
 # -- chronyd or ntpd serving already would be refused the port, or refuse
 # ours. Taken to be ours when this container already publishes it (a re-run,
 # or a --force-update). Docker's DNAT keeps each client's own address, which
-# the rate limit and the top-clients list both need.
+# the rate limit and the top-clients list both need. 10110/tcp, NMEA 0183 over
+# TCP for gpsd and the like, the same way.
 NTP_PUBLISHED=0
-publish_ntp_port() {
-    if grep -qE '^\s*-\s*"?123:123/udp"?' "${COMPOSE_FILE}"; then
-        NTP_PUBLISHED=1
-        return
+NMEA_PUBLISHED=0
+# publish_port PORT PROTO WHAT: returns 0 when the port is (now) published.
+publish_port() {
+    local port="$1" proto="$2" what="$3" entry="\"$1:$1/$2\""
+    if grep -qE "^\s*-\s*\"?${port}:${port}/${proto}\"?" "${COMPOSE_FILE}"; then
+        return 0
     fi
-    local why=""
-    if docker port ntp 123/udp >/dev/null 2>&1; then
+    local why="" flag="-Hlun"
+    [[ "${proto}" == "tcp" ]] && flag="-Hltn"
+    if docker port ntp "${port}/${proto}" >/dev/null 2>&1; then
         why="already this container's"
     elif ! command -v ss >/dev/null 2>&1; then
-        echo "Cannot tell whether port 123/udp is free (no 'ss'): not publishing NTP on the host."
-        return
-    elif [[ -z "$(ss -Hlun 'sport = :123' 2>/dev/null)" ]]; then
+        echo "Cannot tell whether port ${port}/${proto} is free (no 'ss'): not publishing ${what} on the host."
+        return 1
+    elif [[ -z "$(ss ${flag} "sport = :${port}" 2>/dev/null)" ]]; then
         why="free"
     else
-        echo "Port 123/udp is in use on this host by something else, so NTP is not published."
-        echo "  See what has it : sudo ss -ulpn 'sport = :123'"
-        echo "  If that is a local chronyd/ntpd you can stop serving from it, then run"
-        echo "  ./install.sh --force-update to publish this one instead."
-        return
+        echo "Port ${port}/${proto} is in use on this host by something else, so ${what} is not published."
+        echo "  See what has it : sudo ss -${flag#-H}p 'sport = :${port}'"
+        echo "  Free it, then run ./install.sh --force-update to publish this one instead."
+        return 1
     fi
-    # Straight after container_name: a ports: list with one entry.
-    awk '{ print } /^[[:space:]]*container_name:[[:space:]]*ntp[[:space:]]*$/ && !done {
-             print "    ports:"
-             print "      # Added by install.sh: port 123/udp was free on this host."
-             print "      - \"123:123/udp\""
-             done = 1 }' "${COMPOSE_FILE}" > "${COMPOSE_FILE}.tmp" && mv "${COMPOSE_FILE}.tmp" "${COMPOSE_FILE}"
-    if grep -q '"123:123/udp"' "${COMPOSE_FILE}"; then
-        NTP_PUBLISHED=1
-        echo "Port 123/udp is ${why}: publishing NTP on the host."
+    # Into the service's ports: list, made straight after container_name when
+    # there is none yet.
+    if grep -qE '^    ports:[[:space:]]*$' "${COMPOSE_FILE}"; then
+        ENTRY="${entry}" WHAT="${port}/${proto}" awk '{ print } /^    ports:[[:space:]]*$/ && !done {
+                 print "      # Added by install.sh: port " ENVIRON["WHAT"] " was free on this host."
+                 print "      - " ENVIRON["ENTRY"]
+                 done = 1 }' "${COMPOSE_FILE}" > "${COMPOSE_FILE}.tmp"
     else
-        echo "Could not add the port to ${COMPOSE_FILE}: NTP is not published on the host."
+        ENTRY="${entry}" WHAT="${port}/${proto}" awk '{ print } /^[[:space:]]*container_name:[[:space:]]*ntp[[:space:]]*$/ && !done {
+                 print "    ports:"
+                 print "      # Added by install.sh: port " ENVIRON["WHAT"] " was free on this host."
+                 print "      - " ENVIRON["ENTRY"]
+                 done = 1 }' "${COMPOSE_FILE}" > "${COMPOSE_FILE}.tmp"
     fi
+    mv "${COMPOSE_FILE}.tmp" "${COMPOSE_FILE}"
+    if grep -qF "${entry}" "${COMPOSE_FILE}"; then
+        echo "Port ${port}/${proto} is ${why}: publishing ${what} on the host."
+        return 0
+    fi
+    echo "Could not add the port to ${COMPOSE_FILE}: ${what} is not published on the host."
+    return 1
 }
-publish_ntp_port
+publish_port 123 udp NTP && NTP_PUBLISHED=1
+publish_port 10110 tcp "NMEA over TCP" && NMEA_PUBLISHED=1
 
 # ---------------------------------------------------------------------------
 # Fetch the configuration, once
@@ -293,6 +306,11 @@ if (( NTP_PUBLISHED )); then
     echo "NTP is served on this host's port 123/udp: point clients at this machine."
 else
     echo "NTP (port 123/udp) is not published outside Docker (see above)."
+fi
+if (( NMEA_PUBLISHED )); then
+    echo "NMEA 0183 is served on this host's port 10110/tcp: gpsd tcp://<this host>:10110"
+else
+    echo "NMEA over TCP (port 10110/tcp) is not published outside Docker (see above)."
 fi
 echo ""
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"

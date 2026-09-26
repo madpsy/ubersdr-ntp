@@ -83,6 +83,17 @@ inline std::string iso8601(long long ms) {
     return buf;
 }
 
+// RFC 3339 (the internet profile of ISO 8601) to the millisecond, in UTC:
+// "2026-09-26T12:34:56.789Z". POSIX time, so never a :60.
+inline std::string rfc3339Ms(double unixSec) {
+    const long long ms = std::llround(unixSec * 1000.0);
+    std::string s = iso8601(ms);   // ends "...:56Z"
+    char frac[8];
+    std::snprintf(frac, sizeof frac, ".%03lldZ", floorMod(ms, 1000));
+    s.replace(s.size() - 1, 1, frac);
+    return s;
+}
+
 // The host clock in the form the voter's plausibility gate wants. Called from
 // inside process() on the audio thread, so it stays four integer divisions.
 inline clockdec::TimeFields hostNowFields(long long hostMs) {

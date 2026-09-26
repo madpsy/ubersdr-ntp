@@ -14,6 +14,7 @@
 // disagree about what the state was.
 
 #include "NtpServer.h"
+#include "NmeaServer.h"
 #include "Pps.h"
 #include "Selector.h"
 #include "Source.h"
@@ -27,6 +28,17 @@
 #include <vector>
 
 namespace ubersdr_ntp {
+
+// Requests for the time itself, since start and over the past hour: the two
+// endpoints a clock asks, as against the page and the status documents.
+struct HttpTimeCounts {
+    std::uint64_t total = 0;
+    std::uint64_t pastHour = 0;
+};
+struct HttpTimeStats {
+    HttpTimeCounts rfc3339;   // /api/rfc3339
+    HttpTimeCounts json;      // /api/time
+};
 
 struct StatusInput {
     std::vector<SourceSnapshot> sources;
@@ -58,6 +70,13 @@ struct StatusInput {
 
     // The 1PPS output's state; absent when it is not enabled.
     std::optional<PpsStats> pps;
+
+    // NMEA over TCP; absent when it is not enabled.
+    std::optional<NmeaTcpStats> nmeaTcp;
+
+    // Requests for the time over HTTP; meaningless with the HTTP service off,
+    // which httpStreamClients == -1 says.
+    HttpTimeStats httpTime;
 };
 
 // The multi-line block for the log. No trailing newline; Log::block indents it.

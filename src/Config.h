@@ -374,6 +374,22 @@ struct PpsConfig {
     double latitude = 0.0, longitude = 0.0;
 };
 
+// NMEA 0183 over TCP (NmeaServer.h): the same sentences as the serial output,
+// to anything that connects -- gpsd ("gpsd tcp://host:10110"), OpenCPN, a
+// script. On by default and on every interface, like NTP: it is read-only, and
+// a client that connects and reads nothing is dropped.
+struct NmeaTcpConfig {
+    bool enabled = true;
+    std::vector<std::string> listen{"0.0.0.0", "::"};
+    int port = 10110;                 // the port registered for NMEA 0183 over TCP
+    std::vector<std::string> sentences{"rmc", "zda"};   // any of "rmc", "zda", in order
+    int maxClients = 16;
+    // RMC's position, as pps.latitude/longitude; otherwise the 1PPS output's,
+    // otherwise that of a receiver on this host.
+    bool positionGiven = false;
+    double latitude = 0.0, longitude = 0.0;
+};
+
 struct LogConfig {
     std::string file;                  // empty: no file
     LogLevel level = LogLevel::Info;
@@ -387,6 +403,7 @@ struct Config {
     HttpConfig http;
     MqttConfig mqtt;
     PpsConfig pps;
+    NmeaTcpConfig nmeaTcp;
     ClockConfig clock;
     std::vector<SourceConfig> sources;
     std::vector<NtpSourceConfig> ntpSources;

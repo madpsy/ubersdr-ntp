@@ -20,7 +20,7 @@ real failure mode that a clean compile does not rule out:
     unsynchronised radio clock is worse off than one with no radio clock;
   * it does NOT answer mode 6 or mode 7, the control and private modes behind
     every ntpd reflection-amplification advisory;
-  * the HTTP service serves the page, /api/time, /api/status, /api/health,
+  * the HTTP service serves the page, /api/time, /api/rfc3339, /api/status, /api/health,
     /api/eventlog and /api/metrics, with /api/health reporting 503 while
     unsynchronised;
   * the SSE stream connects and emits a tick within a couple of seconds;
@@ -81,6 +81,7 @@ def free_port(kind):
 
 NTP_PORT = free_port(socket.SOCK_DGRAM)
 HTTP_PORT = free_port(socket.SOCK_STREAM)
+NMEA_PORT = free_port(socket.SOCK_STREAM)
 
 ok_count = 0
 fail_count = 0
@@ -388,6 +389,43 @@ def http_post(path, timeout=3.0):
         return -1
 
 
+def nmea_lines(port, seconds):
+    """Connect to the NMEA service and return the sentences read in `seconds`."""
+    buf = b''
+    try:
+        s = socket.create_connection(('127.0.0.1', port), timeout=2.0)
+    except OSError:
+        return None
+    try:
+        end = time.time() + seconds
+        while time.time() < end:
+            s.settimeout(max(0.05, end - time.time()))
+            try:
+                chunk = s.recv(4096)
+            except socket.timeout:
+                break
+            if not chunk:
+                break
+            buf += chunk
+    finally:
+        s.close()
+    return [l for l in buf.decode('ascii', 'replace').split('\r\n') if l]
+
+
+def nmea_ok(sentence):
+    """A sentence's checksum is right."""
+    if not sentence.startswith('$') or '*' not in sentence:
+        return False
+    body, _, cs = sentence[1:].partition('*')
+    x = 0
+    for ch in body:
+        x ^= ord(ch)
+    return cs == '%02X' % x
+
+
+RFC3339 = re.compile(r'^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$')
+
+
 def sse_first_event(timeout=6.0, port=None):
     """Connect to /api/events and return the first named event and its data."""
     s = socket.create_connection(('127.0.0.1', port or HTTP_PORT), timeout=timeout)
@@ -475,6 +513,7 @@ def main():
         'ntp': {'listen': ['0.0.0.0'], 'port': NTP_PORT,
                 'answer_when_unsynchronised': True},
         'http': {'enabled': True, 'listen': '127.0.0.1', 'port': HTTP_PORT},
+        'nmea_tcp': {'listen': ['127.0.0.1'], 'port': NMEA_PORT},
         'log': {'level': 'warn', 'status_interval_seconds': 0},
     }
     # An ingest port that does not recognise this machine, as a receiver
@@ -591,6 +630,19 @@ def main():
             except ValueError:
                 pass
         check('GET /api/time returns usable JSON', ok, body[:200])
+
+        code, body, hdrs = http_get('/api/rfc3339')
+        check('GET /api/rfc3339: 503 while unsynchronised, still one RFC 3339 line',
+              code == 503 and RFC3339.match(body.strip()) is not None and body.endswith('\n')
+              and hdrs.get('X-Synchronised') == 'false', 'HTTP %s %r' % (code, body[:40]))
+
+        # --- NMEA over TCP -----------------------------------------------------
+        lines = nmea_lines(NMEA_PORT, 2.5)
+        check('NMEA over TCP accepts a client', lines is not None)
+        if lines is not None:
+            check('unsynchronised: RMC with status V each second, and no ZDA',
+                  len(lines) >= 2 and all(nmea_ok(l) and l.startswith('$GPRMC,') and l.split(',')[2] == 'V'
+                                          for l in lines), repr(lines[:3]))
 
         code, body, _ = http_get('/api/status')
         ok = False
@@ -714,6 +766,7 @@ def main():
     # A separate process, because the setting is read at startup. Worth its own
     # run: the first implementation tested the wrong field and answered anyway,
     # and nothing else here would have noticed.
+    cfg['nmea_tcp'] = {'enabled': False}
     cfg['ntp']['answer_when_unsynchronised'] = False
     cfg['ntp']['port'] = free_port(socket.SOCK_DGRAM)
     cfg['http']['enabled'] = False
@@ -835,6 +888,7 @@ def main():
                 'min_sources': 1},
         'http': {'enabled': True, 'port': free_port(socket.SOCK_STREAM),
                  'listen': '127.0.0.1'},
+        'nmea_tcp': {'listen': ['127.0.0.1'], 'port': free_port(socket.SOCK_STREAM)},
         'clock': {'primary': 'ntp', 'secondary': 'cold'},
         'ntp_sources': [{'name': 'fake', 'server': '127.0.0.1', 'port': upstream.port,
                          'poll_seconds': 8, 'iburst': True}],
@@ -883,6 +937,18 @@ def main():
                   served['rootdelay'] > 0.0, '%.4f s' % served['rootdelay'])
             check('root dispersion is still reported', served['rootdisp'] > 0.0,
                   '%.4f s' % served['rootdisp'])
+
+        if served:
+            code, body, hdrs = http_get('/api/rfc3339', port=cfg4['http']['port'])
+            check('GET /api/rfc3339: 200 once synchronised, one RFC 3339 line',
+                  code == 200 and RFC3339.match(body.strip()) is not None and
+                  hdrs.get('X-Synchronised') == 'true', 'HTTP %s %r' % (code, body[:40]))
+            lines = nmea_lines(cfg4['nmea_tcp']['port'], 2.5) or []
+            rmc = [l for l in lines if l.startswith('$GPRMC,')]
+            zda = [l for l in lines if l.startswith('$GPZDA,')]
+            check('synchronised: RMC with status A and ZDA each second, checksums right',
+                  len(rmc) >= 2 and len(zda) >= 2 and all(nmea_ok(l) for l in lines) and
+                  all(l.split(',')[2] == 'A' for l in rmc), repr(lines[:2]))
 
         code, body, _ = http_get('/api/status', port=cfg4['http']['port'])
         try:

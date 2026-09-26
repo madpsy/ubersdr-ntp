@@ -161,7 +161,7 @@ need no receiver and no network, and are built alongside the daemon:
 ./build-native/ubersdr-ntp-ntptest       # the NTP client, against a fake server
 ./build-native/ubersdr-ntp-configtest    # the configuration reader
 ./build-native/ubersdr-ntp-eventtest     # the event log's transitions, and the metric history's bounds
-./build-native/ubersdr-ntp-ppstest       # the 1PPS output: NMEA, leap seconds, the thread, a port
+./build-native/ubersdr-ntp-ppstest       # the 1PPS output: NMEA, leap seconds, the thread, a port; NMEA over TCP
 python3 tools/selftest.py ./build-native/ubersdr-ntp
 ```
 
@@ -1184,6 +1184,7 @@ daemon uses, so set `http.listen` to `127.0.0.1` to keep it on this machine.
 | `/` | The status page. It times its own requests to `/api/time` and corrects its clock for the browser-to-server delay, so it ticks with the broadcast; local time alongside |
 | `/api/events` | **SSE.** One `tick` event per *corrected* second — the instant the broadcast's own second rolls over, not this host's — plus a `status` event every 5 s with the full document |
 | `/api/time` | The time, for clients that do not speak NTP |
+| `/api/rfc3339` | The time alone, as one line of RFC 3339 text: `2026-09-26T14:18:39.754Z`. 503 while unsynchronised |
 | `/api/status` | Everything this daemon knows, pretty-printed |
 | `/api/sources` | Just the per-source array |
 | `/api/health` | 200 when synchronised, 503 when not, tiny either way |
@@ -1329,6 +1330,25 @@ served time against the daemon's own clock and how fast that moves, which is
 what a client timing repeated requests needs to tell a change in the server's
 estimate from steady movement — the status page uses them that way.
 `server_raw_receive` is the host's clock at the receive.
+
+### `/api/rfc3339`
+
+The served time as one line of text, in RFC 3339 (the internet profile of
+ISO 8601), UTC, to the millisecond, read as the answer is sent:
+
+```bash
+$ curl -s http://127.0.0.1:1234/api/rfc3339
+2026-09-26T14:18:39.754Z
+```
+
+It is for a shell script, a microcontroller or a display that wants the time
+and nothing else, and has no round-trip correction: the time it names left
+the server when the answer did. The answer is 200 while synchronised and 503
+otherwise. On a 503 the body still carries the best guess, but `curl -f`
+fails, so `date -s "$(curl -fs ...)"` never sets a clock from an
+unsynchronised server. `X-Synchronised` and `X-Dispersion-Ms` headers say the
+same as `/api/time` does. Through the receiver it is
+`http://<receiver>/addon/ntp/api/rfc3339`.
 
 ### `/api/events`
 
@@ -1538,6 +1558,65 @@ across reboots and ports.
 
 **As a service**, the unit's `PrivateDevices=yes` hides serial ports. The unit
 file says what to change.
+
+## NMEA over TCP
+
+On by default: NMEA 0183 on TCP port 10110, the port registered for it. Every
+client that connects gets the sentences a GPS receiver sends, RMC and ZDA, at
+the start of each second of the served time and naming that second. It follows
+the same rules as the [1PPS output](#1pps-output)'s NMEA:
+
+- status `A` with mode `M` while synchronised;
+- RMC with status `V` and no ZDA while not;
+- `23:59:60` for a leap second;
+- RMC's position from the block below if given, otherwise from `pps`,
+  otherwise from a receiver on this host.
+
+It is how a host's own time daemon takes this as a reference clock. gpsd reads
+it as a GPS:
+
+```bash
+gpsd -n tcp://<this host>:10110
+```
+
+gpsd then offers the time to chrony or ntpd through its usual shared memory,
+on whichever host gpsd runs. For chrony:
+
+```
+refclock SHM 0 refid NMEA offset 0.0 delay 0.2 noselect   # as root, gpsd uses unit 0
+```
+
+Drop `noselect` once it agrees with your other sources. A Unix socket would
+not do this job: gpsd cannot read a GPS from one, and chrony's own SOCK
+refclock has chrony create the socket rather than connect to ours.
+
+**How exact it is.** Only the arrival of the sentence carries the second, so
+it is sent as close to the second as the thread can make it. It waits on the
+sockets to within a millisecond, then spins, at the NTP replies' real-time
+priority where the host allows it. The lateness is a few microseconds and is
+shown on the status page and in `/api/status` under `nmea_tcp.late_us`. On the
+loopback gpsd sees each sentence within a fraction of a millisecond of the
+second; across a LAN, the LAN's own jitter adds to that. gpsd treats NMEA time
+without a PPS line as coarse either way, and chrony's `offset` takes out any
+constant part. For real edge timing use the serial [1PPS output](#1pps-output).
+
+```jsonc
+"nmea_tcp": {
+  "enabled": true,
+  "port": 10110,
+  "sentences": ["rmc", "zda"], // either or both, in the order sent
+  "max_clients": 16,
+  "listen": ["0.0.0.0", "::"]  // every interface, like NTP
+  // "latitude": 51.5, "longitude": -0.12
+}
+```
+
+It is read-only: anything a client sends is ignored. A client that stops
+reading is dropped once its small send buffer fills, and connections past
+`max_clients` are closed at once. Neither can hold the service up. **In
+Docker**, `install.sh` publishes 10110/tcp on the host when nothing else there
+has it, as it does for NTP. An existing install gets it with
+`./install.sh --force-update`.
 
 ## What is in here from elsewhere
 
