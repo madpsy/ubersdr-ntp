@@ -120,7 +120,7 @@ void usage() {
         "      --http-listen ADDR   Status service bind address (default 0.0.0.0, all interfaces)\n"
         "      --log-file FILE      Also write the log, and the periodic status block, here\n"
         "      --log-level LEVEL    trace, debug, info (default), warn, error\n"
-        "      --status-interval N  Seconds between status blocks, 0 to disable (default 30)\n"
+        "      --status-interval N  Seconds between status blocks, 0 to disable (default 0)\n"
         "      --quiet              Do not log to stderr (use with --log-file)\n"
         "\n"
         "Other:\n"
@@ -746,8 +746,7 @@ int main(int argc, char** argv) {
         }
 
         // A change in whether time is being served at all is worth a line of
-        // its own, immediately, rather than waiting up to thirty seconds for
-        // the next block.
+        // its own, immediately, whether or not a periodic block is configured.
         if (c.synchronised != lastSync) {
             lastSync = c.synchronised;
             StatusInput in = statusInput();

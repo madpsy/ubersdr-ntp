@@ -394,7 +394,7 @@ struct LogConfig {
     std::string file;                  // empty: no file
     LogLevel level = LogLevel::Info;
     bool stderrEnabled = true;
-    double statusIntervalSeconds = 30.0;  // 0 disables the periodic status block
+    double statusIntervalSeconds = 0.0;   // 0 (the default) disables the periodic status block
 };
 
 struct Config {

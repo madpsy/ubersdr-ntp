@@ -1125,9 +1125,9 @@ rather than making it wait for a timeout. That is what a real refclock does.
 
 ## Watching it
 
-With `log.file` set, the log carries one line per state change plus a detailed
-per-source block every `status_interval_seconds` — which is how you see what
-each source is doing under systemd with no terminal:
+The log carries one line per state change. For a detailed per-source block as
+well, set `log.status_interval_seconds` (off by default, as it runs to twenty
+lines or more each time), or send `SIGUSR1` for one on demand:
 
 ```
 clock: primary is radio (2 candidate(s)), ntp is standby (2 candidate(s))

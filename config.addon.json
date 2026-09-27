@@ -527,17 +527,17 @@
   // To stderr, which the compose file sends to the receiver's log collector.
   // LOG_LEVEL in the compose file overrides the level.
   //
-  // With a file set, the same lines go to stderr and to the file, PLUS a
-  // detailed per-source status block every status_interval_seconds (0 turns
-  // it off) -- which is how you see what each source is doing when this runs
-  // in the background with no terminal. SIGHUP reopens the file, for
-  // logrotate. SIGUSR1 writes a block at once.
+  // With a file set, the same lines go to stderr and to the file. Set
+  // status_interval_seconds to add a detailed multi-line per-source status
+  // block that often; 0 (the default) leaves it out, since the status page
+  // shows the same and the block buries the state-change lines. SIGHUP
+  // reopens the file, for logrotate. SIGUSR1 writes a block at once.
   // =====================================================================
   "log": {
     // trace, debug, info, warn or error.
     "level": "info",
     "stderr": true,
-    "status_interval_seconds": 30
+    "status_interval_seconds": 0
 
     // , "file": ""
   }
