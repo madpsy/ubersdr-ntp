@@ -150,7 +150,13 @@ struct SourceSnapshot {
     int reacquisitions = 0;         // times the consensus sent it back to start over
     double httpRttMs = 0.0;
     std::string receiverName;       // from /api/description
+    std::string receiverCallsign;   // the same, for the page's map
+    std::string receiverPlace;      // its "location": a place name, not coordinates
     GeoPoint receiverLocation;
+    // The transmitter the delay model takes this source to be hearing, and a
+    // name for it; invalid while a 60 kHz source has not decided MSF or WWVB.
+    GeoPoint transmitterLocation;
+    std::string transmitterSite;
 
     // audio
     int sampleRate = 0;

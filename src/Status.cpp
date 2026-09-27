@@ -751,6 +751,12 @@ json statusJson(const StatusInput& in) {
     }
     j["http"] = std::move(http);
 
+    // Where this station is, for the status page's map: null when neither the
+    // configuration nor a receiver on this host says.
+    j["location"] = in.location.valid
+        ? json({{"lat", in.location.lat}, {"lon", in.location.lon}, {"from", in.locationFrom}})
+        : json(nullptr);
+
     json arr = json::array();
     for (const SourceSnapshot& s : in.sources) arr.push_back(sourceJson(s, in.combined));
     j["sources"] = std::move(arr);
@@ -774,6 +780,8 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     o["ready"] = s.ready;
     o["not_ready_reason"] = s.notReadyReason;
     o["receiver_name"] = s.receiverName;
+    o["receiver_callsign"] = s.receiverCallsign;
+    o["receiver_location"] = s.receiverPlace;
     o["carrier_hz"] = s.carrierHz;
     o["dial_hz"] = s.dialHz;
     o["min_margin_db"] = s.minMarginDb;
@@ -949,6 +957,10 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
     if (s.receiverLocation.valid) {
         d["receiver_lat"] = s.receiverLocation.lat;
         d["receiver_lon"] = s.receiverLocation.lon;
+    }
+    if (s.transmitterLocation.valid) {
+        d["transmitter"] = {{"site", s.transmitterSite}, {"lat", s.transmitterLocation.lat},
+                            {"lon", s.transmitterLocation.lon}};
     }
     o["delay"] = std::move(d);
 

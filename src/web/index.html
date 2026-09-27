@@ -38,19 +38,75 @@ h1 span { color:var(--muted); font-weight:400; }
 .now .frac { color:var(--muted); font-size:.45em; }
 .date { color:var(--muted); font-size:13px; margin-top:6px; }
 .linknote { margin-top:10px; }
+/* The clocks on the left, the map on the right; the map drops below them
+   when the two no longer fit side by side, and is not there at all when
+   nothing has a position. */
+.clockhead { display:grid; gap:16px 28px; align-items:stretch;
+  grid-template-columns:minmax(0,1fr) minmax(280px,400px); }
+.clockhead.nomap { grid-template-columns:minmax(0,1fr); }
+@media (max-width:860px) { .clockhead { grid-template-columns:minmax(0,1fr); } }
 /* The viewer's own clock, set apart from the two times above so it cannot be
    read as the server's: it is a statement about the machine in front of them. */
-/* Its basis is a minimum, not its one-line width: a flex item's default basis
-   is its max-content, so the long note alone pushed the whole section onto a
-   row of its own. Given a small basis it takes whatever the row has left
-   beside Local time, and wraps its own text to fit. */
-.devclock { align-self:stretch; display:flex; flex-direction:column; justify-content:flex-end;
-  flex:1 1 220px; min-width:0; padding-left:22px; border-left:1px solid var(--line); }
-.devfig { margin-top:8px; }
-.devfig .pill { font:600 clamp(18px,4.2vw,26px)/1.2 var(--mono); padding:4px 14px; border-radius:10px;
+.devclock { margin-top:14px; padding-top:12px; border-top:1px solid var(--line);
+  display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; }
+.devclock .date { margin-top:0; flex:1 1 200px; min-width:0; }
+.devfig .pill { font:600 clamp(16px,3.6vw,22px)/1.2 var(--mono); padding:3px 12px; border-radius:10px;
   text-transform:none; letter-spacing:-.01em; font-variant-numeric:tabular-nums;
   white-space:normal; max-width:100%; }
-@media (max-width:560px) { .devclock { padding-left:0; border-left:0; } }
+
+/* The map: the look of UberSDR's v2 start overlay -- OpenStreetMap tiles,
+   darkened by the same filter for a dark page, and glowing dots. */
+.minimap { display:flex; flex-direction:column; gap:6px; min-width:0; }
+.minimap[hidden] { display:none; }
+.mapcanvas { flex:1 1 auto; min-height:200px; border:1px solid var(--line); border-radius:7px;
+  overflow:hidden; isolation:isolate; user-select:none; -webkit-user-select:none;
+  background:color-mix(in srgb,var(--line) 55%,var(--panel)); font:inherit; }
+@media (prefers-color-scheme: dark) {
+  .mapcanvas .leaflet-tile {
+    filter:brightness(0.7) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.7); }
+}
+.mapcanvas .leaflet-control-attribution { font-size:9px; background:color-mix(in srgb,var(--panel) 75%,transparent);
+  color:var(--muted); }
+.mapcanvas .leaflet-control-attribution a { color:var(--muted); }
+.mapcanvas .leaflet-bar a { background:var(--panel); color:var(--ink); border-bottom-color:var(--line); }
+.leaflet-tooltip.maptip { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+  box-shadow:0 2px 8px rgba(0,0,0,.2); font-size:11px; padding:1px 6px; border-radius:5px; }
+.leaflet-tooltip.maptip::before { display:none; }
+.leaflet-tooltip.maptip .src { font:10.5px/1.45 var(--mono); font-variant-numeric:tabular-nums; }
+.leaflet-tooltip.maptip .who { color:var(--muted); }
+.leaflet-tooltip.maptip .st { font-weight:600; background:none; }
+.maplegend { display:flex; flex-wrap:wrap; gap:2px 12px; font-size:11px; color:var(--muted); }
+/* The paths, in the signal path's own language (flow.js): the radio hop's
+   blue, dashes flowing toward the instance, dashed while standing by, dotted
+   red when nothing is heard, and quicker and bolder while in the served time. */
+.mapcanvas path.mp-glow, .mapcanvas path.mp-line, .mapcanvas path.mp-flow { fill:none; stroke:#38bdf8; }
+.mapcanvas path.mp-glow { stroke-width:7; stroke-opacity:.12; }
+.mapcanvas path.mp-line { stroke-width:1.5; stroke-opacity:.6; }
+.mapcanvas path.mp-flow { stroke-width:2.6; stroke-dasharray:3 8; stroke-linecap:round; stroke-opacity:.95;
+  animation:mp-dash .6s linear infinite; }
+.mapcanvas path.is-standby { stroke:#38bdf8; }
+.mapcanvas path.mp-line.is-standby { stroke-dasharray:5 5; stroke-opacity:.45; }
+.mapcanvas path.mp-glow.is-standby { stroke-opacity:.04; }
+.mapcanvas path.mp-flow.is-standby { stroke-width:2; stroke-dasharray:2 10; stroke-opacity:.35; animation-duration:2.2s; }
+.mapcanvas path.is-down { stroke:#fb7185; }
+.mapcanvas path.mp-line.is-down { stroke-dasharray:1.5 5; stroke-opacity:.6; }
+.mapcanvas path.mp-glow.is-down, .mapcanvas path.mp-flow.is-down { display:none; }
+@keyframes mp-dash { to { stroke-dashoffset:-11; } }
+@media (prefers-reduced-motion: reduce) { .mapcanvas path.mp-flow { animation:none; } }
+.leaflet-tooltip.mp-chip { --c:#38bdf8; background:color-mix(in srgb,var(--panel) 88%,transparent); color:var(--c);
+  border:1px solid color-mix(in srgb,var(--c) 45%,transparent); border-radius:99px; box-shadow:none;
+  font:600 9.5px/1 var(--mono); font-variant-numeric:tabular-nums; padding:3px 6px; }
+.leaflet-tooltip.mp-chip::before { display:none; }
+.leaflet-tooltip.mp-chip.is-standby { opacity:.75; }
+.leaflet-tooltip.mp-chip.is-down { --c:#fb7185; opacity:.75; }
+@media (prefers-color-scheme: light) { .leaflet-tooltip.mp-chip { --c:#0369a1; }
+  .leaflet-tooltip.mp-chip.is-down { --c:#be123c; } }
+.maplegend .mk::before { content:""; display:inline-block; width:16px; height:0; vertical-align:middle;
+  margin-right:5px; border-top:2px solid #38bdf8; }
+.maplegend .mk.standby::before { border-top-style:dashed; opacity:.6; }
+.maplegend .mk.down::before { border-top:2px dotted #fb7185; }
+.maplegend i { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px;
+  vertical-align:0; }
 .tickdot { width:9px; height:9px; border-radius:50%; background:var(--ok);
   transition:opacity .12s; opacity:.25; margin-bottom:14px; }
 .tickdot.on { opacity:1; }
@@ -225,27 +281,37 @@ tr.fresh td { animation:fresh 4s ease-out; }
   </div>
 
   <div class="card" id="clockcard">
-    <div class="clocks">
+    <div class="clockhead nomap" id="clockhead">
       <div>
-        <div class="label">Broadcast time (UTC)</div>
-        <div class="clock">
-          <div class="now" id="now">--:--:--</div>
-          <div class="tickdot" id="dot"></div>
+        <div class="clocks">
+          <div>
+            <div class="label">Broadcast time (UTC)</div>
+            <div class="clock">
+              <div class="now" id="now">--:--:--</div>
+              <div class="tickdot" id="dot"></div>
+            </div>
+            <div class="date" id="date">&nbsp;</div>
+          </div>
+          <div>
+            <div class="label" id="loclabel">Local time</div>
+            <div class="clock"><div class="now local" id="lnow">--:--:--</div></div>
+            <div class="date" id="ldate">&nbsp;</div>
+          </div>
         </div>
-        <div class="date" id="date">&nbsp;</div>
+        <div class="devclock" id="devclock">
+          <div class="label">Your device's clock</div>
+          <div class="devfig"><span class="pill dim" id="devpill">measuring…</span></div>
+          <div class="date" id="devnote">the computer or phone showing this page</div>
+        </div>
+        <div class="note linknote" id="linknote">&nbsp;</div>
       </div>
-      <div>
-        <div class="label" id="loclabel">Local time</div>
-        <div class="clock"><div class="now local" id="lnow">--:--:--</div></div>
-        <div class="date" id="ldate">&nbsp;</div>
-      </div>
-      <div class="devclock" id="devclock">
-        <div class="label">Your device's clock</div>
-        <div class="devfig"><span class="pill dim" id="devpill">measuring…</span></div>
-        <div class="date" id="devnote">the computer or phone showing this page</div>
+      <!-- Filled in by the map code below from the full status; Leaflet is
+           fetched only once there is something to put on it. -->
+      <div class="minimap" id="minimap" hidden>
+        <div class="mapcanvas" id="mapcanvas"></div>
+        <div class="maplegend" id="maplegend"></div>
       </div>
     </div>
-    <div class="note linknote" id="linknote">&nbsp;</div>
     <div class="grid">
       <div><div class="label">Status</div><div id="syncpill" style="margin-top:6px"></div>
         <div class="note" id="syncnote"></div></div>
@@ -430,6 +496,16 @@ function dur(s) {
   if (s < 5400) return (s / 60).toFixed(0) + "m";
   if (s < 172800) return (s / 3600).toFixed(1) + "h";
   return (s / 86400).toFixed(1) + "d";
+}
+// How far along a radio source is, in one word or two.
+function sourceStage(s) {
+  return s.state === "locked" ? "locked"
+    : s.link !== "streaming" ? "no audio"
+    : !s.tone_detected ? "no tick"
+    : !s.phase_locked ? "no edge"
+    : !s.anchored ? "no frame"
+    : s.refusal !== "none" ? s.refusal
+    : s.frames_in_window < 2 ? "voting" : "waiting";
 }
 function stageTone(stage, state) {
   if (state === "locked") return "ok";
@@ -1201,13 +1277,7 @@ function onTick(d) {
   }).join("");
 
   $("rows").innerHTML = radio.map((s) => {
-    const stage = s.state === "locked" ? "locked"
-      : s.link !== "streaming" ? "no audio"
-      : !s.tone_detected ? "no tick"
-      : !s.phase_locked ? "no edge"
-      : !s.anchored ? "no frame"
-      : s.refusal !== "none" ? s.refusal
-      : s.frames_in_window < 2 ? "voting" : "waiting";
+    const stage = sourceStage(s);
     const votePct = s.window_size ? 100 * s.frames_in_window / s.window_size : 0;
     return "<tr>" +
       '<td class="name">' + esc(s.name) +
@@ -2169,6 +2239,359 @@ document.addEventListener("visibilitychange", () => { if (!document.hidden) fetc
 let es = null, lastEventAt = Date.now(), retryDelay = 1000, retryTimer = 0;
 const kStaleMs = 10000, kRetryMaxMs = 30000;
 
+// ---------------------------------------------------------------------------
+// The map: this station, the receivers its radio sources listen through, and
+// the transmitters they hear, with the path between each receiver and its
+// transmitter. Drawn as UberSDR's v2 start overlay draws its map (StartMap.jsx):
+// OpenStreetMap tiles, glowing dots, a blue line between them.
+//
+// Leaflet is served by this daemon beside the page (relative, so it works
+// behind the receiver's addon proxy too) and fetched only once the status has
+// a position in it. The tiles come from OpenStreetMap; with no route out the
+// dots and paths are still drawn, on a blank ground.
+const MapView = (() => {
+  let L = null, map = null, layer = null, loading = null;
+  let drawnKey = "", fittedKey = "", txMarkers = [], pathEls = [];
+
+  function loadLeaflet() {
+    if (loading) return loading;
+    loading = new Promise((resolve, reject) => {
+      const css = document.createElement("link");
+      css.rel = "stylesheet"; css.href = "leaflet.css";
+      document.head.appendChild(css);
+      const js = document.createElement("script");
+      js.src = "leaflet.js";
+      js.onload = () => window.L ? resolve(window.L) : reject(new Error("no Leaflet"));
+      js.onerror = () => { loading = null; reject(new Error("Leaflet did not load")); };
+      document.head.appendChild(js);
+    });
+    return loading;
+  }
+
+  const km = (a, b) => {
+    const r = Math.PI / 180, dLat = (b.lat - a.lat) * r, dLon = (b.lon - a.lon) * r;
+    const h = Math.sin(dLat / 2) ** 2 + Math.cos(a.lat * r) * Math.cos(b.lat * r) * Math.sin(dLon / 2) ** 2;
+    return 12742 * Math.asin(Math.min(1, Math.sqrt(h)));
+  };
+  const coordKey = (lat, lon) => lat.toFixed(2) + "," + lon.toFixed(2);
+  const near = (a, b) => a && b && Math.abs(a.lat - b.lat) < 0.02 && Math.abs(a.lon - b.lon) < 0.02;
+
+  // What the status says is where, grouped by place: WWV and WWVB share a
+  // site, and several sources usually share an instance. Each source may be
+  // on a different UberSDR instance; each is its own marker, labelled with
+  // its callsign, with a path to every transmitter heard through it.
+  function scene(d) {
+    const here = d.location && isFinite(d.location.lat) ? d.location : null;
+    const tx = new Map(), rx = new Map(), paths = new Map();
+    for (const s of d.sources || []) {
+      if (s.kind === "ntp" || !s.delay) continue;
+      const t = s.delay.transmitter;
+      const r = s.delay.receiver_lat != null
+        ? { lat: s.delay.receiver_lat, lon: s.delay.receiver_lon } : null;
+      if (t) {
+        const k = coordKey(t.lat, t.lon);
+        const e = tx.get(k) || { lat: t.lat, lon: t.lon, names: [], sites: [], sources: [], used: false };
+        const name = String(t.site).split(",")[0];
+        if (!e.names.includes(name)) e.names.push(name);
+        if (!e.sites.includes(t.site)) e.sites.push(t.site);
+        e.sources.push(s.name);
+        e.via = (e.via || []).concat([{ name: s.name, call: s.receiver_callsign || s.name,
+          km: s.delay.receiver_lat != null
+            ? Math.round(km({ lat: s.delay.receiver_lat, lon: s.delay.receiver_lon }, t)) : null,
+          flight: s.delay.propagation_ms || null }]);
+        e.used = e.used || !!s.in_use;
+        tx.set(k, e);
+      }
+      if (r) {
+        const k = coordKey(r.lat, r.lon);
+        const e = rx.get(k) || { lat: r.lat, lon: r.lon, calls: [], names: [], places: [], sources: [],
+                                 used: false, here: near(r, here) };
+        const call = s.receiver_callsign || "";
+        // receiver_name carries the callsign in brackets; the label has it already.
+        const name = String(s.receiver_name || "").replace(/\s*\([^()]*\)$/, "");
+        if (call && !e.calls.includes(call)) e.calls.push(call);
+        if (name && !e.names.includes(name)) e.names.push(name);
+        if (s.receiver_location && !e.places.includes(s.receiver_location)) e.places.push(s.receiver_location);
+        e.sources.push(s.name);
+        e.used = e.used || !!s.in_use;
+        rx.set(k, e);
+      }
+      if (r && t) {
+        const k = coordKey(r.lat, r.lon) + ">" + coordKey(t.lat, t.lon);
+        const e = paths.get(k) || { from: r, to: t, used: false, names: [],
+          // What the propagation model assumed, as the signal path labels it.
+          ground: /groundwave/.test(s.delay.path || ""), flight: s.delay.propagation_ms || 0 };
+        e.names.push(s.name);
+        e.used = e.used || !!s.in_use;
+        paths.set(k, e);
+      }
+    }
+    return { here, tx: [...tx.values()], rx: [...rx.values()], paths: [...paths.values()] };
+  }
+
+  // The great circle between two points, with its longitudes unwrapped so a
+  // path over the antimeridian is drawn across it rather than back round the
+  // world.
+  function greatCircle(a, b, n = 48) {
+    const rad = Math.PI / 180;
+    const p1 = [a.lat * rad, a.lon * rad], p2 = [b.lat * rad, b.lon * rad];
+    const v = (p) => [Math.cos(p[0]) * Math.cos(p[1]), Math.cos(p[0]) * Math.sin(p[1]), Math.sin(p[0])];
+    const A = v(p1), B = v(p2);
+    const w = Math.acos(Math.min(1, Math.max(-1, A[0] * B[0] + A[1] * B[1] + A[2] * B[2])));
+    if (w < 1e-6) return [[a.lat, a.lon], [b.lat, b.lon]];
+    const out = [];
+    let prev = null;
+    for (let i = 0; i <= n; i++) {
+      const f = i / n, s1 = Math.sin((1 - f) * w) / Math.sin(w), s2 = Math.sin(f * w) / Math.sin(w);
+      const x = s1 * A[0] + s2 * B[0], y = s1 * A[1] + s2 * B[1], z = s1 * A[2] + s2 * B[2];
+      let lon = Math.atan2(y, x) / rad;
+      const lat = Math.atan2(z, Math.hypot(x, y)) / rad;
+      if (prev != null) while (lon - prev > 180) lon -= 360;
+      if (prev != null) while (prev - lon > 180) lon += 360;
+      out.push([lat, lon]);
+      prev = lon;
+    }
+    return out;
+  }
+
+  const dot = (size, colour) => L.divIcon({
+    className: "",
+    html: '<div style="width:' + size + "px;height:" + size + "px;background:" + colour +
+      ";border:2px solid rgba(255,255,255,0.9);border-radius:50%;box-shadow:0 0 10px " +
+      colour + ';"></div>',
+    iconSize: [size, size],
+    iconAnchor: [size / 2, size / 2],
+  });
+
+  const kHere = "#ff0000";
+  const kLine = "#007bff";
+
+  function draw(sc) {
+    const ok = cssVar("--ok"), idle = cssVar("--muted"), accent = cssVar("--accent");
+    if (layer) layer.remove();
+    layer = L.layerGroup().addTo(map);
+    const offsets = { top: [0, -6], bottom: [0, 6], left: [-6, 0], right: [6, 0] };
+    const tip = (permanent, dir = "top") => ({ permanent: !!permanent, direction: dir,
+                                               offset: offsets[dir], className: "maptip" });
+    // A transmitter's label, which is the wide one, opens on the side away
+    // from its path, so it does not sit on the line it is labelling: above or
+    // below a path that leaves sideways, beside one that leaves up or down.
+    const px = (q) => map.latLngToContainerPoint(Array.isArray(q) ? q : [q.lat, q.lon]);
+    const side = (t) => {
+      const p = sc.paths.find((q) => q.to.lat === t.lat && q.to.lon === t.lon);
+      if (!p) return "bottom";
+      // A few steps along the great circle, not the far end: it is the
+      // direction the line leaves the dot in that matters.
+      const a = px(t), b = px(greatCircle(p.to, p.from, 12)[2]);
+      const dx = b.x - a.x, dy = b.y - a.y;
+      return Math.abs(dx) >= Math.abs(dy) ? (dy > 0 ? "top" : "bottom") : (dx > 0 ? "left" : "right");
+    };
+    // The detail on hover, as a title: the permanent tooltip is the label.
+    const titled = (m, text) => { const el = m.getElement(); if (el) el.title = text; return m; };
+
+    // Each path as the signal path draws its radio hop: a glow, a line, and
+    // dashes flowing from the transmitter to the instance, restyled by state
+    // on every tick (see tick below). Drawn transmitter-first so the flow runs
+    // the way the signal does.
+    pathEls = [];
+    for (const p of sc.paths) {
+      const ll = greatCircle(p.to, p.from);
+      const parts = ["glow", "line", "flow"].map((c) =>
+        L.polyline(ll, { className: "mp-" + c, interactive: false }).addTo(layer));
+      const mid = ll[ll.length >> 1];
+      // No chip on a path too short on screen to carry one: it would sit on
+      // the dots at either end.
+      const long = px(p.from).distanceTo(px(p.to)) > 60;
+      const chip = p.flight > 0 && long
+        ? L.tooltip({ permanent: true, direction: "center", className: "mp-chip", interactive: false })
+            .setLatLng(mid)
+            .setContent((p.ground ? "ground " : "sky ") + p.flight.toFixed(p.flight < 10 ? 2 : 1) + " ms")
+            .addTo(layer)
+        : null;
+      pathEls.push({ p, parts, chip });
+    }
+    txMarkers = [];
+    for (const t of sc.tx) {
+      const m = L.marker([t.lat, t.lon], { icon: dot(12, t.used ? ok : idle) }).addTo(layer)
+        .bindTooltip(txLabel(t), tip(true, side(t)));
+      txMarkers.push({ m, t });
+      titled(m, txTitle(t));
+    }
+    // An instance at this station's own position is this station: one red dot,
+    // with the instance's callsign on it.
+    let hereDrawn = false;
+    for (const r of sc.rx) {
+      const isHere = r.here;
+      hereDrawn = hereDrawn || isHere;
+      const m = L.marker([r.lat, r.lon], { icon: dot(isHere ? 14 : 11, isHere ? kHere : accent),
+                                           zIndexOffset: isHere ? 1000 : 500 }).addTo(layer)
+        .bindTooltip("<b>" + esc(r.calls.join(" / ") || r.names[0] || "UberSDR") + "</b>" +
+                     (r.places.length ? "<br>" + esc(r.places.join("; ")) : "") +
+                     '<br><span class="who">' + esc(r.sources.join(", ")) + "</span>", tip(false));
+      titled(m, (isHere ? "This station\n" : "") + (r.names.join("; ") || "UberSDR instance") +
+                (r.places.length ? "\n" + r.places.join("; ") : "") +
+                "\nsources: " + r.sources.join(", "));
+    }
+    if (sc.here && !hereDrawn) {
+      const m = L.marker([sc.here.lat, sc.here.lon], { icon: dot(14, kHere), zIndexOffset: 1000 }).addTo(layer)
+        .bindTooltip("this station", tip(true));
+      titled(m, "This station, " + sc.here.lat.toFixed(3) + ", " + sc.here.lon.toFixed(3) +
+                (sc.here.from ? "\nposition from " + sc.here.from : ""));
+    }
+
+    declutter();
+    const key = (colour, text) => '<span><i style="background:' + colour + '"></i>' + text + "</span>";
+    $("maplegend").innerHTML =
+      (sc.here ? key(kHere, "this station") : "") +
+      (sc.rx.some((r) => !r.here) ? key(accent, "UberSDR instance") : "") +
+      '<span class="mk live">in the served time</span><span class="mk standby">standby</span>' +
+      '<span class="mk down">not heard</span>';
+    restyle();
+  }
+
+  // Transmitters a few hundred km apart share a few pixels at this scale, and
+  // their labels land on each other or off the edge of the map. Each label, in
+  // turn, takes the side that overlaps least of the labels already placed and
+  // of the world outside the box; its own side (away from its path) wins ties.
+  function declutter() {
+    const offsets = { top: [0, -6], bottom: [0, 6], left: [-6, 0], right: [6, 0] };
+    const box = $("mapcanvas").getBoundingClientRect();
+    const placed = [];
+    const area = (a, b) => Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left)) *
+                           Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+    const cost = (r) => placed.reduce((n, p) => n + area(r, p), 0) +
+                        (r.width * r.height - area(r, box)) * 2;
+    const set = (tt, dir) => { tt.options.direction = dir; tt.options.offset = offsets[dir]; tt.update(); };
+    for (const { m } of txMarkers) {
+      const tt = m.getTooltip();
+      if (!tt || !tt.getElement()) continue;
+      const own = tt._ownSide || (tt._ownSide = tt.options.direction);
+      let best = own, bestCost = Infinity;
+      for (const dir of [own, "bottom", "top", "right", "left"]) {
+        set(tt, dir);
+        const c = cost(tt.getElement().getBoundingClientRect());
+        if (c < bestCost) { best = dir; bestCost = c; }
+        if (c === 0) break;
+      }
+      set(tt, best);
+      placed.push(tt.getElement().getBoundingClientRect());
+    }
+  }
+
+  // A source's part in the served time, as the signal path has it: in it,
+  // measured and waiting, or neither. A path or a transmitter takes the best
+  // of the sources on it.
+  const rank = { down: 0, standby: 1, live: 2 };
+  function stateOf(names) {
+    let best = "down";
+    for (const n of names) {
+      const s = live[n];
+      if (!s) continue;
+      const st = s.in_use ? "live" : (s.ready || s.have_offset) ? "standby"
+        : s.link === "streaming" && s.tone_detected ? "standby" : "down";
+      if (rank[st] > rank[best]) best = st;
+    }
+    return best;
+  }
+  function restyle() {
+    const tone = { live: cssVar("--ok"), standby: cssVar("--warn"), down: cssVar("--bad") };
+    for (const { p, parts, chip } of pathEls) {
+      const st = stateOf(p.names);
+      for (const part of parts) {
+        const el = part.getElement();
+        if (el) el.setAttribute("class", el.getAttribute("class").replace(/\s*is-\w+/g, "") + " is-" + st);
+      }
+      const el = chip && chip.getElement();
+      if (el) { el.classList.remove("is-live", "is-standby", "is-down"); el.classList.add("is-" + st); }
+    }
+    for (const { m, t } of txMarkers) {
+      const el = m.getElement(), d = el && el.firstChild;
+      if (!d) continue;
+      const c = tone[stateOf(t.sources)];
+      d.style.background = c; d.style.boxShadow = "0 0 10px " + c;
+    }
+  }
+
+  // A transmitter's label: its name, and for each source hearing it how far
+  // along it is, its offset and its tick SNR -- from the per-second tick, so
+  // it is live. Which instance, how far and how long the flight are on hover.
+  function txLabel(t) {
+    const lines = t.via.map((v) => {
+      const s = live[v.name];
+      if (!s) return "";
+      const stage = sourceStage(s);
+      const bits = ['<span class="st ' + stageTone(stage, s.state) + '">' + esc(stage) + "</span>"];
+      if (s.have_offset) bits.push(signed(s.offset_ms));
+      if (s.tone_detected) bits.push(s.tone_snr_db.toFixed(0) + " dB");
+      return (t.via.length > 1 ? '<span class="who">' + esc(v.call) + "</span> " : "") + bits.join(" · ");
+    }).filter(Boolean);
+    const name = "<b>" + esc(t.names.join(" + ")) + "</b>";
+    return lines.length === 1 ? name + ' <span class="src">' + lines[0] + "</span>"
+      : name + lines.map((l) => '<div class="src">' + l + "</div>").join("");
+  }
+  function txTitle(t) {
+    return t.sites.join("; ") + t.via.map((v) => "\n" + v.call + " (" + v.name + ")" +
+      (v.km != null ? ": " + v.km.toLocaleString() + " km" : "") +
+      (v.flight ? ", " + v.flight.toFixed(1) + " ms in flight" : "")).join("") +
+      (t.used ? "" : "\nnot in the served time");
+  }
+  // Live figures by source name, from the tick.
+  let live = {};
+  function tick(d) {
+    live = {};
+    for (const s of d.sources || []) live[s.name] = s;
+    let changed = false;
+    txMarkers.forEach(({ m, t }) => {
+      const html = txLabel(t);
+      if (html !== m._lastLabel) { m._lastLabel = html; m.setTooltipContent(html); changed = true; }
+    });
+    // A label that changed width may now overlap its neighbour.
+    if (changed) declutter();
+    restyle();
+  }
+
+  function fit(sc) {
+    const pts = [];
+    if (sc.here) pts.push([sc.here.lat, sc.here.lon]);
+    for (const r of sc.rx) pts.push([r.lat, r.lon]);
+    for (const t of sc.tx) pts.push([t.lat, t.lon]);
+    for (const p of sc.paths) for (const q of greatCircle(p.from, p.to, 16)) pts.push(q);
+    if (pts.length === 1) map.setView(pts[0], 5);
+    else map.fitBounds(L.latLngBounds(pts), { padding: [34, 34], maxZoom: 6 });
+  }
+
+  async function status(d) {
+    const sc = scene(d);
+    const any = sc.here || sc.rx.length || sc.tx.length;
+    $("minimap").hidden = !any;
+    $("clockhead").classList.toggle("nomap", !any);
+    if (!any) return;
+    try { L = await loadLeaflet(); } catch (e) { $("minimap").hidden = true; $("clockhead").classList.add("nomap"); return; }
+    if (!map) {
+      map = L.map($("mapcanvas"), { scrollWheelZoom: false, worldCopyJump: false, minZoom: 1,
+                                    attributionControl: true });
+      map.attributionControl.setPrefix(false);
+      L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+        maxZoom: 19,
+        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
+      }).addTo(map);
+      // The canvas can change size without the window doing so: the map
+      // moving under the clocks, or the clocks' own height changing.
+      if (window.ResizeObserver) new ResizeObserver(() => map.invalidateSize()).observe($("mapcanvas"));
+    }
+    // Redrawn only when something on it changed; refitted only when the places
+    // did, so a reader's pan or zoom is not undone every five seconds.
+    const places = JSON.stringify([sc.here && [sc.here.lat, sc.here.lon],
+      sc.rx.map((r) => [r.lat, r.lon]), sc.tx.map((t) => [t.lat, t.lon])]);
+    const key = JSON.stringify(sc);
+    // Fitted first: a permanent tooltip cannot be placed on a map with no view.
+    if (places !== fittedKey) { fittedKey = places; fit(sc); }
+    if (key !== drawnKey) { drawnKey = key; draw(sc); }
+  }
+
+  return { status, tick };
+})();
+
 function showLink(ok, text) {
   $("linkpill").className = "pill " + (ok ? "ok" : "bad");
   $("linkpill").textContent = text;
@@ -2206,6 +2629,7 @@ function connect() {
     try { onTick(d); } catch (x) {}
     try { eventsOnTick(d); } catch (x) {}
     try { Flow.tick(d); } catch (x) {}
+    try { MapView.tick(d); } catch (x) {}
     try {
       const order = (d.sources || []).map((x) => x.name);
       if (order.join("\n") !== sourceOrder.join("\n")) { sourceOrder = order; renderMetrics(); }
@@ -2217,6 +2641,7 @@ function connect() {
     try { d = JSON.parse(e.data); } catch (x) { return; }
     try { onStatus(d); } catch (x) {}
     try { Flow.status(d); } catch (x) {}
+    MapView.status(d).catch(() => {});
   });
   s.addEventListener("error", () => {
     if (s !== es) return;

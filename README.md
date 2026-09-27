@@ -1646,7 +1646,9 @@ three stations and checks every timestamp and edge against the truth.
 `third_party/pcm_v4.hpp` is shared verbatim with `ka9q_ubersdr/clients` — keep it
 in step with the copies there.
 
-`third_party/IXWebSocket` and `third_party/json.hpp` are vendored as-is.
+`third_party/IXWebSocket`, `third_party/json.hpp` and `third_party/leaflet`
+(Leaflet 1.9.4, for the status page's map; served from the binary) are vendored
+as-is.
 
 Format facts throughout are per NIST SP 432 (WWV/WWVH), NIST SP 250-67
 (WWVB), and PTB's DCF77 time-code and phase-modulation pages (DCF77).

@@ -60,6 +60,8 @@ constexpr double kFullStatusEverySec = 5.0;
 constexpr int kRequestTimeoutMs = 5000;
 
 #include "IndexHtml.inc"
+#include "LeafletCss.inc"
+#include "LeafletJs.inc"
 
 // Replace, not the strict default: strings in these documents include bytes
 // that came off the network unvalidated (a source's link detail is
@@ -89,13 +91,15 @@ bool writeAll(int fd, const std::string& s) { return writeAll(fd, s.data(), s.si
 
 std::string httpResponse(int code, const char* description, const char* contentType,
                          const std::string& body, bool headOnly,
-                         const char* extraHeader = nullptr) {
+                         const char* extraHeader = nullptr,
+                         const char* cacheControl = "no-store") {
     std::ostringstream o;
     o << "HTTP/1.1 " << code << ' ' << description << "\r\n"
       << "Content-Type: " << contentType << "\r\n"
       << "Content-Length: " << body.size() << "\r\n"
       // Nothing here is ever worth caching: every response is a measurement.
-      << "Cache-Control: no-store\r\n"
+      // The one exception is Leaflet, which only changes with the binary.
+      << "Cache-Control: " << cacheControl << "\r\n"
       // A browser-based client on another origin — a dashboard, a page somebody
       // wrote — should be able to read this. It is public, read-only measurement
       // data with no credentials attached, so a permissive policy leaks nothing.
@@ -647,6 +651,15 @@ void HttpApi::serveConnection(int fd) {
     if (path == "/" || path == "/index.html") {
         writeAll(fd, httpResponse(200, "OK", "text/html; charset=utf-8",
                                   kIndexHtml, headOnly));
+        return;
+    }
+
+    // The map's library. An hour's cache, not a year's: it is only ever
+    // replaced by an upgrade, and a stale copy after one would last no longer.
+    if (path == "/leaflet.js" || path == "/leaflet.css") {
+        const bool js = path == "/leaflet.js";
+        writeAll(fd, httpResponse(200, "OK", js ? "text/javascript; charset=utf-8" : "text/css; charset=utf-8",
+                                  js ? kLeafletJs : kLeafletCss, headOnly, nullptr, "max-age=3600"));
         return;
     }
 

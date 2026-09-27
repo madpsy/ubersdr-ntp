@@ -77,6 +77,11 @@ struct StatusInput {
     // Requests for the time over HTTP; meaningless with the HTTP service off,
     // which httpStreamClients == -1 says.
     HttpTimeStats httpTime;
+
+    // This station's position, as NMEA reports it: the configuration's, or a
+    // capture-timed receiver's on this host. Invalid when neither is known.
+    GeoPoint location;
+    std::string locationFrom;
 };
 
 // The multi-line block for the log. No trailing newline; Log::block indents it.

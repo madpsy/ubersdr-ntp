@@ -564,19 +564,22 @@ int main(int argc, char** argv) {
         pps = std::make_unique<PpsOutput>(cfg.pps, [&selector] { return selector.current(); }, position,
                                           &events, cfg.ntp.realtimePriority, startedAt);
     }
+    // NMEA over TCP's choice, which is also where the status page's map puts
+    // this station.
+    auto stationPosition = [&cfg, receiverPosition](std::string& from) {
+        if (cfg.nmeaTcp.positionGiven) {
+            from = "config";
+            return PpsPosition{true, cfg.nmeaTcp.latitude, cfg.nmeaTcp.longitude};
+        }
+        if (cfg.pps.positionGiven) {
+            from = "config";
+            return PpsPosition{true, cfg.pps.latitude, cfg.pps.longitude};
+        }
+        return receiverPosition(from);
+    };
     std::unique_ptr<NmeaServer> nmeaTcp;
     if (cfg.nmeaTcp.enabled) {
-        auto position = [&cfg, receiverPosition](std::string& from) {
-            if (cfg.nmeaTcp.positionGiven) {
-                from = "config";
-                return PpsPosition{true, cfg.nmeaTcp.latitude, cfg.nmeaTcp.longitude};
-            }
-            if (cfg.pps.positionGiven) {
-                from = "config";
-                return PpsPosition{true, cfg.pps.latitude, cfg.pps.longitude};
-            }
-            return receiverPosition(from);
-        };
+        auto position = stationPosition;
         nmeaTcp = std::make_unique<NmeaServer>(cfg.nmeaTcp, [&selector] { return selector.current(); }, position,
                                                cfg.ntp.realtimePriority);
     }
@@ -604,6 +607,8 @@ int main(int argc, char** argv) {
         if (pps) in.pps = pps->stats();
         if (nmeaTcp) in.nmeaTcp = nmeaTcp->stats();
         if (httpApi && cfg.http.enabled) in.httpTime = httpApi->timeStats();
+        const PpsPosition here = stationPosition(in.locationFrom);
+        if (here.valid) in.location = GeoPoint{here.lat, here.lon, true};
         return in;
     };
 

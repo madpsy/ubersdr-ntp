@@ -904,12 +904,17 @@ bool Source::fetchDescription() {
         std::lock_guard<std::mutex> lk(m_mu);
         const bool hadLocation = m_snap.receiverLocation.valid;
         m_snap.receiverName.clear();   // rebuilt below; a retry must not append twice
+        m_snap.receiverCallsign.clear();
+        m_snap.receiverPlace.clear();
         recordRtt(rtt);
         if (j.contains("receiver") && j["receiver"].is_object()) {
             const json& r = j["receiver"];
             if (r.contains("name") && r["name"].is_string())
                 m_snap.receiverName = r["name"].get<std::string>();
+            if (r.contains("location") && r["location"].is_string())
+                m_snap.receiverPlace = r["location"].get<std::string>();
             if (r.contains("callsign") && r["callsign"].is_string() && !r["callsign"].get<std::string>().empty()) {
+                m_snap.receiverCallsign = r["callsign"].get<std::string>();
                 if (!m_snap.receiverName.empty()) m_snap.receiverName += " ";
                 m_snap.receiverName += "(" + r["callsign"].get<std::string>() + ")";
             }
@@ -2333,6 +2338,29 @@ void Source::recordRtt(double rttSec) {
 }
 
 void Source::updateDelayModel() {
+    // Which transmitter the decoder says it is hearing. Until it says, the dial
+    // decides — which is right for WWVB and for the two WWV-only outlets, and
+    // is a coin toss on the four WWV and WWVH share. That uncertainty is real
+    // and it is worth about 14 ms on a European path, which is why the station
+    // tag is used the moment it is available.
+    //
+    // Decided before the configured-delay case returns, because the status
+    // page's map shows the path either way.
+    GeoPoint tx;
+    bool lf = false;
+    bool undecided = false;
+    std::string site;
+    if (m_broadcast == Broadcast::Dcf77) { tx = dcf77Site(); lf = true; site = "DCF77, Mainflingen"; }
+    else if (m_broadcast == Broadcast::Allouis) { tx = allouisSite(); lf = true; site = "Allouis (ALS162)"; }
+    else if (m_snap.station == "msf") { tx = msfSite(); lf = true; site = "MSF, Anthorn"; }
+    else if (m_broadcast == Broadcast::Lf60 && m_snap.station != "wwvb") undecided = true;
+    else if (m_snap.station == "wwvh") { tx = wwvhSite(); site = "WWVH, Kauai"; }
+    else if (m_snap.station == "wwvb" || m_broadcast == Broadcast::Wwvb) {
+        tx = wwvbSite(); lf = true; site = "WWVB, Fort Collins";
+    } else { tx = wwvSite(); site = "WWV, Fort Collins"; }
+    m_snap.transmitterLocation = tx;
+    m_snap.transmitterSite = site;
+
     if (!m_cfg.autoDelay) {
         m_snap.delaySec = m_cfg.delayMs / 1000.0;
         m_snap.propagationSec = 0.0;
@@ -2344,23 +2372,8 @@ void Source::updateDelayModel() {
         return;
     }
 
-    // Propagation, from the receiver's published coordinates to whichever
-    // transmitter the decoder says it is hearing. Until it says, the dial
-    // decides — which is right for WWVB and for the two WWV-only outlets, and
-    // is a coin toss on the four WWV and WWVH share. That uncertainty is real
-    // and it is worth about 14 ms on a European path, which is why the station
-    // tag is used the moment it is available.
-    GeoPoint tx;
-    bool lf = false;
-    bool undecided = false;
-    if (m_broadcast == Broadcast::Dcf77) { tx = dcf77Site(); lf = true; }
-    else if (m_broadcast == Broadcast::Allouis) { tx = allouisSite(); lf = true; }
-    else if (m_snap.station == "msf") { tx = msfSite(); lf = true; }
-    else if (m_broadcast == Broadcast::Lf60 && m_snap.station != "wwvb") undecided = true;
-    else if (m_snap.station == "wwvh") tx = wwvhSite();
-    else if (m_snap.station == "wwvb" || m_broadcast == Broadcast::Wwvb) { tx = wwvbSite(); lf = true; }
-    else tx = wwvSite();
-
+    // Propagation, from the receiver's published coordinates to that
+    // transmitter.
     double prop = 0.0;
     if (undecided) {
         m_snap.pathDescription = "60 kHz: MSF or WWVB not yet decided (it waits for the receiver's coordinates)";

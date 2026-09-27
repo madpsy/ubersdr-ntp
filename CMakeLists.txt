@@ -212,7 +212,25 @@ add_custom_command(
             "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed-html.py"
     COMMENT "Embedding src/web/index.html"
     VERBATIM)
-add_custom_target(index_html DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc")
+# Leaflet, for the page's map, served from the binary beside it.
+foreach(pair "leaflet.js;LeafletJs;kLeafletJs" "leaflet.css;LeafletCss;kLeafletCss")
+    list(GET pair 0 file)
+    list(GET pair 1 inc)
+    list(GET pair 2 symbol)
+    add_custom_command(
+        OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/generated/${inc}.inc"
+        COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_BINARY_DIR}/generated"
+        COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed-file.py"
+                "${CMAKE_CURRENT_SOURCE_DIR}/third_party/leaflet/${file}"
+                "${CMAKE_CURRENT_BINARY_DIR}/generated/${inc}.inc" ${symbol}
+        DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/third_party/leaflet/${file}"
+                "${CMAKE_CURRENT_SOURCE_DIR}/tools/embed-file.py"
+        COMMENT "Embedding ${file}"
+        VERBATIM)
+endforeach()
+add_custom_target(index_html DEPENDS "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc"
+                                     "${CMAKE_CURRENT_BINARY_DIR}/generated/LeafletJs.inc"
+                                     "${CMAKE_CURRENT_BINARY_DIR}/generated/LeafletCss.inc")
 
 # The version header, generated on every build from src/Version.h.in: the
 # release tag when build.sh passes one, `git describe` otherwise. See
@@ -251,7 +269,9 @@ add_executable(ubersdr-ntp
     src/Source.cpp
     src/TimeContinuity.cpp
     src/Status.cpp
-    "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc")
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/IndexHtml.inc"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/LeafletJs.inc"
+    "${CMAKE_CURRENT_BINARY_DIR}/generated/LeafletCss.inc")
 add_dependencies(ubersdr-ntp index_html version_header)
 add_dependencies(ubersdr-ntp-clocktest version_header)
 add_dependencies(ubersdr-ntp-configtest version_header)
