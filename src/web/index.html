@@ -849,8 +849,8 @@ setInterval(() => {
 // did: late by the path, but never blank.
 let tickAt = 0, tickUnix = 0, haveTick = false;
 let lastFrameTs = 0, frameMs = 1000 / 60, shownSec = null;
-// The device error is read every frame and averaged over the second it is
-// shown for, and the "correct" verdict has hysteresis: see paintClock.
+// The device error is read five times a second and averaged over each second,
+// and the "correct" verdict has hysteresis: see deviceTick.
 const kDevHoldS = 30;
 let devSum = 0, devN = 0, devInside = null, devHeld = 0;
 
@@ -881,10 +881,6 @@ function paintClock(ts) {
   else if (haveTick) t = tickUnix * 1000 + (shownAt - tickAt);
   else return;
 
-  // Date.now() is whole milliseconds, truncated, so one reading is ±0.5 ms on
-  // its own; every frame's goes into the second's average.
-  if (est) { devSum += Date.now() + 0.5 - (performance.now() + est.theta); devN++; }
-
   const d = new Date(t);
   $("now").innerHTML = hms(d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(),
                            d.getUTCMilliseconds());
@@ -906,68 +902,83 @@ function paintClock(ts) {
   let tz = "";
   try { tz = Intl.DateTimeFormat().resolvedOptions().timeZone || ""; } catch (x) {}
   $("loclabel").textContent = "Local time · " + (tz ? tz + " " : "") + "(" + utcOffsetText(d) + ")";
+}
 
-  if (est) {
-    // This browser's wall clock against the corrected time: a fact about the
-    // viewer's machine, not the server, and worth saying loudly -- a phone or
-    // laptop half a second out is common and is exactly what someone opening
-    // a time server's page wants to find out.
-    //
-    // Date.now() is whole milliseconds, truncated, so it is read from the middle
-    // of its millisecond and that half is part of the error.
-    const device = devN ? devSum / devN : Date.now() + 0.5 - (performance.now() + est.theta);
-    devSum = 0; devN = 0;
-    const a = Math.abs(device);
-    // The headline is the likely error of the measurement, not its bound: the
-    // bound is the worst an asymmetric path could do and is usually far above
-    // what it does. Anything inside it is not called fast or slow. Until there
-    // is a second sample to give a likely figure, the bound is all there is.
-    // The likely figure can come out above the bound when the other samples
-    // were slower ones; the bound still holds, so it caps it.
-    const likely = est.jitter == null ? null : Math.min(est.jitter, est.err);
-    const within = 0.5 + (likely == null ? est.err : likely);
-    // An error sitting on the line would otherwise flip between "correct" and
-    // "N ms slow" every second: the reading is noisy, and the line itself
-    // wanders by a millisecond or more over tens of seconds as the chosen
-    // sample and the scatter about it change. So leaving "correct" takes a
-    // margin past the line, and either change of verdict has to stand for
-    // kDevHoldS seconds running -- except an error far outside the line,
-    // which is a real fault and is shown at once. A device clock does not
-    // drift a millisecond in half a minute, so the hold hides nothing real.
-    const want = a <= within + (devInside ? Math.max(0.5, within * 0.5) : 0);
-    devHeld = want === devInside ? 0 : devHeld + 1;
-    if (devInside == null || devHeld >= kDevHoldS || a > 2 * within + 5) {
-      devInside = want; devHeld = 0;
-    }
-    const devText = devInside
-      ? "correct to within " + within.toFixed(within < 1 ? 1 : 0) + " ms"
-      : (a < 1000 ? a.toFixed(0) + " ms" : a < 60000 ? (a / 1000).toFixed(1) + " s" : dur(a / 1000)) +
-        (device > 0 ? " fast" : " slow");
-    const devTone = a <= Math.max(20, within) ? "ok" : a < 500 ? "warn" : "bad";
-    $("devpill").className = "pill " + devTone;
-    $("devpill").textContent = devText;
-    $("devnote").textContent = devTone === "ok"
-      ? "the computer or phone showing this page"
-      : "the computer or phone showing this page, not the server";
-    $("devclock").title = "Your device's own clock, compared with the broadcast time above, " +
-      "to the likely error of the measurement (at most ±" + ms(est.err, 1) + "; see below). " +
-      "Nothing to do with the server: the times shown on this page do not use it.";
-    try { recordDevice(sec, device, within); } catch (x) {}
-    try { Flow.browser({ rtt: est.delay, err: est.err, likely, device, within, inside: devInside }); } catch (x) {}
-    $("linknote").textContent = "browser latency " + ms(est.delay, 1) + " round trip, corrected: " +
-      (likely == null ? "" : "likely within ±" + ms(likely, 1) + ", ") + "at most ±" + ms(est.err, 1);
-    $("linknote").title = "The displayed time is advanced by half the measured round trip " +
-      "between this browser and the server, which is exact only if the delay is the same " +
-      "both ways. No measurement can tell how the round trip splits, so \"at most\" is " +
-      "the worst case: all of it in one direction. \"Likely\" is the scatter between " +
-      "repeated measurements, which shows how much the split varies; a split that never " +
-      "varies would not show in it. Both are on top of the root dispersion.";
-  } else {
+// This device's clock, read on its own timer rather than in paintClock: a
+// browser slows or stops animation frames whenever it decides nobody is
+// looking -- a window behind others, another desktop, power saving -- and
+// readings taken per frame left holes all through the chart's history.
+// Five readings a second, averaged over each corrected second: Date.now() is
+// whole milliseconds, truncated, so one reading is ±0.5 ms on its own.
+let devSec = null;
+function deviceTick() {
+  const est = bestEstimate(performance.now());
+  if (!est) {
     $("linknote").textContent = "measuring browser latency…";
     $("devpill").className = "pill dim";
     $("devpill").textContent = "measuring…";
+    return;
   }
+  devSum += Date.now() + 0.5 - (performance.now() + est.theta); devN++;
+  const sec = Math.floor((performance.now() + est.theta) / 1000);
+  if (sec === devSec) return;
+  devSec = sec;
+  // This browser's wall clock against the corrected time: a fact about the
+  // viewer's machine, not the server, and worth saying loudly -- a phone or
+  // laptop half a second out is common and is exactly what someone opening
+  // a time server's page wants to find out.
+  //
+  // Date.now() is whole milliseconds, truncated, so it is read from the middle
+  // of its millisecond and that half is part of the error.
+  const device = devSum / devN;
+  devSum = 0; devN = 0;
+  const a = Math.abs(device);
+  // The headline is the likely error of the measurement, not its bound: the
+  // bound is the worst an asymmetric path could do and is usually far above
+  // what it does. Anything inside it is not called fast or slow. Until there
+  // is a second sample to give a likely figure, the bound is all there is.
+  // The likely figure can come out above the bound when the other samples
+  // were slower ones; the bound still holds, so it caps it.
+  const likely = est.jitter == null ? null : Math.min(est.jitter, est.err);
+  const within = 0.5 + (likely == null ? est.err : likely);
+  // An error sitting on the line would otherwise flip between "correct" and
+  // "N ms slow" every second: the reading is noisy, and the line itself
+  // wanders by a millisecond or more over tens of seconds as the chosen
+  // sample and the scatter about it change. So leaving "correct" takes a
+  // margin past the line, and either change of verdict has to stand for
+  // kDevHoldS seconds running -- except an error far outside the line,
+  // which is a real fault and is shown at once. A device clock does not
+  // drift a millisecond in half a minute, so the hold hides nothing real.
+  const want = a <= within + (devInside ? Math.max(0.5, within * 0.5) : 0);
+  devHeld = want === devInside ? 0 : devHeld + 1;
+  if (devInside == null || devHeld >= kDevHoldS || a > 2 * within + 5) {
+    devInside = want; devHeld = 0;
+  }
+  const devText = devInside
+    ? "correct to within " + within.toFixed(within < 1 ? 1 : 0) + " ms"
+    : (a < 1000 ? a.toFixed(0) + " ms" : a < 60000 ? (a / 1000).toFixed(1) + " s" : dur(a / 1000)) +
+      (device > 0 ? " fast" : " slow");
+  const devTone = a <= Math.max(20, within) ? "ok" : a < 500 ? "warn" : "bad";
+  $("devpill").className = "pill " + devTone;
+  $("devpill").textContent = devText;
+  $("devnote").textContent = devTone === "ok"
+    ? "the computer or phone showing this page"
+    : "the computer or phone showing this page, not the server";
+  $("devclock").title = "Your device's own clock, compared with the broadcast time above, " +
+    "to the likely error of the measurement (at most ±" + ms(est.err, 1) + "; see below). " +
+    "Nothing to do with the server: the times shown on this page do not use it.";
+  try { recordDevice(sec, device, within); } catch (x) {}
+  try { Flow.browser({ rtt: est.delay, err: est.err, likely, device, within, inside: devInside }); } catch (x) {}
+  $("linknote").textContent = "browser latency " + ms(est.delay, 1) + " round trip, corrected: " +
+    (likely == null ? "" : "likely within ±" + ms(likely, 1) + ", ") + "at most ±" + ms(est.err, 1);
+  $("linknote").title = "The displayed time is advanced by half the measured round trip " +
+    "between this browser and the server, which is exact only if the delay is the same " +
+    "both ways. No measurement can tell how the round trip splits, so \"at most\" is " +
+    "the worst case: all of it in one direction. \"Likely\" is the scatter between " +
+    "repeated measurements, which shows how much the split varies; a split that never " +
+    "varies would not show in it. Both are on top of the root dispersion.";
 }
+setInterval(deviceTick, 200);
 
 // The failover countdowns, counted down HERE rather than redrawn from whatever
 // the server last said.
