@@ -50,6 +50,7 @@ h1 span { color:var(--muted); font-weight:400; }
 .devclock { margin-top:14px; padding-top:12px; border-top:1px solid var(--line);
   display:flex; flex-wrap:wrap; align-items:center; gap:6px 14px; }
 .devclock .date { margin-top:0; flex:1 1 200px; min-width:0; }
+.devclock .chart { flex:1 1 100%; }
 .devfig .pill { font:600 clamp(16px,3.6vw,22px)/1.2 var(--mono); padding:3px 12px; border-radius:10px;
   text-transform:none; letter-spacing:-.01em; font-variant-numeric:tabular-nums;
   white-space:normal; max-width:100%; }
@@ -302,6 +303,7 @@ tr.fresh td { animation:fresh 4s ease-out; }
           <div class="label">Your device's clock</div>
           <div class="devfig"><span class="pill dim" id="devpill">measuring…</span></div>
           <div class="date" id="devnote">the computer or phone showing this page</div>
+          <div class="chart" id="ch-device" data-height="90"></div>
         </div>
         <div class="note linknote" id="linknote">&nbsp;</div>
       </div>
@@ -829,6 +831,7 @@ function burst() {
 
 function restartMeasurement() {
   samples = [];
+  devSum = 0; devN = 0; devInside = null; devHeld = 0;
   burst();
 }
 
@@ -846,6 +849,10 @@ setInterval(() => {
 // did: late by the path, but never blank.
 let tickAt = 0, tickUnix = 0, haveTick = false;
 let lastFrameTs = 0, frameMs = 1000 / 60, shownSec = null;
+// The device error is read every frame and averaged over the second it is
+// shown for, and the "correct" verdict has hysteresis: see paintClock.
+const kDevHoldS = 30;
+let devSum = 0, devN = 0, devInside = null, devHeld = 0;
 
 const pad = (n, w = 2) => String(n).padStart(w, "0");
 const hms = (h, m, s, frac) =>
@@ -873,6 +880,10 @@ function paintClock(ts) {
   if (est) t = shownAt + est.theta;
   else if (haveTick) t = tickUnix * 1000 + (shownAt - tickAt);
   else return;
+
+  // Date.now() is whole milliseconds, truncated, so one reading is ±0.5 ms on
+  // its own; every frame's goes into the second's average.
+  if (est) { devSum += Date.now() + 0.5 - (performance.now() + est.theta); devN++; }
 
   const d = new Date(t);
   $("now").innerHTML = hms(d.getUTCHours(), d.getUTCMinutes(), d.getUTCSeconds(),
@@ -904,7 +915,8 @@ function paintClock(ts) {
     //
     // Date.now() is whole milliseconds, truncated, so it is read from the middle
     // of its millisecond and that half is part of the error.
-    const device = Date.now() + 0.5 - (performance.now() + est.theta);
+    const device = devN ? devSum / devN : Date.now() + 0.5 - (performance.now() + est.theta);
+    devSum = 0; devN = 0;
     const a = Math.abs(device);
     // The headline is the likely error of the measurement, not its bound: the
     // bound is the worst an asymmetric path could do and is usually far above
@@ -914,7 +926,20 @@ function paintClock(ts) {
     // were slower ones; the bound still holds, so it caps it.
     const likely = est.jitter == null ? null : Math.min(est.jitter, est.err);
     const within = 0.5 + (likely == null ? est.err : likely);
-    const devText = a <= within
+    // An error sitting on the line would otherwise flip between "correct" and
+    // "N ms slow" every second: the reading is noisy, and the line itself
+    // wanders by a millisecond or more over tens of seconds as the chosen
+    // sample and the scatter about it change. So leaving "correct" takes a
+    // margin past the line, and either change of verdict has to stand for
+    // kDevHoldS seconds running -- except an error far outside the line,
+    // which is a real fault and is shown at once. A device clock does not
+    // drift a millisecond in half a minute, so the hold hides nothing real.
+    const want = a <= within + (devInside ? Math.max(0.5, within * 0.5) : 0);
+    devHeld = want === devInside ? 0 : devHeld + 1;
+    if (devInside == null || devHeld >= kDevHoldS || a > 2 * within + 5) {
+      devInside = want; devHeld = 0;
+    }
+    const devText = devInside
       ? "correct to within " + within.toFixed(within < 1 ? 1 : 0) + " ms"
       : (a < 1000 ? a.toFixed(0) + " ms" : a < 60000 ? (a / 1000).toFixed(1) + " s" : dur(a / 1000)) +
         (device > 0 ? " fast" : " slow");
@@ -927,7 +952,8 @@ function paintClock(ts) {
     $("devclock").title = "Your device's own clock, compared with the broadcast time above, " +
       "to the likely error of the measurement (at most ±" + ms(est.err, 1) + "; see below). " +
       "Nothing to do with the server: the times shown on this page do not use it.";
-    try { Flow.browser({ rtt: est.delay, err: est.err, likely, device, within }); } catch (x) {}
+    try { recordDevice(sec, device, within); } catch (x) {}
+    try { Flow.browser({ rtt: est.delay, err: est.err, likely, device, within, inside: devInside }); } catch (x) {}
     $("linknote").textContent = "browser latency " + ms(est.delay, 1) + " round trip, corrected: " +
       (likely == null ? "" : "likely within ±" + ms(likely, 1) + ", ") + "at most ±" + ms(est.err, 1);
     $("linknote").title = "The displayed time is advanced by half the measured round trip " +
@@ -1750,6 +1776,7 @@ function makeChart(el, opts) {
       // A scale borrowed from a neighbouring chart, so two can be compared.
       if (s.bounds) { lo = Math.min(lo, s.bounds[0]); hi = Math.max(hi, s.bounds[1]); }
     }
+    for (const z of state.zone || []) { lo = Math.min(lo, -z[1]); hi = Math.max(hi, z[1]); }
     const empty = lo === Infinity;
     if (empty) { lo = 0; hi = 1; }
     if (opts.floorZero) lo = Math.min(0, lo);
@@ -1764,6 +1791,17 @@ function makeChart(el, opts) {
     const Y = (v) => mT + (1 - (v - lo) / (hi - lo)) * ph;
 
     svgEl("rect", { class: "plotbg", x: mL, y: mT, width: pw, height: ph, fill: "none", rx: 2 }, svg);
+    // A band either side of zero, [start, half-width] per bucket: what counts
+    // as no error at all, drawn under everything else.
+    if (state.zone && state.zone.length) {
+      const zx = (t) => Math.max(mL, Math.min(mL + pw, X(t))).toFixed(1);
+      const top = [], bot = [];
+      for (const z of state.zone) {
+        top.push(zx(z[0]) + "," + Y(z[1]).toFixed(1), zx(z[0] + width) + "," + Y(z[1]).toFixed(1));
+        bot.push(zx(z[0]) + "," + Y(-z[1]).toFixed(1), zx(z[0] + width) + "," + Y(-z[1]).toFixed(1));
+      }
+      svgEl("polygon", { points: top.concat(bot.reverse()).join(" "), fill: cssVar("--ok"), "fill-opacity": 0.1, stroke: "none" }, svg);
+    }
     for (const v of ticks) {
       const y = Math.round(Y(v)) + 0.5;
       svgEl("line", { class: v === 0 && opts.signed ? "zero" : "gridl", x1: mL, x2: mL + pw, y1: y, y2: y }, svg);
@@ -1771,11 +1809,12 @@ function makeChart(el, opts) {
     }
     // Time ticks on round boundaries: quarter hours across an hour, six hours
     // across a day.
-    const xStep = width >= 1800 ? 6 * 3600 : 15 * 60;
+    const xStep = state.xStep || (width >= 1800 ? 6 * 3600 : 15 * 60);
+    const xFmt = state.xFmt || hhmm;
     for (let t = Math.ceil(x0 / xStep) * xStep; t <= x1; t += xStep) {
       const x = X(t);
       if (x < mL + 14 || x > mL + pw - 14) continue;
-      svgEl("text", { class: "tick", x, y: H - 4, "text-anchor": "middle" }, svg).textContent = hhmm(t);
+      svgEl("text", { class: "tick", x, y: H - 4, "text-anchor": "middle" }, svg).textContent = xFmt(t);
     }
 
     if (empty) {
@@ -1837,7 +1876,8 @@ function makeChart(el, opts) {
       tip.textContent = "";
       const head = document.createElement("div");
       head.className = "t";
-      head.textContent = hhmm(t) + "–" + hhmm(t + width) + " UTC" + (t + width > state.now ? " · so far" : "");
+      head.textContent = xFmt(t) + (width > 1 ? "–" + xFmt(t + width) : "") + " UTC" +
+        (t + width > state.now ? " · so far" : "");
       tip.appendChild(head);
       for (const { s, p } of rows) {
         const r = document.createElement("div"); r.className = "r";
@@ -1941,6 +1981,45 @@ function makeChart(el, opts) {
 function chart(id, opts) {
   if (!charts[id]) charts[id] = makeChart($(id), opts);
   return charts[id];
+}
+
+// This device's clock error, second by second, since the page opened. The
+// server keeps no history of it -- it is the viewer's machine, measured here --
+// so the window starts at the first reading and widens with each one until it
+// is kDevWindowS wide, then rolls: always full, never mostly empty.
+const kDevWindowS = 600;
+let devHist = [];   // [unix second, device ms, within ms]
+
+function recordDevice(sec, device, within) {
+  devHist.push([sec, device, within]);
+  while (devHist.length && devHist[0][0] <= sec - kDevWindowS) devHist.shift();
+  const x1 = sec + 1;
+  // Never narrower than a minute, or the first few points would be spread
+  // across the whole width.
+  const x0 = Math.min(devHist[0][0], x1 - 60);
+  const span = x1 - x0;
+  // About a hundred buckets whatever the width: a second each at first, five
+  // once the window is full.
+  const width = span <= 120 ? 1 : span <= 240 ? 2 : 5;
+  const buckets = new Map();
+  for (const [t, v, w] of devHist) {
+    const b = Math.floor(t / width) * width;
+    let p = buckets.get(b);
+    if (!p) buckets.set(b, p = [b, 0, Infinity, -Infinity, 0, 0]);
+    p[1] += v; p[5] += w; p[4]++;
+    p[2] = Math.min(p[2], v); p[3] = Math.max(p[3], v);
+  }
+  const points = [...buckets.values()].map((p) => [p[0], p[1] / p[4], p[2], p[3], p[4], p[5] / p[4]]);
+  const xStep = [10, 15, 30, 60, 120, 300].find((st) => span / st <= 5);
+  chart("ch-device", {
+    unit: "ms", band: true, signed: true, minSpan: 1, title: "Your device's clock, fast (+) or slow (−)",
+    tipText: (p) => (p[1] > 0 ? "fast" : "slow") + " · correct within ±" + fmtVal(p[5], "ms") +
+      (p[4] > 1 ? " · range " + fmtVal(p[2], "") + " to " + fmtVal(p[3], "") : ""),
+  }).update({
+    series: [{ name: "Your device", color: slot(0), points }],
+    zone: points.map((p) => [p[0], p[5]]),
+    x0, x1, width, now: sec, xStep, xFmt: xStep < 60 ? hhmmss : hhmm,
+  });
 }
 
 // The narrowest an offset chart zooms to, in ms. The default half a millisecond
@@ -2217,7 +2296,8 @@ function setRange(r) {
   $("rangenote").textContent = (r === "hour" ? "1-minute averages over the last hour"
     : "30-minute averages over the last 24 hours") + " · kept in memory since the daemon started";
   // Hold the old picture, dimmed, until the new one arrives: no blank flash.
-  for (const c of Object.values(charts)) c.el.classList.add("loading");
+  // Not the device chart: it is measured here, not fetched.
+  for (const c of Object.values(charts)) if (c.el.id !== "ch-device") c.el.classList.add("loading");
   mFetching = false;
   fetchMetrics();
   scheduleMetrics();

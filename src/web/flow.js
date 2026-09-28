@@ -370,7 +370,7 @@ function model(d) {
   }
 
   const b = browser;
-  const dev = !b ? "—" : Math.abs(b.device) <= b.within ? "±" + num(b.within, b.within < 1 ? 1 : 0) + " ms"
+  const dev = !b ? "—" : b.inside ? "±" + num(b.within, b.within < 1 ? 1 : 0) + " ms"
     : (Math.abs(b.device) < 1000 ? num(Math.abs(b.device), 0) + " ms" : num(Math.abs(b.device) / 1000) + " s") +
       (b.device > 0 ? " fast" : " slow");
   cols[3].push({
