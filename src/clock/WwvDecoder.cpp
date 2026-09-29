@@ -880,17 +880,23 @@ void WwvDecoder::Impl::timeTick(TickTimer& t, double windowStart, int secOfFrame
         // Judged at this second's own peak (the tone's onset is a peak too, and
         // its plateau carries on past it), or at the prediction once the
         // average says where the tick is.
+        // Own less other, as the apex is found: WWVH's tick lands 15-20 ms after
+        // WWV's on a North American path -- just where the tone is looked for
+        // -- and leaks into the 1000 Hz template there; heard about as strong
+        // as WWV (K3FEF, 10 MHz), it had nearly every second thrown out.
+        auto own = [&](int l) {
+            return std::max(0.0, std::norm(t.at(t.cur, l)) - std::norm(t.at(t.curO, l)));
+        };
         int l0 = 0;
         if (!t.locked) {
             double best = -1.0;
             for (int l = -Wa; l <= Wa - 3 * L; ++l) {
-                const double v = std::norm(t.at(t.cur, l));
+                const double v = own(l);
                 if (v > best) { best = v; l0 = l; }
             }
         }
-        const double at0 = std::norm(t.at(t.cur, l0));
-        const double after = 0.5 * (std::norm(t.at(t.cur, std::min(Wa, l0 + 2 * L))) +
-                                     std::norm(t.at(t.cur, std::min(Wa, l0 + 3 * L))));
+        const double at0 = own(l0);
+        const double after = 0.5 * (own(std::min(Wa, l0 + 2 * L)) + own(std::min(Wa, l0 + 3 * L)));
         if (at0 > 4.0 * lagNoise && after > kToneRatio * at0) exclude = true;
     }
     if (!exclude) {
@@ -961,12 +967,19 @@ void WwvDecoder::Impl::timeTick(TickTimer& t, double windowStart, int secOfFrame
 
     if (!t.locked) {
         if (t.snr >= kTickLockSnr && t.n >= kTickMinSecs) {
-            t.locked = true; t.miss = 0; t.hist.clear(); t.stepRef = apex;
+            t.locked = true; t.miss = 0; t.hist.clear(); t.stepRef = 0.0;
         }
-    } else if (t.snr < kTickHoldSnr || std::fabs(apex - t.stepRef) > kTickMaxStep) {
-        // Weak, or a jump no receiver clock makes in a second: hold where the
-        // tick was, and let go only if it goes on.
+    } else if (t.snr < kTickHoldSnr) {
+        // Weak: hold where the tick was, and let go only if it stays weak.
         apex = 0.0;
+        if (++t.miss >= kTickMissLimit) { t.locked = false; t.period = t.nominal; t.hist.clear(); }
+    } else if (std::fabs(apex - t.stepRef) > kTickMaxStep) {
+        // A jump no receiver clock makes in a second: follow it no further than
+        // one that it could. Holding still instead let a receiver whose clock
+        // runs tens of ppm off -- K3FEF, +26 ppm, before the slope was fitted --
+        // fall further behind every second it held, until every second was a
+        // jump and the lock cycled every eleven seconds.
+        apex = t.stepRef + std::clamp(apex - t.stepRef, -kTickMaxStep, kTickMaxStep);
         if (++t.miss >= kTickMissLimit) { t.locked = false; t.period = t.nominal; t.hist.clear(); }
     } else {
         t.miss = 0;

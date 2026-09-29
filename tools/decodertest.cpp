@@ -122,6 +122,11 @@ struct Scenario {
     double nominalHz = 0.0;
     double ppm = 0.0;
     double pathMs = 0.0, pathAmp = 0.0, fadeHz = 0.1;
+    // The other station on its own carrier: same time code, its own tick
+    // (1200 Hz for WWVH, 1000 Hz for WWV) and minute tone, arriving otherMs
+    // later at otherAmp, its carrier otherHz off -- so the two carriers beat,
+    // as WWV and WWVH do on a shared frequency.
+    double otherAmp = 0.0, otherMs = 18.0, otherHz = 0.37;
     bool tones = false;
     // Edge error allowed, ms, for WWV/WWVH: every measured edge after lock
     // within this of the truth (after `expectMs`, the multipath's weighted mean).
@@ -221,7 +226,7 @@ std::vector<float> render(const Scenario& sc, const std::vector<Second>& secs) {
         if (tau < -0.001 || tau > 0.006) return 0.0;
         return 0.5 * (std::erf(tau * k) - std::erf((tau - 0.005) * k));
     };
-    auto mod = [&](double t) {
+    auto mod = [&](double t, double tickHz) {
         const long long p = static_cast<long long>(std::floor(t));
         const double tau = t - static_cast<double>(p);
         if (p < 0 || p >= static_cast<long long>(secs.size())) return 0.0;
@@ -245,7 +250,7 @@ std::vector<float> render(const Scenario& sc, const std::vector<Second>& secs) {
         return m;
     };
 
-    double peak = 2.9 * (1.0 + sc.pathAmp), sigma = 0.0;
+    double peak = 2.9 * (1.0 + sc.pathAmp + sc.otherAmp), sigma = 0.0;
     if (!std::isnan(sc.snrDb)) {
         // snrDb is carrier over the noise in the whole 12 kHz (or 24 kHz): a
         // complex sigma per rail such that |noise|^2 averages 10^(-snr/10).
@@ -260,14 +265,20 @@ std::vector<float> render(const Scenario& sc, const std::vector<Second>& secs) {
     for (std::size_t i = 0; i < n; ++i) {
         const double tt = static_cast<double>(i) / rate;
         const double t = tt - off;
-        double re = (1.0 + mod(t)), im = 0.0;
+        double re = (1.0 + mod(t, tickHz)), im = 0.0;
         double ph = 2.0 * kPi * sc.carrierHz * tt + phi0;
         double zr = re * std::cos(ph), zi = re * std::sin(ph);
         if (sc.pathAmp > 0.0) {
             const double t2 = t - sc.pathMs / 1000.0;
             const double ph2 = ph + 2.0 * kPi * sc.fadeHz * tt + 1.9;
-            const double r2 = sc.pathAmp * (1.0 + mod(t2));
+            const double r2 = sc.pathAmp * (1.0 + mod(t2, tickHz));
             zr += r2 * std::cos(ph2); zi += r2 * std::sin(ph2);
+        }
+        if (sc.otherAmp > 0.0) {
+            const double t3 = t - sc.otherMs / 1000.0;
+            const double ph3 = ph + 2.0 * kPi * sc.otherHz * tt + 2.3;
+            const double r3 = sc.otherAmp * (1.0 + mod(t3, otherHz));
+            zr += r3 * std::cos(ph3); zi += r3 * std::sin(ph3);
         }
         (void)im;
         if (sigma > 0.0) { zr += sigma * gauss(rng); zi += sigma * gauss(rng); }
@@ -723,6 +734,19 @@ int main(int argc, char** argv) {
         }
         scs.swap(keep);
     }
+    // WWV and WWVH on one frequency, carriers beating: the tick of each comes
+    // out of coherent AM with its sign flipping as the beat turns.
+    // (At 0.9, near equal, the time code of the two garbles past what these
+    // checks allow: open, see the K3FEF 10 MHz recordings.)
+    for (double amp : {0.6}) for (Kind k : {Kind::Wwv, Kind::Wwvh}) {
+        char* note = new char[48];
+        std::snprintf(note, 48, "other station at %.1f, carriers beating", amp);
+        Scenario sc = iqScenario(k, 10.0, note);
+        sc.otherAmp = amp;
+        if (k == Kind::Wwvh) sc.preset = ClockStation::Wwvh;
+        scs.push_back(sc);
+    }
+
     std::vector<Result> results(scs.size());
     std::atomic<std::size_t> next{0};
     unsigned nThreads = std::max(1u, std::thread::hardware_concurrency());
