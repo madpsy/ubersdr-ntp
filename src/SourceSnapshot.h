@@ -168,7 +168,7 @@ struct SourceSnapshot {
     std::string station = "unknown";
     double toneSnrDb = 0.0;
     double delayEstMs = 0.0;
-    // WWV/WWVH: tick energy in the 2000 Hz band over the 2200 Hz band, in dB --
+    // WWV/WWVH: tick energy in the 1000 Hz band over the 1200 Hz band, in dB --
     // what the station tag is decided from. Positive leans WWV, negative WWVH;
     // NaN when there is none (WWVB, or no tick yet).
     double tickBandRatioDb = std::numeric_limits<double>::quiet_NaN();
@@ -202,6 +202,14 @@ struct SourceSnapshot {
     bool pmInterference = false;
     bool pmHolding = false;
     int pmAidedLocks = 0;
+
+    // WWV/WWVH's seconds-tick timer (WwvDecoder.h): whether the served edges
+    // are the tick's, the averaged correlation's SNR, and where the BCD pulse
+    // puts the second less where the tick does -- the tick's one check, as
+    // amMinusPmMs is PM's. carrierOffsetHz above is set for WWV too.
+    bool tickTiming = false;
+    double tickSnrDb = std::numeric_limits<double>::quiet_NaN();
+    double bcdMinusTickMs = std::numeric_limits<double>::quiet_NaN();
 
     // The continuity check on decoded times (Source.cpp, admitDecodedTime):
     // UTC does not jump, so a decoded time that does has been misread. Empty

@@ -586,8 +586,16 @@ function renderPps(p) {
 // broadcastFor): DCF77 and Allouis by their carriers whatever the dial, and
 // 60 kHz when it is tuned on the carrier (MSF, or WWVB by location).
 function isIqSource(x) {
-  return x.carrier_hz === 77500 || x.carrier_hz === 162000 ||
-    (x.carrier_hz === 60000 && x.dial_hz === x.carrier_hz);
+  // Everything but WWVB tuned the old way, 1 kHz under its carrier.
+  return !(x.carrier_hz < 1e6 && x.dial_hz !== x.carrier_hz);
+}
+
+// WWV/WWVH, timed by the seconds tick; the BCD pulse's edge is its check.
+function wwvText(p) {
+  return "seconds tick " + (p.tick_timing ? "timing the second" : "not timed") +
+    (p.tick_snr_db != null ? " at " + p.tick_snr_db.toFixed(1) + " dB" : "") +
+    (p.bcd_minus_tick_ms != null ? ", BCD pulse " + signed(p.bcd_minus_tick_ms, 2) + " from it" : "") +
+    (p.carrier_offset_hz != null ? ", carrier " + p.carrier_offset_hz.toFixed(2) + " Hz off the dial" : "");
 }
 
 // Allouis, timed by correlating each second's whole phase modulation.
@@ -641,7 +649,7 @@ function stationMix(d) {
 function stationText(station, ratioDb) {
   if (station && station !== "unknown") return esc(station.toUpperCase());
   if (ratioDb == null || !isFinite(ratioDb)) return "—";
-  return '<span class="note" title="Not decided yet. Tick 2000/2200 Hz ratio ' + signedDb(ratioDb) +
+  return '<span class="note" title="Not decided yet. Tick 1000/1200 Hz ratio ' + signedDb(ratioDb) +
     ': positive leans WWV, negative WWVH; a tag needs +1.8 dB either way.">' +
     (ratioDb >= 0 ? "WWV?" : "WWVH?") + "</span>";
 }
@@ -1472,6 +1480,7 @@ function onStatus(d) {
           : "")],
       ...(dec.dcf77 ? [["DCF77", dcf77Text(dec.dcf77)]] : []),
       ...(dec.allouis ? [["Allouis", allouisText(dec.allouis)]] : []),
+      ...(dec.wwv ? [["Tick", wwvText(dec.wwv)]] : []),
       ["Last decode", dec.last_decoded_utc
         ? esc(dec.last_decoded_utc) + " at quality " + dec.last_quality + "%, " +
           dur(dec.last_decode_age_seconds) + " ago"

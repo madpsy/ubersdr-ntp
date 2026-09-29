@@ -52,9 +52,7 @@ bool parseSecondaryMode(const std::string& s, SecondaryMode& out) {
 }
 
 std::uint64_t dialForCarrier(std::uint64_t carrierHz) {
-    if (carrierHz == kDcf77CarrierHz || carrierHz == kAllouisCarrierHz || carrierHz == kLf60CarrierHz)
-        return carrierHz;
-    return carrierHz > 1000 ? carrierHz - 1000 : 0;
+    return carrierHz;
 }
 
 namespace {
@@ -643,6 +641,18 @@ bool Config::finalise(std::string& err) {
                 return false;
             }
         }
+        if (bc == Broadcast::Wwv) {
+            const std::uint64_t off = s.dialHz > s.carrierHz ? s.dialHz - s.carrierHz
+                                                             : s.carrierHz - s.dialHz;
+            if (off > kWwvMaxDialOffsetHz) {
+                err = "source \"" + (s.name.empty() ? std::string("wwv") : s.name) + "\": dial_hz " +
+                      std::to_string(s.dialHz) + " puts the carrier " + std::to_string(off) +
+                      " Hz off; WWV is taken as IQ, and its tick needs the carrier within " +
+                      std::to_string(kWwvMaxDialOffsetHz) + " Hz of the dial. Leave dial_hz out "
+                      "and it goes on the carrier";
+                return false;
+            }
+        }
 
         if (s.name.empty()) {
             // Named after what it listens to, which is what anyone reading the
@@ -677,8 +687,8 @@ bool Config::finalise(std::string& err) {
         // channel lossless whatever it is asked. Not an error -- it may well
         // have come in from "defaults" -- but not what the setting says either.
         if (s.minMarginDb > 0 && !isIqBroadcast(broadcastFor(s.carrierHz, s.dialHz))) {
-            warnings.push_back(label + "min_margin applies to the LF sources' IQ streams only; this "
-                               "source is received as audio, which UberSDR always sends lossless");
+            warnings.push_back(label + "min_margin applies to IQ streams only; this source is WWVB "
+                               "received as audio, which UberSDR always sends lossless");
         }
         if (s.enabled) ++enabled;
     }

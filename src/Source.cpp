@@ -59,47 +59,20 @@ constexpr double kOffsetStaleSec = 180.0;
 // event should have arrived — WWV sends one a minute.
 constexpr double kAnchorMaxAgeSec = 300.0;
 
-// Where the WWV/WWVH decoder puts a second edge relative to the true edge in
-// its input: 13.6 ms EARLY, the matched filter's chain delay being taken as 7
-// series samples where it is 4.27. Measured, not estimated: tools/decodertest
-// generates WWV and WWVH and reports this mean over every edge it checks
-// (-13.645 / -13.637 ms, spread about ±1 ms). The WWVB decoder's edges are
-// exact to 0.02 ms, so it has no such term. Kept as a correction here rather
-// than fixed in the decoder, whose tracker is built around the upstream value.
-constexpr double kWwvDecoderEdgeBiasSec = -0.013645;
-
-// What WWV and WWVH need on top of everything else, measured only as a
-// residual: +4.7 ms. It is the 4.7 ms the chain constant below carried until
-// 2026-09-22, moved here unchanged, so every WWV source's total delay is
-// exactly what it was calibrated to.
+// WWV and WWVH are timed by the seconds tick (WwvDecoder), whose correlation
+// peak is the start of the tick -- where NIST puts the second -- exactly:
+// tools/decodertest puts the synthetic edge on truth to a microsecond clean,
+// with a mean under 5 us over every noisy run. So the decoder has no edge bias
+// to take off, as DCF77's PM and Allouis have none.
 //
-// It belongs to WWV because only WWV needs it. DCF77 read 4.7 ms early against
-// a GPS-fed NTP server for forty settled minutes with the chain at 14.1, and
-// nothing DCF77-specific can account for that: its AM and PM demodulators are
-// independent and agree to under a millisecond, its groundwave path cannot be
-// wrong by kilometres enough, and radiod's channel filter delays the iq preset
-// exactly as it does usb (filter.c: a linear-phase sinc, (M-1)/2 samples,
-// whatever the passband). WWV, calibrated against the NTP class with the same
-// chain, came out right. The chain is shared; the difference is not.
+// Until 2026-09-29 they were timed by the 100 Hz BCD pulse instead, through a
+// 25 Hz low-pass, with a -13.645 ms bias measured on synthetic pulses and a
+// residual on top of it (+4.7 ms, then 0) that no live measurement ever pinned
+// down. How a real pulse's shape moves that edge is what the decoder's
+// bcd_minus_tick_ms now shows, live, beside the tick that is served.
 //
-// Which WWV term is short is not known. The decoder bias above was measured on
-// synthetic signals, and a real tick, smeared by multipath and the ionosphere,
-// need not sit where a clean one does; or the skywave model's single hop at
-// 350 km is shorter than the path the signal takes. And the WWV calibrations
-// were all made over Opus, which is no longer used: the sum they fixed held the
-// 8 ms then charged for Opus (measured offline as a 5-10 ms bias), so WWV over
-// PCM is right only as far as that figure was, and this carries its error too.
-// Until a receiver that hears WWV and DCF77 together splits them, this is the
-// sum, kept with the decoder term where the status page shows it.
-//
-// Zero from 2026-09-24, pending exactly that measurement. With capture timing
-// nothing between the antenna and the sample index treats WWV differently from
-// DCF77 -- the same radiod path, the same capture stamps, no chain term -- so no
-// mechanism is known that needs it, and the one WWV-over-PCM reading (K3FEF,
-// 2026-09-22, against Cloudflare) put it nearer +2.3 ms than +4.7. The terms it
-// could really belong to, the decoder bias on live ticks and the skywave model,
-// are to be measured as themselves: WWV against DCF77 on one receiver, both
-// capture-timed, over twenty settled minutes by day and by night.
+// What WWV might still need on top of propagation, measured as a residual: 0
+// until a capture-timed receiver that also hears an LF station says otherwise.
 constexpr double kWwvResidualSec = 0.0;
 
 // Where MsfDecoder puts MSF's second against where NPL does: 0.19 ms LATE. The
@@ -994,19 +967,15 @@ std::string Source::buildWsUrl() const {
     u << httpToWs(m_cfg.url) << "/ws"
       << "?frequency=" << m_cfg.dialHz;
     if (m_iq) {
-        // DCF77: the whole 12 kHz of complex baseband, which is exactly the
-        // server's own IQ preset, so the mode change moves no filter. Lossless
-        // unless min_margin asks for reduced depth, and min_margin=0 says so
+        // The whole 12 kHz of complex baseband, which is exactly the server's
+        // own IQ preset, so the mode change moves no filter. Lossless unless
+        // min_margin asks for reduced depth, and min_margin=0 says so
         // explicitly rather than relying on the parameter's absence meaning it.
         u << "&mode=iq&bandwidthLow=-6000&bandwidthHigh=6000"
           << "&format=pcm-zstd&min_margin=" << m_cfg.minMarginDb;
     } else {
+        // WWVB tuned the old way, 1 kHz under its carrier: USB audio.
         u << "&mode=usb"
-          // The passband has to reach 2.2 kHz or the WWV/WWVH second tick —
-          // which is recovered entirely from its 2000/2200 Hz audio image — is
-          // filtered away, and the decoder sits in `acquiring` for ever with
-          // nothing to say why. 0-3000 is what the frontend's own clock panel
-          // asks for.
           << "&bandwidthLow=0&bandwidthHigh=3000"
           // Lossless at full quality, as IQ is: min_margin=0 says so rather
           // than leaving it to the parameter's absence.
@@ -1693,7 +1662,7 @@ bool Source::ensureDecoder(int rate) {
         m_iqToAudioDelaySec = delay / rate;
         m_iqShiftPhase = 0.0;
         m_iqShiftStep = 2.0 * 3.14159265358979323846 * (1000.0 - offsetHz) / rate;
-    } else if (m_iq) {
+    } else if (m_broadcast == Broadcast::Dcf77) {
         m_dcf77 = std::make_unique<clockdec::Dcf77Decoder>(rate, offsetHz);
         m_dcf77->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
         m_dcf77->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
@@ -1708,7 +1677,7 @@ bool Source::ensureDecoder(int rate) {
         m_wwvb->onTime = [this](const clockdec::ClockTimeInfo& t) { onClockTime(t); };
         m_wwvb->setPlausibility(reference, 24 * 60);
     } else {
-        m_wwv = std::make_unique<clockdec::WwvDecoder>(rate);
+        m_wwv = std::make_unique<clockdec::WwvDecoder>(rate, offsetHz);
         m_wwv->onStateChanged = [this](clockdec::ClockLockState s) { onClockState(s); };
         m_wwv->onSecond = [this](const clockdec::ClockSecondInfo& i) { onClockSecond(i); };
         m_wwv->onFrame = [this](const clockdec::ClockFrameInfo& f) { onClockFrame(f); };
@@ -1744,7 +1713,8 @@ bool Source::ensureDecoder(int rate) {
 
     LOG_INFO(m_cfg.name.c_str(), "decoder started: %s at %d Hz%s",
              m_dcf77 ? "DCF77 (AM + PM, IQ)" : m_allouis ? "Allouis (PM, IQ)" : m_msf ? "MSF (IQ)"
-             : m_wwvbFromIq ? "WWVB (from IQ)" : wwvb ? "WWVB" : "WWV/WWVH", rate, stationNote.c_str());
+             : m_wwvbFromIq ? "WWVB (from IQ)" : wwvb ? "WWVB" : "WWV/WWVH (IQ, timed by the tick)",
+             rate, stationNote.c_str());
     return true;
 }
 
@@ -1823,6 +1793,22 @@ void Source::feedSamples(const std::int16_t* pcm, int count, int rate, double ar
     m_snap.windowSize = d.windowSize;
     m_snap.voteQuality = d.voteQuality;
     m_snap.samplesConsumed = consumed;
+    if (m_wwv) {
+        m_snap.tickTiming = d.tickTiming;
+        m_snap.tickSnrDb = d.tickSnrDb;
+        m_snap.bcdMinusTickMs = d.bcdMinusTickMs;
+        m_snap.carrierOffsetHz = d.carrierOffsetHz;
+        // Whether the tick is timing the second, logged when it has held for
+        // half a minute either way, as DCF77's PM is.
+        const int timing = d.phaseLocked ? static_cast<int>(d.tickTiming) : -1;
+        const double now = monotonicNow();
+        if (timing != m_timingSeen) { m_timingSeen = timing; m_timingSeenAt = now; }
+        if (timing >= 0 && timing != m_loggedTimingPm && now - m_timingSeenAt >= 30.0) {
+            if (timing) LOG_INFO(m_cfg.name.c_str(), "seconds tick timed for the last 30 s (%.1f dB)", d.tickSnrDb);
+            else LOG_INFO(m_cfg.name.c_str(), "seconds tick not timed for the last 30 s; not serving");
+            m_loggedTimingPm = timing;
+        }
+    }
     if (m_allouis || m_msf) {
         // Allouis is timed by its phase alone: the same fields as DCF77's PM.
         m_snap.pmLocked = d.pmLocked;
@@ -2442,15 +2428,14 @@ void Source::updateDelayModel() {
     // the dial exactly as ensureDecoder chooses it. Negative: an edge reported
     // early makes the offset read large, so it is taken back off.
     // DCF77's edges are exact to the test's resolution whichever demodulator
-    // is timing them (tools/dcf77test), so it has none either.
-    // WWV's residual rides here too (kWwvResidualSec), with the term it is most
-    // likely to belong to.
+    // is timing them (tools/dcf77test), so it has none, and nor has WWV's tick;
+    // WWV's residual rides here (kWwvResidualSec), zero until measured.
     // Allouis's decoder puts the edge where the station puts the second
     // (AllouisDecoder), so it has none. MSF's times the steepest point of the
     // fall, 0.19 ms after NPL's second (kMsfDecoderEdgeBiasSec). WWVB taken
     // from IQ is timed through the low-pass that turns it into audio, whose
     // delay is exactly known (ensureDecoder) and taken off here.
-    const double decoder = m_broadcast == Broadcast::Wwv ? kWwvDecoderEdgeBiasSec + kWwvResidualSec
+    const double decoder = m_broadcast == Broadcast::Wwv ? kWwvResidualSec
                          : m_snap.station == "msf" ? kMsfDecoderEdgeBiasSec
                          : m_iqToAudioDelayModelSec;
 
@@ -2543,9 +2528,11 @@ SourceSnapshot Source::snapshot() const {
     // with no earlier anchor still extending, has nothing to offer -- and
     // "still filtering" would hide that it is refusing a jump.
     const bool heldOut = !m_snap.timeCheck.empty() && !m_haveAnchor;
-    // DCF77 serves only while PM times the second: see edgeServable.
+    // DCF77 serves only while PM times the second, WWV only while the tick
+    // does: see edgeServable.
     const bool amOnly = m_dcf77 && s.clockState == "locked" && !s.timingFromPm;
-    s.ready = s.enabled && s.active && s.clockState == "locked" && !heldOut && !amOnly;
+    const bool bcdOnly = m_wwv && s.clockState == "locked" && !s.tickTiming;
+    s.ready = s.enabled && s.active && s.clockState == "locked" && !heldOut && !amOnly && !bcdOnly;
     if (!s.enabled) {
         s.notReadyReason = "disabled in the configuration";
     } else if (!s.active) {
@@ -2577,6 +2564,9 @@ SourceSnapshot Source::snapshot() const {
     } else if (amOnly) {
         s.notReadyReason = "AM only: the time code decodes, but phase modulation is not locked, "
                            "and AM's second edge is too coarse to serve time from";
+    } else if (bcdOnly) {
+        s.notReadyReason = "time code only: the minute decodes, but the seconds tick is not timed yet, "
+                           "and the time code's own edge is not served";
     } else {
         s.notReadyReason.clear();
     }

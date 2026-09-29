@@ -443,9 +443,9 @@ struct Config {
     bool finalise(std::string& err);
 };
 
-// The dial for a carrier: 1 kHz below it, which is what puts the carrier at
-// 1000 Hz audio in USB for WWV and WWVH -- and the carrier itself for the LF
-// stations, which are taken as IQ with the carrier at 0 Hz (see below).
+// The dial for a carrier: the carrier itself. Every station is taken as IQ
+// with the carrier at 0 Hz (see below) -- except WWVB below 1 MHz on a dial
+// given explicitly 1 kHz under it, the old USB tuning, which stays that.
 std::uint64_t dialForCarrier(std::uint64_t carrierHz);
 
 // DCF77, Mainflingen. Unlike the NIST stations it is decoded from IQ, not from
@@ -485,9 +485,16 @@ inline Broadcast broadcastFor(std::uint64_t carrierHz, std::uint64_t dialHz) {
     return dialHz < kWwvbCeilingHz ? Broadcast::Wwvb : Broadcast::Wwv;
 }
 // The broadcasts received as IQ, tuned on the carrier, rather than USB audio.
+// WWV and WWVH too: coherent AM on the carrier's own phase times the seconds
+// tick exactly and holds the time code far into the noise (WwvDecoder.h). A
+// dial_hz from the USB days, 1 kHz under the carrier, still works: the carrier
+// is then 1 kHz up in the baseband and the decoder is told so.
 inline bool isIqBroadcast(Broadcast b) {
-    return b == Broadcast::Dcf77 || b == Broadcast::Allouis || b == Broadcast::Lf60;
+    return b != Broadcast::Wwvb;
 }
+// How far a WWV/WWVH dial may sit from the carrier: the tick's sidebands reach
+// 1.2 kHz either side of it, and all of that must stay inside the 12 kHz.
+inline constexpr std::uint64_t kWwvMaxDialOffsetHz = 4000;
 
 // Carriers only WWV transmits on. WWVH shares 2.5, 5, 10 and 15 MHz with it,
 // so only on these two does the dial alone say which station is heard.

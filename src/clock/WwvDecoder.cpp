@@ -10,24 +10,55 @@
 // decimated per-second work, per the NIST WWV/WWVH time-code table (NIST
 // SP 432) and the reference chain documented in WwvDecoder.h.
 //
-// Chain (identical intent to the prototype, streaming realization):
-//   analytic bandpass 700-1300 Hz (biquad cascade) -> rectify+LPF envelope
-//   -> coherent 100 Hz demod (running quadrature mixer, 25 Hz LPF both rails,
-//      magnitude) -> decimate to a 200 Hz amplitude series a[]
-//   -> tick rail: bandpass 2000 Hz (WWV) / 2200 Hz (WWVH), envelope, decimate,
-//      fold mod 1 s for tick phase + station tag
-//   -> per-second matched-filter classify (zero-mean 170/470/770 ms templates
-//      at +30 ms; confidence = best correlation minus runner-up)
-//   -> marker frame sync (P markers at 9/19/29/39/49/59), mod-10 degeneracy
-//      resolved by the s0 minute-mark subcarrier hole + minute-increment
-//      scoring -> NIST BCD field map -> TimeFrameVoter.
+// Chain, per input sample of complex baseband:
+//
+//   carrier search   DFT bins across +/-kPullHz of the expected offset, on a
+//                    600 Hz decimation, repeated every 2 s until the carrier
+//                    stands out; the peak is where the mixer goes, and it is
+//                    followed after (kFreqGain).
+//   reference        c = a 15 Hz low-pass of the mixed baseband z, and z itself
+//                    delayed by that low-pass's group delay, so c is the
+//                    carrier's phase AT the sample it is compared with: no lag
+//                    to follow a Doppler shift with, and nothing that depends
+//                    on the offset.
+//   AM, coherently   m = Re(z conj(c)) / <|c|^2>. The modulation itself, on
+//                    the carrier's own phase, weighted by the carrier's
+//                    strength (a faded second counts for less, as it should),
+//                    with no envelope detector to lose it in noise. The
+//                    quadrature Im(z conj(c)) carries no AM at all, and is how
+//                    the noise under m is measured.
+//
+// Then, from m:
+//
+//   seconds tick     the 5 ms burst of 1000 Hz (WWV) or 1200 Hz (WWVH) at the
+//                    start of every second, correlated against its own
+//                    waveform (TickTimer) and averaged coherently from second
+//                    to second. THIS is the second edge served: NIST puts the
+//                    second at the start of the tick, and the correlation's
+//                    peak is exactly there, whatever filters the receiver used.
+//   tick rails       bandpass 1000 / 1200 Hz, envelope, 200 Hz series, folded
+//                    mod 1 s: the coarse tick phase that cuts the seconds, and
+//                    the station tag.
+//   BCD              coherent 100 Hz demod (quadrature mixer, 25 Hz LPF, the
+//                    subcarrier's own phase once known) -> 200 Hz series a[]
+//      -> per-second matched-filter classify (zero-mean 170/470/770 ms
+//         templates at +30 ms; confidence = best correlation minus runner-up)
+//      -> marker frame sync (P markers at 9/19/29/39/49/59), mod-10 degeneracy
+//         resolved by the s0 minute-mark subcarrier hole + minute-increment
+//         scoring -> NIST BCD field map -> TimeFrameVoter.
+//
+// The BCD pulse's edge is still measured, but only as a check on the tick
+// (bcdMinusTickMs): after a 25 Hz low-pass its edges are tens of milliseconds
+// long, and where it puts the second depends on the pulse's shape on the air.
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <complex>
 #include <cstdint>
 #include <deque>
 #include <limits>
+#include <vector>
 #include <vector>
 
 namespace clockdec {
@@ -49,11 +80,20 @@ constexpr int kSeriesRate = 200;                 // decimated series rate (Hz)
 constexpr int kSecLen     = kSeriesRate;          // samples per broadcast second
 constexpr int kFrameSecs  = 60;
 
-// Nominal biquad-chain group delay at 200 Hz (~35 ms) — the matched-filter
-// shift a clean, drift-free stream settles at. The tracked delay estimate
-// starts here, and the reported second edge subtracts it back out so the edge
-// label follows REAL stream drift, not the fixed chain delay.
-constexpr int kNominalDelaySamples = 7;
+// Each second's window is cut this many series samples (50 ms) before the
+// tick, so the pulse's matched-filter shift sits in the middle of the range
+// searched (0..kMaxShift) with room both ways for a receiver clock to walk it.
+// Cut at the tick itself the shift settled 2.5 samples above the lower rail,
+// and a clock 60 ppm slow put it on the rail within minutes, over and over.
+constexpr int kWindowLead = 10;
+// The matched-filter shift a clean, drift-free stream settles at, in whole
+// series samples: the lead, plus the 25 Hz low-pass and the decimation (about
+// 20 ms). The tracked delay estimate starts here.
+constexpr int kNominalDelaySamples = kWindowLead + 4;
+// The same, exactly, as tools/decodertest measures it: what the BCD edge takes
+// off the smoothed shift to put a synthetic pulse on its true second. Only the
+// BCD check uses it (bcdMinusTickMs); nothing served depends on it.
+constexpr double kBcdEdgeDelaySamples = 3.52;
 
 // Matched-filter shift search ceiling (series samples, 200 ms). Wide (WS-4.5)
 // so slow sample-clock drift is ABSORBED by the tracked delay estimate instead
@@ -65,6 +105,10 @@ constexpr int kMaxShift = 40;
 // this is τ ≈ 100 s). The fold must FORGET a stale phase: after a sample
 // discontinuity the re-seed has to find the CURRENT tick phase, not history.
 constexpr double kFoldDecay = 0.99;
+// The fold's other lock (foldZ): its peak this many spreads above the median
+// bin, after at least this long. The largest of 200 bins of noise is about 3.
+constexpr double kFoldZ = 10.0;
+constexpr int kFoldZMinSecs = 10;
 
 // Station tag (see onSeriesSample): one band's folded tick excess must be this
 // many times the other's for a verdict. A single station's own tick leaks into
@@ -117,6 +161,71 @@ constexpr float kStructConf = 0.10f;
 // Markers (P1..P5, P0) land at seconds 9/19/29/39/49/59 — i.e. (s % 10 == 9).
 inline bool isMarkerSec(int s) { return (s % 10) == 9; }
 
+// ---- Carrier. --------------------------------------------------------------
+// How far from where the dial puts it the carrier is looked for. WWV's carrier
+// is an atomic standard, so only the receiver's clock moves it: 2 ppm at 25 MHz
+// is 50 Hz. Further out than this the search would start to see the 100 Hz
+// subcarrier's sidebands, which are the next strongest lines.
+constexpr double kPullHz      = 50.0;
+constexpr double kSearchStep  = 0.25;    // Hz between bins
+constexpr int    kSearchRate  = 600;     // Hz, the decimated stream searched
+constexpr double kSearchSec   = 2.0;
+constexpr double kToneGate    = 12.0;    // carrier bin over the median bin, power
+// A carrier found but no tick in this long: it was not the carrier. Search again.
+constexpr double kResearchSec = 60.0;
+// The reference low-pass: two Butterworth sections, fourth order. 15 Hz follows
+// any fade or Doppler HF produces and is 66 dB down at the subcarrier's 100 Hz.
+constexpr double kRefHz       = 15.0;
+constexpr double kFreqGain    = 0.2;     // per-second fraction of the residual taken
+constexpr double kLevelSec    = 10.0;    // carrier power, averaged, that m is scaled by
+constexpr double kNoiseSec    = 10.0;    // the quadrature rail's variance, averaged
+constexpr double kDcSec       = 1.0;     // what is taken off m before the BCD demod
+// The subcarrier's long-run phase against the 100 Hz mixer, averaged this
+// long: what steadies each second's own (processSecond).
+constexpr double kBcdPhaseSec = 20.0;
+
+// ---- Tick timer (see TickTimer). -------------------------------------------
+constexpr double kTickSec       = 0.005;   // WWV: 5 cycles of 1000 Hz; WWVH: 6 of 1200
+constexpr double kTickTrackSec  = 0.015;   // half-width of the lags searched when locked
+constexpr double kTickAcqSec    = 0.030;   // ... and while acquiring
+constexpr double kTickAlpha     = 1.0 / 16.0;
+// Averaged-correlation SNR (power, linear) to lock, to hold, and to move the
+// prediction at all. 14 dB at lock puts the edge within a few samples; 10 dB
+// holds it through a fade without letting noise walk it.
+// Until locked, the prediction moves only on a lock-grade apex: a noise peak
+// that wins one second would carry the average's edge of the window with it.
+constexpr double kTickLockSnr   = 25.0;
+constexpr double kTickHoldSnr   = 10.0;
+constexpr int    kTickMissLimit = 10;
+// Seconds averaged before a lock: the largest of 700 lags of a thin average
+// is noise far more often than the largest of a thick one.
+constexpr int    kTickMinSecs   = 8;
+// The step between seconds, once locked: the slope of the timed edges over the
+// last two minutes, from ten seconds of them on, and nominal again when the
+// lock goes -- a period learned from noise must not outlive it. A loop on each
+// second's move was tried and wandered by tens of ppm: those moves are a
+// sixteen-second average's, not a second's, and summing them walks.
+constexpr std::size_t kTickRateSecs = 120;
+constexpr std::size_t kTickRateMin  = 10;
+// Locked, the tick moves by the receiver's clock error and the ionosphere's
+// drift, both steady from one second to the next; a move this far from the
+// recent ones is noise. (Not from zero: until the slope is known, a receiver
+// tens of ppm off moves the average several samples a second, every second.)
+constexpr double kTickMaxStep   = 3.0;
+constexpr double kTickStepAlpha = 0.5;
+constexpr double kTickMaxPpm    = 200.0;
+// A second whose correlation 10-20 ms after the edge -- inside NIST's protected
+// zone, where nothing is sent -- is this much of the edge's own is not a tick:
+// the 800 ms minute or hour tone.
+constexpr double kToneRatio     = 0.3;
+// Nothing else is sent at the tick's frequency within 10 ms before it or 25 ms
+// after (NIST's protected zone), so a real tick's average stands alone: its
+// apex this far above anything more than 1.5 tick lengths away. A profile that
+// is broad or has rivals -- the other station's minute tone, a carrier that is
+// not WWV's -- is not a tick.
+constexpr double kTickIsolation = 4.0;
+constexpr double kBcdCheckAlpha = 1.0 / 32.0;
+
 // ---- Transposed Direct-Form-II biquad (RBJ cookbook coefficients). ---------
 // MSVC <cmath> does not define M_PI without _USE_MATH_DEFINES; repo core
 // convention is a local constant (Biquad/ClientEq/ClientPhaseRotator).
@@ -163,12 +272,127 @@ Biquad designLowpass(double fc, double q, double fs) {
     return bq;
 }
 
+// A low-pass biquad's group delay at DC, in samples: one for the symmetric
+// numerator, less the denominator's.
+double dcDelaySamples(const Biquad& b) {
+    return 1.0 - (b.a1 + 2.0 * b.a2) / (1.0 + b.a1 + b.a2);
+}
+
+using cd = std::complex<double>;
+
+// One station's seconds tick, timed.
+//
+// The tick is a 5 ms burst, and in m (coherent AM) it is exactly the waveform
+// NIST sends: a sinusoid at 1000 or 1200 Hz with a rectangular envelope,
+// starting on the second. Correlated against e^{-jwt} over those 5 ms, the
+// magnitude is a triangle 10 ms wide whose apex is the start of the burst --
+// symmetric, so any linear-phase filtering of the whole signal leaves it where
+// it is, and the phase along it turns at w, which is the whole of the
+// waveform's fine structure.
+//
+// One second's correlation is noisy. The profile around the predicted edge is
+// averaged across seconds, coherently: the tick has the same phase against the
+// carrier every second, so a weak tick adds up as signal and the noise as its
+// root. That needs every second's profile on the SAME footing, to a fraction of
+// a sample, which is what the prediction x is for: the template is shifted by
+// x's fraction of a sample (its first and last taps weighted by it, its phase
+// turned by it), so each profile is taken exactly relative to x. Then the
+// average's apex is how far x is from the tick, x moves there, and the average
+// is moved with it (shift). The step from second to second is followed as well
+// (period), so a receiver whose sample clock is tens of ppm off stays aligned.
+//
+// The apex is found by fitting a line to each side of the triangle, on the
+// average projected onto its own phase, and intersecting them: every lag of
+// the 10 ms carries evidence, and a real value has no Rayleigh floor.
+struct TickTimer {
+    double hz = 1000.0;
+    double w = 0.0;            // rad per sample
+    int L = 60;                // template length, samples
+    int W = 180;               // lags searched each side when locked
+    int Wacq = 360;            // ... and the profile's half-width
+    std::vector<cd> tpl;       // e^{-j w t}, t = 0..L
+    double wo = 0.0;           // the other station's tick, rad per sample
+    std::vector<cd> tplO;      // ... and its template
+    std::vector<cd> avg;       // 2*Wacq+1 lags, lag 0 at x
+    std::vector<cd> cur;       // this second's profile
+    // The same lags against the OTHER station's tick. At full overlap the two
+    // are orthogonal (200 Hz over 5 ms is one whole cycle), but part-way on
+    // they are not: a strong WWVH tick puts a bump in WWV's profile 2.5 ms off
+    // its own edge, a third of its height. Where the other template explains
+    // a lag better than this one, it is the other station there, not this one.
+    std::vector<cd> avgO, curO;
+    double varAvg = 0.0;       // noise variance of one lag of avg (complex)
+    int n = 0;                 // seconds in the average
+    bool active = false;
+    double x = 0.0;            // this second's predicted edge, m index
+    double period = 12000.0;   // samples a second
+    double nominal = 12000.0;
+    bool locked = false;
+    int miss = 0;
+    double stepRef = 0.0;      // recent accepted moves, averaged
+    std::int64_t tickCount = 0;                          // seconds timed, for the slope
+    std::deque<std::pair<double, double>> hist;          // (second, edge) while locked
+    double snr = 0.0;          // averaged, power, at the apex
+    double edge = 0.0;         // the timed edge after this second's update
+
+    void init(double f, double other, int fs) {
+        hz = f;
+        w = 2.0 * 3.14159265358979323846 * f / fs;
+        wo = 2.0 * 3.14159265358979323846 * other / fs;
+        L = static_cast<int>(std::lround(kTickSec * fs));
+        W = static_cast<int>(std::lround(kTickTrackSec * fs));
+        Wacq = static_cast<int>(std::lround(kTickAcqSec * fs));
+        tpl.resize(static_cast<std::size_t>(L + 1));
+        tplO.resize(static_cast<std::size_t>(L + 1));
+        for (int t = 0; t <= L; ++t) {
+            tpl[static_cast<std::size_t>(t)] = std::polar(1.0, -w * t);
+            tplO[static_cast<std::size_t>(t)] = std::polar(1.0, -wo * t);
+        }
+        avg.assign(static_cast<std::size_t>(2 * Wacq + 1), cd(0.0, 0.0));
+        cur.assign(avg.size(), cd(0.0, 0.0));
+        avgO.assign(avg.size(), cd(0.0, 0.0));
+        curO.assign(avg.size(), cd(0.0, 0.0));
+        nominal = period = fs;
+        reset();
+    }
+    void reset() {
+        std::fill(avg.begin(), avg.end(), cd(0.0, 0.0));
+        std::fill(avgO.begin(), avgO.end(), cd(0.0, 0.0));
+        varAvg = 0.0; n = 0; active = false; locked = false; miss = 0; snr = 0.0; stepRef = 0.0;
+        hist.clear();
+        period = nominal;
+    }
+    cd& at(std::vector<cd>& v, int lag) { return v[static_cast<std::size_t>(lag + Wacq)]; }
+
+    // Move the average by e samples: avg(l) <- avg(l + e). Taken off its
+    // carrier ramp first, what is left is the triangle times a constant phase,
+    // which linear interpolation moves exactly along each side.
+    void shift(double e) {
+        if (e == 0.0) return;
+        shiftOne(avg, w, e);
+        shiftOne(avgO, wo, e);
+    }
+    void shiftOne(std::vector<cd>& v, double wr, double e) {
+        std::vector<cd> out(v.size(), cd(0.0, 0.0));
+        for (int l = -Wacq; l <= Wacq; ++l) {
+            const double s = l + e;
+            const int i0 = static_cast<int>(std::floor(s));
+            const double f = s - i0;
+            if (i0 < -Wacq || i0 + 1 > Wacq) continue;
+            const cd b0 = at(v, i0) * std::polar(1.0, -wr * i0);
+            const cd b1 = at(v, i0 + 1) * std::polar(1.0, -wr * (i0 + 1));
+            out[static_cast<std::size_t>(l + Wacq)] = ((1.0 - f) * b0 + f * b1) * std::polar(1.0, wr * s);
+        }
+        v.swap(out);
+    }
+};
+
 } // namespace
 
 // ---------------------------------------------------------------------------
 
 struct WwvDecoder::Impl {
-    explicit Impl(int sampleRateHz);
+    Impl(int sampleRateHz, double carrierOffsetHz);
 
     // Public-surface state.
     int fs;
@@ -180,22 +404,56 @@ struct WwvDecoder::Impl {
     // Callbacks (owned by the outer WwvDecoder; copied pointers here).
     WwvDecoder* owner = nullptr;
 
-    // --- Streaming front-end filters (preallocated, no per-sample alloc). ---
-    std::array<Biquad, 2> bpMain;    // analytic bandpass 700-1300 Hz
-    std::array<Biquad, 2> lpEnv;     // envelope smoothing
+    // --- Carrier search (once found, repeated only if no tick follows). -----
+    double fNominal = 0.0;           // where the dial puts the carrier, Hz
+    bool carrierFound = false;
+    std::int64_t carrierFoundAt = 0; // samplesConsumed when it was
+    int searchDecim = 20;
+    double sAccR = 0.0, sAccI = 0.0; int sAccN = 0;
+    double sOscR = 1.0, sOscI = 0.0, sStepR = 1.0, sStepI = 0.0; int sRenorm = 0;
+    std::vector<cd> searchBuf;       // kSearchSec at kSearchRate
+    float carrierSnrDb = std::numeric_limits<float>::quiet_NaN();
+
+    // --- Mixer, reference, coherent AM. -------------------------------------
+    double f0 = 0.0;                 // carrier, Hz in the baseband
+    double oscR = 1.0, oscI = 0.0, stepR = 1.0, stepI = 0.0; int oscRenormZ = 0;
+    std::array<Biquad, 2> refI, refQ;
+    int refDelay = 0;                // z is delayed this many samples to meet c
+    std::vector<cd> zLine; std::int64_t zMask = 0;
+    double level = 0.0;              // <|c|^2>
+    double qVar = 0.0;               // variance of the quadrature rail
+    double aLevel = 0.0, aNoise = 0.0, aDc = 0.0;
+    double mDc = 0.0;
+    int freqCount = 0;
+    cd freqPrev{0.0, 0.0};
+
+    // m, kept for the tick timers: index = the input sample it stands for.
+    std::vector<float> mRing, qRing; std::int64_t mMask = 0;
+    std::int64_t mHead = -1;         // newest m index written
+
+    // --- BCD and tick-rail front end (runs on m). ---------------------------
     std::array<Biquad, 2> lpI;       // 25 Hz LPF, in-phase rail
     std::array<Biquad, 2> lpQ;       // 25 Hz LPF, quadrature rail
-    std::array<Biquad, 2> bpTickV;   // WWV  tick band (2000 Hz)
-    std::array<Biquad, 2> bpTickH;   // WWVH tick band (2200 Hz)
+    std::array<Biquad, 2> bpTickV;   // WWV  tick band (1000 Hz)
+    std::array<Biquad, 2> bpTickH;   // WWVH tick band (1200 Hz)
 
     // 100 Hz quadrature oscillator (running rotation — no per-sample trig).
     double oscC = 1.0, oscS = 0.0, rotC = 1.0, rotS = 0.0;
     int oscRenorm = 0;
+    // The subcarrier's phase against it (see kBcdPhaseSec).
+    cd bcdPhase{0.0, 0.0};
+    double aBcdPhase = 0.0;
 
     // Decimation accumulators.
-    double accA = 0.0, accTickV = 0.0, accTickH = 0.0;
+    double accI = 0.0, accQ = 0.0, accTickV = 0.0, accTickH = 0.0;
     int decCount = 0;
     std::int64_t n200 = 0;           // count of 200 Hz series samples emitted
+
+    // --- Tick timers, one per station. ---------------------------------------
+    TickTimer timerV, timerH;
+    bool tickTiming = false;         // the last second's edge came from a tick
+    double bcdMinusTick = std::numeric_limits<double>::quiet_NaN();   // samples
+    int bcdCheckN = 0;
 
     // Tick-phase fold (mod 1 s). Station is tagged by folded IMPULSIVENESS
     // (peak-to-mean of each tick band), not total energy: WWV voice
@@ -242,7 +500,7 @@ struct WwvDecoder::Impl {
     bool lastLeapWarn = false;        // previous frame's leap-warning bit
 
     // Per-second windowing at 200 Hz.
-    std::array<float, kSecLen> curSec{};
+    std::array<cd, kSecLen> curSec{};
     int curFill = 0;
     bool secStarted = false;
     std::int64_t secStartJ = 0;      // 200 Hz index of current window start
@@ -280,9 +538,15 @@ struct WwvDecoder::Impl {
     void designFilters();
     void buildTemplates();
     void setState(ClockLockState s);
-    void processSample(float x);
-    void onSeriesSample(double a, double tickV, double tickH);
-    void processSecond(std::int64_t startJ, const std::array<float, kSecLen>& w);
+    void setMixer(double f);
+    void searchStep(double xr, double xi);
+    void finishSearch();
+    void processSample(double xr, double xi);
+    void processM(std::int64_t k, double m);
+    void onSeriesSample(cd b, double tickV, double tickH);
+    TickTimer& timingTimer();
+    void timeTick(TickTimer& t, double windowStart, int secOfFrame);
+    void processSecond(std::int64_t startJ, const std::array<cd, kSecLen>& b);
     void classify(const std::array<float, kSecLen>& w, int8_t& sym, float& conf,
                   int& winShift, double& fracShift) const;
     bool leapSecondPossible() const;
@@ -319,9 +583,10 @@ TimeFrameVoter::Config WwvDecoder::Impl::makeVoterConfig() {
     return c;
 }
 
-WwvDecoder::Impl::Impl(int sampleRateHz)
-    : fs(sampleRateHz > 0 ? sampleRateHz : 24000),
-      decim(std::max(1, (sampleRateHz > 0 ? sampleRateHz : 24000) / kSeriesRate)),
+WwvDecoder::Impl::Impl(int sampleRateHz, double carrierOffsetHz)
+    : fs(sampleRateHz > 0 ? sampleRateHz : 12000),
+      decim(std::max(1, (sampleRateHz > 0 ? sampleRateHz : 12000) / kSeriesRate)),
+      fNominal(carrierOffsetHz),
       voter(makeVoterConfig()) {
     designFilters();
     buildTemplates();
@@ -329,23 +594,114 @@ WwvDecoder::Impl::Impl(int sampleRateHz)
 
 void WwvDecoder::Impl::designFilters() {
     double f = static_cast<double>(fs);
-    // Analytic bandpass 700-1300 Hz: pass the 1000 Hz carrier + 900/1100 Hz
-    // subcarrier sidebands, reject the 2000/2200 Hz tick image and out-of-band
-    // noise. Two wide sections keep the sidebands while limiting noise.
-    for (auto& b : bpMain) b = designBandpass(1000.0, 1.0, f);
-    // Envelope smoothing: pass the 100 Hz subcarrier modulation, kill the
-    // rectified-carrier ripple (2000 Hz and up).
-    for (auto& b : lpEnv) b = designLowpass(180.0, 0.70710678, f);
     // Coherent-demod baseband LPF (25 Hz) — matches the prototype's 25 Hz mask.
     for (auto& b : lpI) b = designLowpass(25.0, 0.70710678, f);
     for (auto& b : lpQ) b = designLowpass(25.0, 0.70710678, f);
-    // Tick bands: narrow so 2000 Hz (WWV) and 2200 Hz (WWVH) separate cleanly.
-    for (auto& b : bpTickV) b = designBandpass(2000.0, 12.0, f);
-    for (auto& b : bpTickH) b = designBandpass(2200.0, 12.0, f);
+    // Tick bands, 167 Hz wide as the 2000/2200 Hz pair of the USB decoder was,
+    // so 1000 Hz (WWV) and 1200 Hz (WWVH) separate as those did.
+    for (auto& b : bpTickV) b = designBandpass(1000.0, 6.0, f);
+    for (auto& b : bpTickH) b = designBandpass(1200.0, 7.2, f);
 
     double dth = 2.0 * kPi * 100.0 / f;   // 100 Hz demod rotation per sample
     rotC = std::cos(dth);
     rotS = std::sin(dth);
+
+    // The carrier reference: fourth-order Butterworth, and the delay that
+    // brings z level with it.
+    const double qs[2] = {0.54119610014619698, 1.3065629648763766};
+    double delay = 0.0;
+    for (int s = 0; s < 2; ++s) {
+        refI[static_cast<std::size_t>(s)] = designLowpass(kRefHz, qs[s], f);
+        refQ[static_cast<std::size_t>(s)] = refI[static_cast<std::size_t>(s)];
+        delay += dcDelaySamples(refI[static_cast<std::size_t>(s)]);
+    }
+    refDelay = static_cast<int>(std::lround(delay));
+    std::int64_t zn = 1;
+    while (zn < refDelay + 2) zn <<= 1;
+    zLine.assign(static_cast<std::size_t>(zn), cd(0.0, 0.0));
+    zMask = zn - 1;
+
+    // m is kept 2.5 s back: a second is timed once its whole window is in,
+    // and the window can sit up to a quarter-second off the tick.
+    std::int64_t mn = 1;
+    while (mn < static_cast<std::int64_t>(2.5 * f)) mn <<= 1;
+    mRing.assign(static_cast<std::size_t>(mn), 0.0f);
+    qRing.assign(static_cast<std::size_t>(mn), 0.0f);
+    mMask = mn - 1;
+
+    aLevel = 1.0 / (kLevelSec * f);
+    aNoise = 1.0 / (kNoiseSec * f);
+    aDc = 1.0 / (kDcSec * f);
+    aBcdPhase = 1.0 / (kBcdPhaseSec * kSeriesRate);
+
+    searchDecim = std::max(1, fs / kSearchRate);
+    const double sdth = -2.0 * kPi * fNominal / f;
+    sStepR = std::cos(sdth); sStepI = std::sin(sdth);
+    searchBuf.clear();
+    searchBuf.reserve(static_cast<std::size_t>(kSearchSec * kSearchRate));
+    setMixer(fNominal);
+
+    timerV.init(1000.0, 1200.0, fs);
+    timerH.init(1200.0, 1000.0, fs);
+}
+
+void WwvDecoder::Impl::setMixer(double f) {
+    f0 = std::clamp(f, fNominal - kPullHz, fNominal + kPullHz);
+    stepR = std::cos(-2.0 * kPi * f0 / fs);
+    stepI = std::sin(-2.0 * kPi * f0 / fs);
+}
+
+// The search: the baseband mixed by the nominal offset, block-averaged down to
+// 600 Hz (the carrier +/- 50 Hz is all that is wanted of it), kSearchSec of
+// that, then DFT bins across +/-kPullHz.
+void WwvDecoder::Impl::searchStep(double xr, double xi) {
+    const double zr = xr * sOscR - xi * sOscI;
+    const double zi = xr * sOscI + xi * sOscR;
+    const double nr = sOscR * sStepR - sOscI * sStepI;
+    sOscI = sOscR * sStepI + sOscI * sStepR;
+    sOscR = nr;
+    if (++sRenorm >= 1024) {
+        sRenorm = 0;
+        const double m = std::hypot(sOscR, sOscI);
+        if (m > 0.0) { sOscR /= m; sOscI /= m; }
+    }
+    sAccR += zr; sAccI += zi;
+    if (++sAccN < searchDecim) return;
+    searchBuf.emplace_back(sAccR / sAccN, sAccI / sAccN);
+    sAccR = sAccI = 0.0; sAccN = 0;
+    if (searchBuf.size() >= static_cast<std::size_t>(kSearchSec * kSearchRate)) finishSearch();
+}
+
+void WwvDecoder::Impl::finishSearch() {
+    const double rate = static_cast<double>(fs) / searchDecim;
+    const int nb = static_cast<int>(std::lround(2.0 * kPullHz / kSearchStep)) + 1;
+    std::vector<double> pw(static_cast<std::size_t>(nb));
+    int peak = 0;
+    for (int b = 0; b < nb; ++b) {
+        const double f = -kPullHz + b * kSearchStep;
+        const cd step = std::polar(1.0, -2.0 * kPi * f / rate);
+        cd rot(1.0, 0.0), acc(0.0, 0.0);
+        for (const cd& v : searchBuf) { acc += v * rot; rot *= step; }
+        pw[static_cast<std::size_t>(b)] = std::norm(acc);
+        if (pw[static_cast<std::size_t>(b)] > pw[static_cast<std::size_t>(peak)]) peak = b;
+    }
+    std::vector<double> med = pw;
+    std::nth_element(med.begin(), med.begin() + nb / 2, med.end());
+    const double median = med[static_cast<std::size_t>(nb / 2)];
+    searchBuf.clear();
+    if (median > 0.0) carrierSnrDb = static_cast<float>(10.0 * std::log10(pw[static_cast<std::size_t>(peak)] / median));
+    if (!(median > 0.0) || pw[static_cast<std::size_t>(peak)] < kToneGate * median) return;
+    double f = -kPullHz + peak * kSearchStep;
+    if (peak > 0 && peak + 1 < nb) {
+        const double a = std::sqrt(pw[static_cast<std::size_t>(peak - 1)]);
+        const double b = std::sqrt(pw[static_cast<std::size_t>(peak)]);
+        const double c = std::sqrt(pw[static_cast<std::size_t>(peak + 1)]);
+        const double den = a - 2.0 * b + c;
+        if (den < 0.0) f += kSearchStep * std::clamp(0.5 * (a - c) / den, -0.5, 0.5);
+    }
+    setMixer(fNominal + f);
+    carrierFound = true;
+    carrierFoundAt = samplesConsumed;
 }
 
 void WwvDecoder::Impl::buildTemplates() {
@@ -373,51 +729,280 @@ void WwvDecoder::Impl::setState(ClockLockState s) {
     if (owner && owner->onStateChanged) owner->onStateChanged(s);
 }
 
-void WwvDecoder::Impl::processSample(float x) {
-    ++samplesConsumed;
+void WwvDecoder::Impl::processSample(double xr, double xi) {
+    const std::int64_t n = samplesConsumed++;
 
-    // 1) Analytic bandpass 700-1300 Hz, then rectify + LPF -> AM envelope. The
-    //    envelope carries the 100 Hz subcarrier as a DC + 100 Hz component.
-    double bp = x;
-    for (auto& b : bpMain) bp = b.process(bp);
-    double env = std::fabs(bp);
-    for (auto& b : lpEnv) env = b.process(env);
+    if (!carrierFound) searchStep(xr, xi);
+    else if (!timerV.locked && !timerH.locked && !tickLocked &&
+             n - carrierFoundAt > static_cast<std::int64_t>(kResearchSec * fs)) {
+        carrierFound = false;   // a carrier with no tick after a minute: look again
+    }
 
-    // 2) Coherent 100 Hz demod: mix envelope down by the running quadrature
-    //    oscillator, LPF both rails at 25 Hz, take the magnitude.
-    double i = env * oscC;
-    double q = env * oscS;
+    // 1) Mixer: the carrier to 0 Hz.
+    const double zr = xr * oscR - xi * oscI;
+    const double zi = xr * oscI + xi * oscR;
+    {
+        const double nr = oscR * stepR - oscI * stepI;
+        oscI = oscR * stepI + oscI * stepR;
+        oscR = nr;
+        if (++oscRenormZ >= 1024) {
+            oscRenormZ = 0;
+            const double m = std::hypot(oscR, oscI);
+            if (m > 0.0) { oscR /= m; oscI /= m; }
+        }
+    }
+
+    // 2) The carrier's phase and strength, and z delayed to meet it.
+    double cr = zr, ci = zi;
+    for (auto& b : refI) cr = b.process(cr);
+    for (auto& b : refQ) ci = b.process(ci);
+    zLine[static_cast<std::size_t>(n & zMask)] = cd(zr, zi);
+
+    // 3) Follow the carrier: a residual offset shows as the reference turning.
+    if (++freqCount >= fs) {
+        freqCount = 0;
+        const cd c(cr, ci);
+        if (std::norm(freqPrev) > 0.0 && std::norm(c) > 0.0) {
+            const double dphi = std::arg(c * std::conj(freqPrev));
+            setMixer(f0 + kFreqGain * dphi / (2.0 * kPi));
+        }
+        freqPrev = c;
+    }
+
+    if (n < refDelay) return;
+    const cd zd = zLine[static_cast<std::size_t>((n - refDelay) & zMask)];
+
+    // 4) Coherent AM, scaled by the carrier's average power.
+    const double p = cr * cr + ci * ci;
+    const std::int64_t k = n - refDelay;           // the sample m stands for
+    level += std::max(aLevel, 1.0 / static_cast<double>(k + 1)) * (p - level);
+    const double inv = level > 1e-30 ? 1.0 / level : 0.0;
+    const double m = (zd.real() * cr + zd.imag() * ci) * inv;
+    const double q = (zd.imag() * cr - zd.real() * ci) * inv;
+    qVar += std::max(aNoise, 1.0 / static_cast<double>(k + 1)) * (q * q - qVar);
+    mRing[static_cast<std::size_t>(k & mMask)] = static_cast<float>(m);
+    qRing[static_cast<std::size_t>(k & mMask)] = static_cast<float>(q);
+    mHead = k;
+
+    processM(k, m);
+}
+
+void WwvDecoder::Impl::processM(std::int64_t k, double m) {
+    // 1) Coherent 100 Hz demod: m less its mean (the carrier), mixed down by
+    //    the running quadrature oscillator, both rails at 25 Hz.
+    mDc += std::max(aDc, 1.0 / static_cast<double>(k + 1)) * (m - mDc);
+    const double mb = m - mDc;
+    double i = mb * oscC;
+    double q = mb * oscS;
     for (auto& b : lpI) i = b.process(i);
     for (auto& b : lpQ) q = b.process(q);
-    double a = std::sqrt(i * i + q * q);
 
-    // advance + periodically renormalize the oscillator
     double nc = oscC * rotC - oscS * rotS;
     double ns = oscS * rotC + oscC * rotS;
     oscC = nc; oscS = ns;
     if (++oscRenorm >= 1024) {
         oscRenorm = 0;
-        double m = std::sqrt(oscC * oscC + oscS * oscS);
-        if (m > 0.0) { oscC /= m; oscS /= m; }
+        double r = std::sqrt(oscC * oscC + oscS * oscS);
+        if (r > 0.0) { oscC /= r; oscS /= r; }
     }
 
-    // 3) Tick rails: bandpass around each tick image, rectify.
-    double tv = x, th = x;
+    // 2) Tick rails: bandpass around each station's tick, rectify.
+    double tv = m, th = m;
     for (auto& b : bpTickV) tv = b.process(tv);
     for (auto& b : bpTickH) th = b.process(th);
-    double etv = std::fabs(tv), eth = std::fabs(th);
 
-    // 4) Decimate by block-average to the 200 Hz series (matches prototype).
-    accA += a; accTickV += etv; accTickH += eth;
+    // 3) Decimate by block-average to the 200 Hz series.
+    accI += i; accQ += q; accTickV += std::fabs(tv); accTickH += std::fabs(th);
     if (++decCount >= decim) {
-        double invd = 1.0 / decim;
-        onSeriesSample(accA * invd, accTickV * invd, accTickH * invd);
-        accA = accTickV = accTickH = 0.0;
+        const double invd = 1.0 / decim;
+        const cd b(accI * invd, accQ * invd);
+        // The subcarrier's long-run phase against the mixer (see processSecond).
+        bcdPhase += aBcdPhase * (b - bcdPhase);
+        onSeriesSample(b, accTickV * invd, accTickH * invd);
+        accI = accQ = accTickV = accTickH = 0.0;
         decCount = 0;
     }
 }
 
-void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
+// The timer the second is served from: the tagged station's, WWV until tagged,
+// which is also what the engine's delay model assumes.
+TickTimer& WwvDecoder::Impl::timingTimer() {
+    return station == ClockStation::Wwvh ? timerH : timerV;
+}
+
+void WwvDecoder::Impl::timeTick(TickTimer& t, double windowStart, int secOfFrame) {
+    // Predict. A timer that has lost the windows -- a soft reacquisition cut
+    // them somewhere new -- starts over from the window.
+    if (!t.active || std::fabs(t.x + t.period - windowStart) > 0.25 * fs) {
+        t.reset();
+        t.active = true;
+        t.x = windowStart;
+    } else {
+        t.x += t.period;
+    }
+    ++t.tickCount;   // the slope's time axis: one a second, timed or not
+
+    const int L = t.L, Wa = t.Wacq;
+    const std::int64_t R = std::llround(t.x);
+    const double g = t.x - static_cast<double>(R);   // -0.5 .. 0.5
+    if (R - Wa < mHead - mMask || R + Wa + L + 1 > mHead) return;   // not in the ring
+
+    // This second's profile, lag l meaning an edge at x + l. Each sample
+    // stands for the half-sample either side of it, so the 5 ms from x + l
+    // takes its first tap at 1/2 - g and one more, at L, at 1/2 + g; and the
+    // phase is turned by g. The profile is then taken from x exactly, to a
+    // fraction of a sample.
+    const cd turn = std::polar(1.0, t.w * g);
+    const cd turnO = std::polar(1.0, t.wo * g);
+    const double edgeW = 0.5 + g;
+    auto mAt = [&](std::int64_t i) { return static_cast<double>(mRing[static_cast<std::size_t>(i & mMask)]); };
+    for (int l = -Wa; l <= Wa; ++l) {
+        const std::int64_t s = R + l;
+        cd acc(0.0, 0.0), accO(0.0, 0.0);
+        for (int u = 0; u < L; ++u) {
+            const double v = mAt(s + u);
+            acc += t.tpl[static_cast<std::size_t>(u)] * v;
+            accO += t.tplO[static_cast<std::size_t>(u)] * v;
+        }
+        const double v0 = mAt(s), vL = mAt(s + L);
+        acc += edgeW * (t.tpl[static_cast<std::size_t>(L)] * vL - v0);
+        accO += edgeW * (t.tplO[static_cast<std::size_t>(L)] * vL - v0);
+        t.at(t.cur, l) = acc * turn;
+        t.at(t.curO, l) = accO * turnO;
+    }
+
+    // Not a tick: seconds 29 and 59 have none, second 0 is the 800 ms minute
+    // (or hour) tone, known by frame once anchored and by the tone carrying on
+    // into the protected zone before that.
+    const double lagNoise = L * qVar;   // one lag's noise, complex variance
+    bool exclude = anchored && (secOfFrame == 0 || secOfFrame == 29 || secOfFrame == 59);
+    if (!exclude) {
+        // Judged at this second's own peak (the tone's onset is a peak too, and
+        // its plateau carries on past it), or at the prediction once the
+        // average says where the tick is.
+        int l0 = 0;
+        if (!t.locked) {
+            double best = -1.0;
+            for (int l = -Wa; l <= Wa - 3 * L; ++l) {
+                const double v = std::norm(t.at(t.cur, l));
+                if (v > best) { best = v; l0 = l; }
+            }
+        }
+        const double at0 = std::norm(t.at(t.cur, l0));
+        const double after = 0.5 * (std::norm(t.at(t.cur, std::min(Wa, l0 + 2 * L))) +
+                                     std::norm(t.at(t.cur, std::min(Wa, l0 + 3 * L))));
+        if (at0 > 4.0 * lagNoise && after > kToneRatio * at0) exclude = true;
+    }
+    if (!exclude) {
+        ++t.n;
+        const double a = std::max(1.0 / t.n, kTickAlpha);
+        for (std::size_t i = 0; i < t.avg.size(); ++i) {
+            t.avg[i] += a * (t.cur[i] - t.avg[i]);
+            t.avgO[i] += a * (t.curO[i] - t.avgO[i]);
+        }
+        t.varAvg = (1.0 - a) * (1.0 - a) * t.varAvg + a * a * lagNoise;
+    }
+    if (t.n == 0 || !(t.varAvg > 0.0)) { t.edge = t.x; return; }
+
+    // The apex: the strongest lag within reach, the average projected onto
+    // its phase there, and a line through each side.
+    // Strongest where this station's tick explains the lag better than the
+    // other's does: a leaked bump of the other tick scores below zero.
+    const int reach = (t.locked ? t.W : Wa) - L;
+    int lp = 0;
+    double best = -std::numeric_limits<double>::infinity();
+    for (int l = -reach; l <= reach; ++l) {
+        const double v = std::norm(t.at(t.avg, l)) - std::norm(t.at(t.avgO, l));
+        if (v > best) { best = v; lp = l; }
+    }
+    double theta = std::arg(t.at(t.avg, lp)) - t.w * lp;
+    auto y = [&](int l) { return std::real(t.at(t.avg, l) * std::polar(1.0, -(t.w * l + theta))); };
+    auto fit = [&](int from, int to, double& a0, double& b0) {
+        double sx = 0, sy = 0, sxx = 0, sxy = 0; int cnt = 0;
+        for (int l = from; l <= to; ++l) {
+            const double v = y(l);
+            sx += l; sy += v; sxx += double(l) * l; sxy += l * v; ++cnt;
+        }
+        const double den = cnt * sxx - sx * sx;
+        if (cnt < 2 || den == 0.0) return false;
+        b0 = (cnt * sxy - sx * sy) / den;
+        a0 = (sy - b0 * sx) / cnt;
+        return true;
+    };
+    // The strongest lag is only somewhere on the triangle's top, which on a
+    // weak signal is flat against the noise; the lines are what place it. So
+    // fit around the strongest lag, and if the lines meet elsewhere on the
+    // top, fit again around where they met.
+    const int span = static_cast<int>(0.8 * L);
+    double apex = lp;
+    for (int pass = 0; pass < 2; ++pass) {
+        double aL = 0, bL = 0, aR = 0, bR = 0;
+        if (!(fit(lp - span, lp - 2, aL, bL) && fit(lp + 2, lp + span, aR, bR) && bL > 0.0 && bR < 0.0)) break;
+        const double c = (aR - aL) / (bL - bR);
+        if (std::fabs(c - lp) <= 2.0) { apex = c; break; }
+        if (pass == 1 || std::fabs(c - lp) > span / 3.0) break;
+        lp = static_cast<int>(std::lround(c));
+        if (std::abs(lp) > reach) break;
+        theta = std::arg(t.at(t.avg, lp)) - t.w * lp;
+        apex = lp;
+    }
+    const double peak = y(lp);
+    // The other template, at the apex, is noise alone for a genuine tick of
+    // this station's; anything it holds there counts against it.
+    t.snr = std::max(0.0, peak * peak - std::norm(t.at(t.avgO, lp))) / (0.5 * t.varAvg);
+    // Rivals judged as the apex was: the other station's tick, heard 14 ms
+    // after WWV's on a European path, leaks a bump into this profile that is
+    // no rival -- the other template explains it.
+    double rival = 0.0;
+    for (int l = -Wa; l <= Wa; ++l)
+        if (std::abs(l - lp) > 3 * L / 2)
+            rival = std::max(rival, std::norm(t.at(t.avg, l)) - std::norm(t.at(t.avgO, l)));
+    if (std::norm(t.at(t.avg, lp)) < kTickIsolation * rival) t.snr = 0.0;
+
+    if (!t.locked) {
+        if (t.snr >= kTickLockSnr && t.n >= kTickMinSecs) {
+            t.locked = true; t.miss = 0; t.hist.clear(); t.stepRef = apex;
+        }
+    } else if (t.snr < kTickHoldSnr || std::fabs(apex - t.stepRef) > kTickMaxStep) {
+        // Weak, or a jump no receiver clock makes in a second: hold where the
+        // tick was, and let go only if it goes on.
+        apex = 0.0;
+        if (++t.miss >= kTickMissLimit) { t.locked = false; t.period = t.nominal; t.hist.clear(); }
+    } else {
+        t.miss = 0;
+        t.stepRef += kTickStepAlpha * (apex - t.stepRef);
+    }
+
+    // Move the prediction to the apex and the average with it; then the step
+    // between seconds from the slope of where the tick has been.
+    if (t.locked || (t.snr >= kTickLockSnr && t.n >= kTickMinSecs)) {
+        t.shift(apex);
+        t.x += apex;
+    }
+    if (t.locked && t.miss == 0) {
+        t.hist.emplace_back(static_cast<double>(t.tickCount), t.x);
+        while (t.hist.size() > kTickRateSecs) t.hist.pop_front();
+        if (t.hist.size() >= kTickRateMin) {
+            // Relative to the first point, so the sums stay small.
+            const double s0 = t.hist.front().first, x0 = t.hist.front().second;
+            double sx = 0, sy = 0, sxx = 0, sxy = 0;
+            for (const auto& h : t.hist) {
+                const double u = h.first - s0, v = h.second - x0;
+                sx += u; sy += v; sxx += u * u; sxy += u * v;
+            }
+            const double nn = static_cast<double>(t.hist.size());
+            const double den = nn * sxx - sx * sx;
+            if (den > 0.0) {
+                const double lim = t.nominal * kTickMaxPpm * 1e-6;
+                t.period = std::clamp((nn * sxy - sx * sy) / den, t.nominal - lim, t.nominal + lim);
+            }
+        }
+    }
+    t.edge = t.x;
+}
+
+void WwvDecoder::Impl::onSeriesSample(cd b, double tickV, double tickH) {
+    const double a = std::abs(b);
     const std::int64_t j = n200++;
 
     // Fold each tick band's envelope mod 1 s — leaky, so a stale phase decays
@@ -460,6 +1045,20 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
         for (int d = -1; d <= 1; ++d) e += fold[(arg + d + kSecLen) % kSecLen] - median;
         return std::max(0.0, e);
     };
+    // How far a fold's peak stands above its other bins, in units of their
+    // own spread (the median absolute deviation). On a weak signal the ratio
+    // above cannot pass however long the fold runs -- the noise under every
+    // bin is most of the peak's height too -- but the spread of that noise
+    // shrinks as the fold integrates, and the tick's excess does not.
+    auto foldZ = [](const std::array<double, kSecLen>& fold, int arg) {
+        std::array<double, kSecLen> tmp = fold;
+        std::nth_element(tmp.begin(), tmp.begin() + kSecLen / 2, tmp.end());
+        const double median = tmp[kSecLen / 2];
+        for (double& v : tmp) v = std::fabs(v - median);
+        std::nth_element(tmp.begin(), tmp.begin() + kSecLen / 2, tmp.end());
+        const double mad = 1.4826 * tmp[kSecLen / 2];
+        return mad > 0.0 ? (fold[static_cast<std::size_t>(arg)] - median) / mad : 0.0;
+    };
     auto tickVerdict = [&](double eV, double eH) {
         if (eV >= kStationExcessRatio * eH && eV > 0.0) return ClockStation::Wwv;
         if (eH >= kStationExcessRatio * eV && eH > 0.0) return ClockStation::Wwvh;
@@ -474,7 +1073,8 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
         // noise or voice never clears the ratio gate). The tick phase comes from
         // the band that actually carries the tick -- the larger excess -- not
         // from whichever band looks peakier, which can be the leakage band.
-        if (std::max(rV, rH) > 2.5) {
+        if (std::max(rV, rH) > 2.5 ||
+            (j >= kFoldZMinSecs * kSecLen && std::max(foldZ(foldV, argV), foldZ(foldH, argH)) > kFoldZ)) {
             const double eV = tickExcess(foldV, argV);
             const double eH = tickExcess(foldH, argH);
             tickLocked = true;
@@ -551,14 +1151,14 @@ void WwvDecoder::Impl::onSeriesSample(double a, double tickV, double tickH) {
     if (!tickLocked) return;
 
     // Cut a[] into 1 s windows aligned to the tick phase.
-    bool boundary = (((j - tickPhase) % kSecLen) == 0) && (j >= tickPhase);
+    bool boundary = (((j - tickPhase + kWindowLead) % kSecLen) == 0) && (j + kWindowLead >= tickPhase);
     if (boundary) {
         if (secStarted && curFill == kSecLen) processSecond(secStartJ, curSec);
         curFill = 0;
         secStarted = true;
         secStartJ = j;
     }
-    if (secStarted && curFill < kSecLen) curSec[curFill++] = static_cast<float>(a);
+    if (secStarted && curFill < kSecLen) curSec[curFill++] = b;
 }
 
 void WwvDecoder::Impl::classify(const std::array<float, kSecLen>& w,
@@ -643,7 +1243,26 @@ bool WwvDecoder::Impl::leapSecondPossible() const {
 }
 
 void WwvDecoder::Impl::processSecond(std::int64_t startJ,
-                                     const std::array<float, kSecLen>& w) {
+                                     const std::array<cd, kSecLen>& b) {
+    // The pulse, read as the projection of the 100 Hz demod onto the
+    // subcarrier's phase: a real value, noise and all, where the magnitude
+    // reads the noise as a floor under every sample and loses a weak pulse in
+    // it. NIST starts every pulse on the subcarrier's positive-going zero
+    // crossing, so its phase against the mixer is one value -- but on a
+    // skywave path the modes' 100 Hz envelopes add at their own delays (a
+    // millisecond is 36 degrees of it), and live, from one second to the next,
+    // it swings by 60 degrees and more (K3FEF and M9PSY, 5 MHz, 2026-09-29).
+    // Projected on the long-run phase such a second read as no pulse at all.
+    // So the phase is this second's own -- the whole second summed, which is
+    // well clear of the noise even where its samples are not -- steadied by the
+    // long-run one, which it outweighs when the second is strong and differs.
+    cd sum(0.0, 0.0);
+    for (const cd& v : b) sum += v;
+    const cd ref = sum / static_cast<double>(kSecLen) + bcdPhase;
+    const cd rot = std::abs(ref) > 0.0 ? std::conj(ref) / std::abs(ref) : cd(1.0, 0.0);
+    std::array<float, kSecLen> w{};
+    for (int n = 0; n < kSecLen; ++n) w[static_cast<std::size_t>(n)] = static_cast<float>(std::real(b[static_cast<std::size_t>(n)] * rot));
+
     int8_t sym; float conf; int winShift = 0; double fracShift = 0.0;
     classify(w, sym, conf, winShift, fracShift);
 
@@ -704,8 +1323,26 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
     // the estimate converges on the mean of those shifts -- minus their jitter
     // and 5 ms quantisation.
     const double reportDelay = edgeDelayCount > 0 ? edgeDelayEst : delayEst;
-    const double edgeExact = (static_cast<double>(startJ) + reportDelay - kNominalDelaySamples) * decim;
+    const double bcdEdge = (static_cast<double>(startJ) + reportDelay - kBcdEdgeDelaySamples) * decim;
+
+    // The tick, both stations', and the second served from the tagged one's.
+    // Where it is not locked the BCD edge still frames the second -- the count
+    // of whole seconds needs an edge every second -- but it is not served.
+    const double windowStart = static_cast<double>(startJ + kWindowLead) * decim;
+    timeTick(timerV, windowStart, secOfFrame);
+    timeTick(timerH, windowStart, secOfFrame);
+    const TickTimer& tt = timingTimer();
+    tickTiming = tt.locked;
+    const bool tickSecond = !(anchored && (secOfFrame == 0 || secOfFrame == 29 || secOfFrame == 59));
+    const double edgeExact = tickTiming ? tt.edge : bcdEdge;
     const std::int64_t edgeSample = static_cast<std::int64_t>(std::llround(edgeExact));
+    if (tickTiming && timed && tickSecond) {
+        const double d = bcdEdge - tt.edge;
+        if (std::fabs(d) < 0.1 * fs) {
+            const double a = std::max(1.0 / ++bcdCheckN, kBcdCheckAlpha);
+            bcdMinusTick = bcdCheckN == 1 ? d : bcdMinusTick + a * (d - bcdMinusTick);
+        }
+    }
 
     // Slip detection, BEFORE this second is emitted. The per-frame skeleton
     // check below only runs once a minute, and every second until then would
@@ -739,7 +1376,11 @@ void WwvDecoder::Impl::processSecond(std::int64_t startJ,
         ClockSecondInfo info;
         info.edgeSample = edgeSample;
         info.edgeSampleExact = edgeExact;
-        info.edgeMeasured = timed;
+        // Measured: by the tick when it is timing (not at seconds 0, 29, 59,
+        // which have none -- the tracker's prediction stands there), by the
+        // pulse otherwise. Servable only from the tick.
+        info.edgeMeasured = tickTiming ? tickSecond : timed;
+        info.edgeServable = tickTiming;
         info.symbol = static_cast<ClockSymbol>(sym);
         info.confidence = conf;
         info.secondOfFrame = secOfFrame;
@@ -1037,14 +1678,24 @@ ClockFrameInfo WwvDecoder::Impl::decodeFrame(
 }
 
 void WwvDecoder::Impl::reset() {
-    for (auto& b : bpMain) b.reset();
-    for (auto& b : lpEnv) b.reset();
     for (auto& b : lpI) b.reset();
     for (auto& b : lpQ) b.reset();
     for (auto& b : bpTickV) b.reset();
     for (auto& b : bpTickH) b.reset();
+    for (auto& b : refI) b.reset();
+    for (auto& b : refQ) b.reset();
     oscC = 1.0; oscS = 0.0; oscRenorm = 0;
-    accA = accTickV = accTickH = 0.0; decCount = 0; n200 = 0;
+    accI = accQ = accTickV = accTickH = 0.0; decCount = 0; n200 = 0;
+    carrierFound = false; carrierFoundAt = 0; carrierSnrDb = std::numeric_limits<float>::quiet_NaN();
+    sAccR = sAccI = 0.0; sAccN = 0; sOscR = 1.0; sOscI = 0.0; sRenorm = 0; searchBuf.clear();
+    oscR = 1.0; oscI = 0.0; oscRenormZ = 0; setMixer(fNominal);
+    std::fill(zLine.begin(), zLine.end(), cd(0.0, 0.0));
+    std::fill(mRing.begin(), mRing.end(), 0.0f);
+    std::fill(qRing.begin(), qRing.end(), 0.0f);
+    mHead = -1; level = 0.0; qVar = 0.0; mDc = 0.0; freqCount = 0; freqPrev = cd(0.0, 0.0);
+    bcdPhase = cd(0.0, 0.0);
+    timerV.reset(); timerH.reset(); tickTiming = false;
+    bcdMinusTick = std::numeric_limits<double>::quiet_NaN(); bcdCheckN = 0;
     foldV.fill(0.0); foldH.fill(0.0);
     tickLocked = false; tickPhase = 0;
     tickLockJ = 0; pendingStation = ClockStation::Unknown; pendingCount = 0;
@@ -1067,17 +1718,17 @@ void WwvDecoder::Impl::reset() {
 // ---------------------------------------------------------------------------
 // Public surface.
 
-WwvDecoder::WwvDecoder(int sampleRateHz)
-    : m_impl(std::make_unique<Impl>(sampleRateHz)) {
+WwvDecoder::WwvDecoder(int sampleRateHz, double carrierOffsetHz)
+    : m_impl(std::make_unique<Impl>(sampleRateHz, carrierOffsetHz)) {
     m_impl->owner = this;
 }
 
 WwvDecoder::~WwvDecoder() = default;
 
-void WwvDecoder::process(const float* mono, std::size_t n) {
-    if (!mono) return;
+void WwvDecoder::process(const float* iq, std::size_t frames) {
+    if (!iq) return;
     Impl* d = m_impl.get();
-    for (std::size_t k = 0; k < n; ++k) d->processSample(mono[k]);
+    for (std::size_t k = 0; k < frames; ++k) d->processSample(iq[2 * k], iq[2 * k + 1]);
 }
 
 void WwvDecoder::reset() { m_impl->reset(); }
@@ -1138,6 +1789,14 @@ ClockDecoderDiagnostics WwvDecoder::diagnostics() const {
 
     g.anchored = d.anchored;
     g.badFrameStreak = d.badFrameStreak;
+
+    const TickTimer& tt = d.station == ClockStation::Wwvh ? d.timerH : d.timerV;
+    g.tickTiming = d.tickTiming;
+    g.tickSnrDb = tt.n > 0 && tt.snr > 0.0 ? static_cast<float>(10.0 * std::log10(tt.snr))
+                                            : std::numeric_limits<float>::quiet_NaN();
+    g.bcdMinusTickMs = std::isfinite(d.bcdMinusTick)
+        ? static_cast<float>(d.bcdMinusTick * 1000.0 / d.fs) : std::numeric_limits<float>::quiet_NaN();
+    if (d.carrierFound) g.carrierOffsetHz = static_cast<float>(d.f0 - d.fNominal);
 
     g.framesInWindow = d.voter.frameCount();
     g.windowSize = d.voter.windowSize();

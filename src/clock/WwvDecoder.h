@@ -4,19 +4,26 @@
 // gate-passed reference chain (research/wwv_decode_proto.py).
 // Format facts per the NIST WWV/WWVH time-code table (NIST SP 432).
 //
-// Input contract: 24 kHz mono float32 from a slice tuned USB at
-// (carrier - 1 kHz). In that spectrum the RF carrier is a 1000 Hz audio tone,
-// the 100 Hz BCD subcarrier appears as 900/1100 Hz sidebands, and the WWV
-// 1000 Hz seconds tick images at 2000 Hz (WWVH's 1200 Hz tick at 2200 Hz —
-// which tick band carries energy tags the station).
+// Input contract: complex baseband, interleaved I/Q float32, from an UberSDR
+// "iq" session (12 kHz) with the carrier near carrierOffsetHz -- 0 when the
+// dial is on the carrier. The carrier is found to a fraction of a hertz and
+// followed after, so a receiver a few ppm off costs nothing.
 //
-// Chain: analytic bandpass 700-1300 Hz -> envelope -> coherent 100 Hz demod
-// (25 Hz LPF) -> 200 Hz amplitude series -> tick-phase sync (2000/2200 Hz
-// band) -> per-second matched-filter classify (170/470/770 ms templates at
-// +30 ms; margin = confidence) -> marker frame sync (P markers at seconds
-// 9/19/29/39/49/59; marker-only anchoring is DEGENERATE mod 10 s —
-// disambiguated via the s0 minute-mark subcarrier hole and minute-increment
-// scoring) -> NIST BCD field map -> TimeFrameVoter.
+// Timing is the seconds tick: WWV's 5 ms burst of 1000 Hz, WWVH's of 1200 Hz,
+// which starts ON the second. It is taken from coherent AM (the carrier's own
+// phase as the reference) by a matched filter averaged from second to second,
+// so it is exact to the synthetic test's resolution and has no filter delay to
+// calibrate. The 100 Hz BCD subcarrier gives the time code; its own edge is
+// kept only as a check on the tick (bcdMinusTickMs).
+//
+// Chain: carrier search -> mixer -> 15 Hz carrier reference (delay-matched) ->
+// coherent AM m -> {tick timers at 1000/1200 Hz} + {tick-band fold: coarse
+// tick phase + station tag} + {coherent 100 Hz demod (25 Hz LPF) -> 200 Hz
+// series -> per-second matched-filter classify (170/470/770 ms templates at
+// +30 ms) -> marker frame sync (P markers at seconds 9/19/29/39/49/59;
+// marker-only anchoring is DEGENERATE mod 10 s -- disambiguated via the s0
+// minute-mark subcarrier hole and minute-increment scoring) -> NIST BCD field
+// map -> TimeFrameVoter}.
 //
 // Pure DSP — no Qt (EB1/EB2). Streaming: process() accumulates internally,
 // no whole-file transforms.
@@ -31,15 +38,16 @@ namespace clockdec {
 
 class WwvDecoder {
 public:
-    explicit WwvDecoder(int sampleRateHz = 24000);
+    explicit WwvDecoder(int sampleRateHz = 12000, double carrierOffsetHz = 0.0);
     ~WwvDecoder();
 
     WwvDecoder(const WwvDecoder&) = delete;
     WwvDecoder& operator=(const WwvDecoder&) = delete;
 
-    // Feed mono float32 samples; fires callbacks inline (same thread) as
-    // seconds/frames/time updates become available.
-    void process(const float* mono, std::size_t n);
+    // Feed `frames` complex samples, interleaved I,Q (2*frames floats). Fires
+    // callbacks inline (same thread) as seconds/frames/time updates become
+    // available.
+    void process(const float* iq, std::size_t frames);
 
     void reset();
 

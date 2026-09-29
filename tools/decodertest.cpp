@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -113,6 +114,21 @@ struct Scenario {
     double otherTickAmp = 0.0;
     const char* wantStation = nullptr;
     double tagBySec = -1.0;
+    // WWV/WWVH, which are IQ: where the carrier really is in the baseband and
+    // where the decoder is told it is (the dial's offset), the receiver's
+    // sample clock off by ppm, a second path (delay, amplitude, the two beating
+    // at fadeHz), and NIST's 500/600 Hz tones at 50% outside the protected zone.
+    double carrierHz = 0.0;
+    double nominalHz = 0.0;
+    double ppm = 0.0;
+    double pathMs = 0.0, pathAmp = 0.0, fadeHz = 0.1;
+    bool tones = false;
+    // Edge error allowed, ms, for WWV/WWVH: every measured edge after lock
+    // within this of the truth (after `expectMs`, the multipath's weighted mean).
+    double tolMs = 0.1;
+    double expectMs = 0.0;
+    bool expectNoTiming = false;
+    double meanTolMs = -1.0;       // >= 0: the run's mean edge error within this of expectMs   // no tick of the pinned station on air: nothing served
     const char* note = "";
 };
 
@@ -155,48 +171,108 @@ std::vector<Second> buildSeconds(const Scenario& sc) {
     return secs;
 }
 
+double trueRate(const Scenario& sc) { return sc.rate * (1.0 + sc.ppm * 1e-6); }
+
 std::vector<float> render(const Scenario& sc, const std::vector<Second>& secs) {
     const bool b = sc.kind == Kind::Wwvb;
-    const double tickHz = sc.kind == Kind::Wwvh ? 2200.0 : 2000.0;
     const double lowAmp = std::pow(10.0, -17.0 / 20.0);
     const double lowLen[3] = {0.200, 0.500, 0.800};
     const double pulseLen[3] = {0.170, 0.470, 0.770};
-
-    double peak = b ? 1.0 : 2.3;
-    double sigma = 0.0;
-    if (!std::isnan(sc.snrDb)) {
-        sigma = (1.0 / std::sqrt(2.0)) * std::pow(10.0, -sc.snrDb / 20.0);
-        peak += 4.0 * sigma;
-    }
-    // wwvgen.py scales to int16 at 28000 peak; the decoders see int16 / 32768.
-    const double scale = 28000.0 / peak / 32768.0;
     std::mt19937_64 rng(sc.seed);
     std::normal_distribution<double> gauss(0.0, 1.0);
-
-    const std::size_t n = secs.size() * static_cast<std::size_t>(sc.rate);
-    std::vector<float> out(n);
     const double off = sc.offsetMs / 1000.0;
-    for (std::size_t i = 0; i < n; ++i) {
-        const double t = static_cast<double>(i) / sc.rate - off;
+
+    if (b) {
+        // WWVB is USB audio still: the carrier at 1000 Hz, PWM on its amplitude.
+        double peak = 1.0, sigma = 0.0;
+        if (!std::isnan(sc.snrDb)) {
+            sigma = (1.0 / std::sqrt(2.0)) * std::pow(10.0, -sc.snrDb / 20.0);
+            peak += 4.0 * sigma;
+        }
+        const double scale = 28000.0 / peak / 32768.0;
+        const std::size_t n = secs.size() * static_cast<std::size_t>(sc.rate);
+        std::vector<float> out(n);
+        for (std::size_t i = 0; i < n; ++i) {
+            const double t = static_cast<double>(i) / sc.rate - off;
+            const long long p = static_cast<long long>(std::floor(t));
+            const double tau = t - static_cast<double>(p);
+            const int sym = (p >= 0 && p < static_cast<long long>(secs.size())) ? secs[p].sym : -1;
+            const double amp = (sym >= 0 && tau < lowLen[sym]) ? lowAmp : 1.0;
+            double x = amp * std::sin(2.0 * kPi * 1000.0 * tau);
+            if (sigma > 0.0) x += sigma * gauss(rng);
+            out[i] = static_cast<float>(x * scale);
+        }
+        return out;
+    }
+
+    // WWV/WWVH as the receiver's IQ: AM on a carrier at carrierHz. The
+    // modulation, per NIST SP 432: the 100 Hz subcarrier at 50% from +30 ms for
+    // the pulse's length (none in second 0); the tick, 5 ms of 1000 Hz (WWV) or
+    // 1200 Hz (WWVH) at 80%, starting on the second, except in seconds 29 and
+    // 59; in second 0 instead an 800 ms tone at the tick's frequency.
+    const double tickHz = sc.kind == Kind::Wwvh ? 1200.0 : 1000.0;
+    const double otherHz = tickHz == 1000.0 ? 1200.0 : 1000.0;
+    // The tick's envelope, band-limited as radiod's filter and the
+    // transmitter's audio chain leave it: its edges Gaussian with a 0.1 ms
+    // sigma, nothing of note above 5 kHz. A rectangle sampled as it is would be
+    // aliased, and its edge only findable to the nearest sample.
+    auto tickEnv = [](double tau) {
+        const double k = 1.0 / (std::sqrt(2.0) * 0.0001);
+        if (tau < -0.001 || tau > 0.006) return 0.0;
+        return 0.5 * (std::erf(tau * k) - std::erf((tau - 0.005) * k));
+    };
+    auto mod = [&](double t) {
         const long long p = static_cast<long long>(std::floor(t));
         const double tau = t - static_cast<double>(p);
-        const int sym = (p >= 0 && p < static_cast<long long>(secs.size())) ? secs[p].sym : -1;
-        double x;
-        if (b) {
-            const double amp = (sym >= 0 && tau < lowLen[sym]) ? lowAmp : 1.0;
-            x = amp * std::sin(2.0 * kPi * 1000.0 * tau);
-        } else {
-            double env = 1.0;
-            if (sym >= 0 && tau >= 0.030 && tau < 0.030 + pulseLen[sym])
-                env += 0.5 * std::sin(2.0 * kPi * 100.0 * tau);
-            x = env * std::sin(2.0 * kPi * 1000.0 * tau);
-            if (tau < 0.005) x += 0.8 * std::sin(2.0 * kPi * tickHz * tau);
-            const double otherHz = tickHz == 2000.0 ? 2200.0 : 2000.0;
-            if (sc.otherTickAmp > 0.0 && tau >= 0.015 && tau < 0.020)
-                x += sc.otherTickAmp * std::sin(2.0 * kPi * otherHz * (tau - 0.015));
+        if (p < 0 || p >= static_cast<long long>(secs.size())) return 0.0;
+        const int sym = secs[static_cast<std::size_t>(p)].sym;
+        const int sof = static_cast<int>(((p % 60) + 60) % 60);
+        double m = 0.0;
+        if (sym >= 0 && tau >= 0.030 && tau < 0.030 + pulseLen[sym])
+            m += 0.5 * std::sin(2.0 * kPi * 100.0 * tau);
+        const bool minuteTone = sof == 0 && secs[static_cast<std::size_t>(p)].posix >= 0;
+        if (minuteTone && tau < 0.8) m += 0.8 * std::sin(2.0 * kPi * tickHz * tau);
+        else if (sof != 29 && sof != 59) m += 0.8 * tickEnv(tau) * std::sin(2.0 * kPi * tickHz * tau);
+        // The next second's tick starts rising a few sigma before it.
+        const long long nx = p + 1;
+        const int nsof = static_cast<int>(nx % 60);
+        if (tau > 0.999 && nx < static_cast<long long>(secs.size()) && nsof != 0 && nsof != 29 && nsof != 59)
+            m += 0.8 * tickEnv(tau - 1.0) * std::sin(2.0 * kPi * tickHz * (tau - 1.0));
+        if (sc.otherTickAmp > 0.0 && tau >= 0.015 && tau < 0.020)
+            m += sc.otherTickAmp * std::sin(2.0 * kPi * otherHz * (tau - 0.015));
+        if (sc.tones && tau >= 0.030 && tau < 0.990 && !minuteTone)
+            m += 0.5 * std::sin(2.0 * kPi * ((p / 60) % 2 ? 600.0 : 500.0) * tau);
+        return m;
+    };
+
+    double peak = 2.9 * (1.0 + sc.pathAmp), sigma = 0.0;
+    if (!std::isnan(sc.snrDb)) {
+        // snrDb is carrier over the noise in the whole 12 kHz (or 24 kHz): a
+        // complex sigma per rail such that |noise|^2 averages 10^(-snr/10).
+        sigma = std::sqrt(0.5 * std::pow(10.0, -sc.snrDb / 10.0));
+        peak += 4.0 * sigma;
+    }
+    const double scale = 28000.0 / peak / 32768.0;
+    const double rate = trueRate(sc);
+    const std::size_t n = secs.size() * static_cast<std::size_t>(sc.rate);
+    std::vector<float> out(2 * n);
+    const double phi0 = 0.7 + 0.37 * sc.seed;
+    for (std::size_t i = 0; i < n; ++i) {
+        const double tt = static_cast<double>(i) / rate;
+        const double t = tt - off;
+        double re = (1.0 + mod(t)), im = 0.0;
+        double ph = 2.0 * kPi * sc.carrierHz * tt + phi0;
+        double zr = re * std::cos(ph), zi = re * std::sin(ph);
+        if (sc.pathAmp > 0.0) {
+            const double t2 = t - sc.pathMs / 1000.0;
+            const double ph2 = ph + 2.0 * kPi * sc.fadeHz * tt + 1.9;
+            const double r2 = sc.pathAmp * (1.0 + mod(t2));
+            zr += r2 * std::cos(ph2); zi += r2 * std::sin(ph2);
         }
-        if (sigma > 0.0) x += sigma * gauss(rng);
-        out[i] = static_cast<float>(x * scale);
+        (void)im;
+        if (sigma > 0.0) { zr += sigma * gauss(rng); zi += sigma * gauss(rng); }
+        out[2 * i] = static_cast<float>(zr * scale);
+        out[2 * i + 1] = static_cast<float>(zi * scale);
     }
     return out;
 }
@@ -217,6 +293,10 @@ struct Result {
     const char* station = "?";
     double tickRatioDb = std::numeric_limits<double>::quiet_NaN();   // at the end
     double tagOffAtSec = -1.0;         // first second past tagBySec without the wanted tag
+    double servableAtSec = -1.0;       // first servable edge (WWV: the tick timer locked)
+    double bcdMinusTickMs = std::numeric_limits<double>::quiet_NaN();
+    double tickSnrDb = std::numeric_limits<double>::quiet_NaN();
+    double carrierHz = std::numeric_limits<double>::quiet_NaN();
 };
 
 const char* stationName(ClockStation s) {
@@ -234,12 +314,13 @@ Result run(const Scenario& sc) {
     Result r;
     const std::vector<Second> secs = buildSeconds(sc);
     const std::vector<float> pcm = render(sc, secs);
-    const double rate = sc.rate;
-    const double offSamples = sc.offsetMs / 1000.0 * rate;
+    const double rate = sc.rate;                 // the stream's nominal rate, as Source counts
+    const double trate = sc.kind == Kind::Wwvb ? rate : trueRate(sc);   // its real one
+    const double offSamples = sc.offsetMs / 1000.0 * trate;
     const long long nSecs = static_cast<long long>(secs.size());
 
     auto physIndex = [&](std::int64_t edge) {
-        return std::llround((static_cast<double>(edge) - offSamples) / rate);
+        return std::llround((static_cast<double>(edge) - offSamples) / trate);
     };
     auto truthMs = [&](long long p, long long& ms) {
         if (p < 0 || p >= nSecs || secs[static_cast<std::size_t>(p)].posix < 0) return false;
@@ -287,11 +368,12 @@ Result run(const Scenario& sc) {
     };
     auto onSecond = [&](const ClockSecondInfo& i) {
         const long long p = physIndex(i.edgeSample);
-        const double errMs =
-            (static_cast<double>(i.edgeSample) - (static_cast<double>(p) * rate + offSamples)) /
-            rate * 1000.0;
+        const double at = std::isfinite(i.edgeSampleExact) ? i.edgeSampleExact
+                                                           : static_cast<double>(i.edgeSample);
+        const double errMs = (at - (static_cast<double>(p) * trate + offSamples)) / trate * 1000.0;
+        if (i.edgeServable && r.servableAtSec < 0) r.servableAtSec = at / trate;
         if (seenTime) {
-            if (i.edgeMeasured) {
+            if (i.edgeMeasured && i.edgeServable) {
                 r.edgeErrMs.push_back(errMs);
             } else {
                 ++r.unmeasured;
@@ -327,19 +409,24 @@ Result run(const Scenario& sc) {
     const char* want = sc.wantStation ? sc.wantStation
                      : sc.kind == Kind::Wwv ? "WWV" : sc.kind == Kind::Wwvh ? "WWVH" : "WWVB";
     if (sc.kind != Kind::Wwvb) {
-        WwvDecoder d(sc.rate);
+        WwvDecoder d(sc.rate, sc.nominalHz);
         d.onSecond = onSecond; d.onFrame = onFrame; d.onTime = onTime; d.onStateChanged = onState;
         if (sc.pin) d.pinStation(sc.preset);
         else d.presetStation(sc.preset);
-        for (std::size_t i = 0; i < pcm.size(); i += kChunk) {
-            d.process(pcm.data() + i, std::min(kChunk, pcm.size() - i));
+        const std::size_t frames = pcm.size() / 2;
+        for (std::size_t i = 0; i < frames; i += kChunk) {
+            d.process(pcm.data() + 2 * i, std::min(kChunk, frames - i));
             const double at = static_cast<double>(i) / rate;
             if (sc.tagBySec >= 0.0 && at >= sc.tagBySec && r.tagOffAtSec < 0.0 &&
                 std::string(stationName(d.station())) != want)
                 r.tagOffAtSec = at;
         }
         r.station = stationName(d.station());
-        r.tickRatioDb = d.diagnostics().tickBandRatioDb;
+        const ClockDecoderDiagnostics g = d.diagnostics();
+        r.tickRatioDb = g.tickBandRatioDb;
+        r.bcdMinusTickMs = g.bcdMinusTickMs;
+        r.tickSnrDb = g.tickSnrDb;
+        r.carrierHz = g.carrierOffsetHz;
     }
 
     // (a) + (c); (b) for WWVB here, WWV/WWVH once every run's mean is known.
@@ -354,6 +441,33 @@ Result run(const Scenario& sc) {
         char buf[96];
         std::snprintf(buf, sizeof buf, "%s tag not held at %.0f s", want, r.tagOffAtSec);
         fail(r, buf);
+    }
+    if (sc.kind != Kind::Wwvb) {
+        for (double e : r.edgeErrMs) {
+            if (std::fabs(e - sc.expectMs) > sc.tolMs) {
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "tick edge %+.3f ms, beyond %+.3f +/-%.3f ms",
+                              e, sc.expectMs, sc.tolMs);
+                fail(r, buf);
+                break;
+            }
+        }
+        if (sc.meanTolMs >= 0.0 && !r.edgeErrMs.empty()) {
+            double sum = 0.0;
+            for (double e : r.edgeErrMs) sum += e;
+            const double mean = sum / static_cast<double>(r.edgeErrMs.size());
+            if (std::fabs(mean - sc.expectMs) > sc.meanTolMs) {
+                char buf[96];
+                std::snprintf(buf, sizeof buf, "mean edge %+.3f ms, beyond %+.3f +/-%.3f ms",
+                              mean, sc.expectMs, sc.meanTolMs);
+                fail(r, buf);
+            }
+        }
+        if (sc.expectNoTiming) {
+            if (r.servableAtSec >= 0.0) fail(r, "served a tick that is not the pinned station's");
+        } else if (r.edgeErrMs.empty()) {
+            fail(r, "no tick-timed edge");
+        }
     }
     if (sc.kind == Kind::Wwvb) {
         for (double e : r.edgeErrMs) {
@@ -379,7 +493,70 @@ Stats stats(const std::vector<double>& v) {
 
 } // namespace
 
-int main() {
+// A recording instead of a synthesis: tools/iqrecord's WAV (16-bit I/Q), fed
+// to the decoder as Source feeds it, every second printed as CSV on stdout --
+// the edge's sample index, whether it was measured and servable, the symbol --
+// with the decoder's time events and a diagnostics line every ten seconds, for
+// scripts to take on from there (the recording's capture stamps, the path).
+int decodeWav(const char* path, double carrierOffsetHz) {
+    std::FILE* f = std::fopen(path, "rb");
+    if (!f) { std::fprintf(stderr, "cannot open %s\n", path); return 2; }
+    unsigned char hdr[44];
+    if (std::fread(hdr, 1, 44, f) != 44) { std::fclose(f); return 2; }
+    auto u16 = [&](int o) { return static_cast<unsigned>(hdr[o] | hdr[o + 1] << 8); };
+    auto u32 = [&](int o) { return static_cast<unsigned>(hdr[o] | hdr[o + 1] << 8 | hdr[o + 2] << 16 | hdr[o + 3] << 24); };
+    const int channels = static_cast<int>(u16(22));
+    const int rate = static_cast<int>(u32(24));
+    if (channels != 2 || u16(34) != 16) { std::fprintf(stderr, "%s: want 16-bit stereo I/Q\n", path); return 2; }
+    WwvDecoder d(rate, carrierOffsetHz);
+    std::int64_t consumed = 0;
+    d.onSecond = [&](const ClockSecondInfo& i) {
+        double e = 0.0;
+        for (float v : i.envelope) e += v;
+        if (!i.envelope.empty()) e /= static_cast<double>(i.envelope.size());
+        std::printf("sec,%lld,%.4f,%d,%d,%d,%d,%.3f,%.3f\n", static_cast<long long>(i.edgeSample), i.edgeSampleExact,
+                    i.edgeMeasured ? 1 : 0, i.edgeServable ? 1 : 0, i.secondOfFrame, static_cast<int>(i.symbol),
+                    i.confidence, e);
+    };
+    d.onFrame = [&](const ClockFrameInfo& fr) {
+        std::printf("frame,%lld,%02d:%02d,doy %d,%.2f\n", static_cast<long long>(fr.frameStartSample), fr.hour,
+                    fr.minute, fr.doy, fr.frameConfidence);
+    };
+    d.onTime = [&](const ClockTimeInfo& t) {
+        std::printf("time,%lld,%.4f,20%02d doy %d %02d:%02d,sof %d,q %.2f,%s\n", static_cast<long long>(t.lastEdgeSample),
+                    t.lastEdgeSampleExact, t.year2, t.doy, t.hour, t.minute, t.lastEdgeSecondOfFrame, t.quality,
+                    stationName(t.station));
+    };
+    std::vector<std::int16_t> buf(2 * 2400);
+    std::vector<float> iq(buf.size());
+    double nextDiag = 10.0;
+    for (;;) {
+        const std::size_t got = std::fread(buf.data(), sizeof(std::int16_t), buf.size(), f);
+        if (got < 2) break;
+        for (std::size_t i = 0; i < got; ++i) iq[i] = buf[i] * (1.0f / 32768.0f);
+        d.process(iq.data(), got / 2);
+        consumed += static_cast<std::int64_t>(got / 2);
+        if (static_cast<double>(consumed) / rate >= nextDiag) {
+            nextDiag += 10.0;
+            const ClockDecoderDiagnostics g = d.diagnostics();
+            std::printf("diag,%.0f,state %d,station %s,fold %d,tick %d,tickSNR %.1f,bcd-tick %.2f,carrier %+.2f,"
+                        "tag %.1f,frames %d,q %.2f\n",
+                        static_cast<double>(consumed) / rate, static_cast<int>(d.state()), stationName(d.station()),
+                        g.toneDetected ? 1 : 0, g.tickTiming ? 1 : 0, g.tickSnrDb, g.bcdMinusTickMs,
+                        g.carrierOffsetHz, g.tickBandRatioDb, g.framesInWindow, g.voteQuality);
+        }
+    }
+    std::fclose(f);
+    std::printf("end,%lld,%d\n", static_cast<long long>(consumed), rate);
+    return 0;
+}
+
+int main(int argc, char** argv) {
+    if (argc > 1 && std::string(argv[1]) == "--wav") {
+        if (argc < 3) { std::fprintf(stderr, "usage: %s --wav FILE [CARRIER_OFFSET_HZ]\n", argv[0]); return 2; }
+        return decodeWav(argv[2], argc > 3 ? std::atof(argv[3]) : 0.0);
+    }
+    const char* only = argc > 1 ? argv[1] : nullptr;
     const double kClean = std::numeric_limits<double>::quiet_NaN();
     // 2024-12-31T23:53Z: a leap year's day 366 rolling into 2025 while locked.
     constexpr long long kRollStart = 1735689180;
@@ -404,6 +581,7 @@ int main() {
                     sc.kind = k; sc.rate = rate; sc.offsetMs = off; sc.snrDb = snr;
                     sc.seed = seed++; sc.startUnix = kRollStart; sc.minutes = 10;
                     sc.rolloverUnix = kRollover; sc.note = "rollover";
+                    sc.tolMs = std::isnan(snr) ? 0.01 : 0.4;
                     scs.push_back(sc);
                 }
     }
@@ -421,6 +599,7 @@ int main() {
                     sc.seed = seed++; sc.startUnix = kLeapStart; sc.minutes = 12;
                     sc.leapAfterUnix = kLeapAfter; sc.leapInsert = v.insert;
                     sc.leapWarn = v.warn; sc.allowLeapEdgeWrong = v.allowLeapEdgeWrong;
+                    sc.tolMs = std::isnan(snr) ? 0.01 : 0.4;
                     sc.note = v.note;
                     scs.push_back(sc);
                 }
@@ -433,6 +612,7 @@ int main() {
         Scenario sc;
         sc.kind = k; sc.rate = 12000; sc.offsetMs = 1.29; sc.seed = seed++;
         sc.startUnix = kRollStart; sc.minutes = 10; sc.rolloverUnix = kRollover; sc.note = note;
+        sc.tolMs = 0.02;
         return sc;
     };
     {
@@ -448,6 +628,7 @@ int main() {
     {
         Scenario sc = tagScenario(Kind::Wwvh, "tag: pinned WWV is never judged");
         sc.preset = ClockStation::Wwv; sc.pin = true; sc.wantStation = "WWV"; sc.tagBySec = 0.0;
+        sc.expectNoTiming = true;
         scs.push_back(sc);
     }
     // WWVH's tick at 0.6 of WWV's reads about +1.4 dB here: between the
@@ -469,6 +650,79 @@ int main() {
         scs.push_back(sc);
     }
 
+    // The IQ front end: weak signals, a carrier off where the dial says, a
+    // receiver clock off by tens of ppm, NIST's programme tones, and a second
+    // path. snrDb here is carrier over the noise in the whole 12 kHz.
+    auto iqScenario = [&](Kind k, double snr, const char* note) {
+        Scenario sc;
+        sc.kind = k; sc.rate = 12000; sc.offsetMs = 2.52; sc.snrDb = snr; sc.seed = seed++;
+        sc.startUnix = kRollStart; sc.minutes = 10; sc.rolloverUnix = kRollover; sc.note = note;
+        sc.tolMs = 0.4; sc.meanTolMs = 0.05;
+        return sc;
+    };
+    for (Kind k : {Kind::Wwv, Kind::Wwvh}) {
+        for (double snr : {0.0, -5.0, -10.0}) {
+            Scenario sc = iqScenario(k, snr, "weak");
+            sc.tolMs = snr <= -10.0 ? 1.5 : 0.8;
+            sc.meanTolMs = snr <= -10.0 ? 0.15 : 0.05;
+            scs.push_back(sc);
+        }
+    }
+    {
+        Scenario sc = iqScenario(Kind::Wwv, 3.0, "carrier +23.7 Hz, dial on it");
+        sc.carrierHz = 23.7;
+        scs.push_back(sc);
+    }
+    {
+        Scenario sc = iqScenario(Kind::Wwv, 3.0, "dial 1 kHz below, carrier -8.1 Hz off that");
+        sc.nominalHz = 1000.0; sc.carrierHz = 991.9;
+        scs.push_back(sc);
+    }
+    {
+        Scenario sc = iqScenario(Kind::Wwv, 3.0, "receiver clock +40 ppm");
+        sc.ppm = 40.0;
+        scs.push_back(sc);
+    }
+    for (double ppm : {-60.0, -20.0, 60.0}) for (Kind k : {Kind::Wwv, Kind::Wwvh}) {
+        char* note = new char[40];
+        std::snprintf(note, 40, "receiver clock %+.0f ppm", ppm);
+        Scenario sc = iqScenario(k, 3.0, note);
+        sc.ppm = ppm;
+        // Past any real receiver's clock: the second or two before the slope
+        // is fitted may be off by half a millisecond; the mean may not.
+        if (std::fabs(ppm) >= 60.0) sc.tolMs = 0.6;
+        scs.push_back(sc);
+    }
+    {
+        Scenario sc = iqScenario(Kind::Wwv, 3.0, "500/600 Hz tones at 50%");
+        sc.tones = true;
+        scs.push_back(sc);
+    }
+    {
+        // Two modes 1 ms apart, the second at 0.7, beating at 0.1 Hz. Coherent
+        // AM weights each by its amplitude times the carrier they share: over
+        // a fade cycle 1 and 0.49, so the tick is timed near 0.33 ms, the
+        // modes' power-weighted mean -- but not every second: with the modes
+        // in antiphase the carrier nearly cancels, the second path's weight
+        // goes negative and the edge swings by up to 2 ms. That is what AM
+        // demodulated on a carrier multipath has part-cancelled does; the
+        // average over the fades is what is checked.
+        Scenario sc = iqScenario(Kind::Wwv, 3.0, "two paths 1 ms apart, 0.7");
+        sc.pathMs = 1.0; sc.pathAmp = 0.7; sc.fadeHz = 0.1;
+        sc.expectMs = 0.329; sc.tolMs = 2.5; sc.meanTolMs = 0.3;
+        scs.push_back(sc);
+    }
+
+    if (only) {
+        std::vector<Scenario> keep;
+        for (const Scenario& sc : scs) {
+            char key[160];
+            std::snprintf(key, sizeof key, "%s/%d/%.2f/%s/%s", kindName(sc.kind), sc.rate, sc.offsetMs,
+                          std::isnan(sc.snrDb) ? "clean" : std::to_string(static_cast<int>(sc.snrDb)).c_str(), sc.note);
+            if (std::string(key).find(only) != std::string::npos) keep.push_back(sc);
+        }
+        scs.swap(keep);
+    }
     std::vector<Result> results(scs.size());
     std::atomic<std::size_t> next{0};
     unsigned nThreads = std::max(1u, std::thread::hardware_concurrency());
@@ -488,27 +742,12 @@ int main() {
     std::map<Kind, Stats> stationStats;
     for (auto& kv : all) stationStats[kv.first] = stats(kv.second);
 
-    for (std::size_t i = 0; i < scs.size(); ++i) {
-        const Scenario& sc = scs[i];
-        Result& r = results[i];
-        if (sc.kind != Kind::Wwvb) {
-            const double mu = stationStats[sc.kind].mean;
-            for (double e : r.edgeErrMs) {
-                if (std::fabs(e - mu) > 3.0) {
-                    char buf[96];
-                    std::snprintf(buf, sizeof buf, "edge %+.2f ms is beyond %s mean %+.2f +/-3 ms",
-                                  e, kindName(sc.kind), mu);
-                    fail(r, buf);
-                    break;
-                }
-            }
-        }
-    }
 
     int failed = 0;
-    std::printf("%-4s %-4s %-6s %-6s %-5s | %-6s %-9s %-10s | %-44s | %-14s | %s\n", "res", "stn",
-                "rate", "offset", "snr", "lock", "time ok/X", "label ok/X",
-                "measured edge error, ms (n mean min max)", "tag (tick dB)", "scenario");
+    std::printf("%-4s %-4s %-6s %-6s %-5s | %-6s %-6s %-9s %-10s | %-44s | %-14s | %-22s | %s\n",
+                "res", "stn", "rate", "offset", "snr", "tick", "lock", "time ok/X", "label ok/X",
+                "served edge error, ms (n mean min max)", "tag (tick dB)",
+                "tickSNR bcd-tick carrier", "scenario");
     for (std::size_t i = 0; i < scs.size(); ++i) {
         const Scenario& sc = scs[i];
         const Result& r = results[i];
@@ -519,11 +758,14 @@ int main() {
         char tag[32];
         if (std::isnan(r.tickRatioDb)) std::snprintf(tag, sizeof tag, "%s", r.station);
         else std::snprintf(tag, sizeof tag, "%s %+.1f", r.station, r.tickRatioDb);
-        std::printf("%-4s %-4s %-6d %5.2fms %-5s | %5.0fs %4d/%-4d %5d/%-4d | n=%-4zu %+6.2f %+6.2f %+6.2f "
-                    "unmeas=%-3d | %-14s | %s%s%s\n",
-                    r.pass ? "ok" : "FAIL", kindName(sc.kind), sc.rate, sc.offsetMs, snr,
+        char diag[48] = "";
+        if (sc.kind != Kind::Wwvb)
+            std::snprintf(diag, sizeof diag, "%4.1fdB %+6.2fms %+6.2fHz", r.tickSnrDb, r.bcdMinusTickMs, r.carrierHz);
+        std::printf("%-4s %-4s %-6d %5.2fms %-5s | %5.0fs %5.0fs %4d/%-4d %5d/%-4d | n=%-4zu %+7.3f %+7.3f %+7.3f "
+                    "unmeas=%-3d | %-14s | %-22s | %s%s%s\n",
+                    r.pass ? "ok" : "FAIL", kindName(sc.kind), sc.rate, sc.offsetMs, snr, r.servableAtSec,
                     r.lockAtSec, r.timeGood, r.timeBad, r.labelGood, r.labelBad, s.n, s.mean, s.min,
-                    s.max, r.unmeasured, tag, sc.note, r.pass ? "" : " -- ", r.why.c_str());
+                    s.max, r.unmeasured, tag, diag, sc.note, r.pass ? "" : " -- ", r.why.c_str());
         if (!r.pass) ++failed;
     }
 
@@ -532,13 +774,20 @@ int main() {
         const Stats& s = kv.second;
         std::printf("  %-4s n=%-6zu mean %+7.3f ms  min %+6.2f  max %+6.2f", kindName(kv.first), s.n,
                     s.mean, s.min, s.max);
-        if (kv.first != Kind::Wwvb) {
-            // edge = (window start + shift - kNominalDelaySamples) * decim at a
-            // 200 Hz series: one series sample is 5 ms, so the value that would
-            // put these synthetic edges on truth is 7 + mean / 5.
-            std::printf("  -> synthetic-exact kNominalDelaySamples = %.3f (current 7)", 7.0 + s.mean / 5.0);
-        }
         std::printf("\n");
+    }
+    // The BCD check's own delay: bcd - tick is (the smoothed shift less
+    // kBcdEdgeDelaySamples) at a 200 Hz series, so the value that puts the
+    // synthetic pulse on the tick is the current one plus the mean / 5 ms.
+    std::vector<double> bcd;
+    for (std::size_t i = 0; i < scs.size(); ++i)
+        if (scs[i].kind != Kind::Wwvb && scs[i].pathAmp == 0.0 && std::isfinite(results[i].bcdMinusTickMs))
+            bcd.push_back(results[i].bcdMinusTickMs);
+    if (!bcd.empty()) {
+        const Stats b = stats(bcd);
+        std::printf("  BCD minus tick over %zu runs: mean %+.3f ms (min %+.3f max %+.3f) -> "
+                    "synthetic-exact kBcdEdgeDelaySamples = current + %.3f\n",
+                    b.n, b.mean, b.min, b.max, b.mean / 5.0);
     }
     std::printf("\n%zu scenarios, %d failed\n", scs.size(), failed);
     return failed == 0 ? 0 : 1;

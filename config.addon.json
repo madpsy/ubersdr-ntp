@@ -414,12 +414,11 @@
     //                     Named after the station and carrier if left out.
     //   "url"             the receiver, http:// or https://. Required.
     //
-    //   "carrier_hz"      the TRANSMITTER's carrier (default 10000000). For
-    //                     WWV the dial is derived as 1 kHz below it, which
-    //                     puts the carrier at 1000 Hz audio in USB. The LF
-    //                     carriers -- 60000, 77500, 162000 -- are tuned ON the
-    //                     carrier in IQ mode instead. DO NOT subtract the
-    //                     kilohertz yourself.
+    //   "carrier_hz"      the TRANSMITTER's carrier (default 10000000). Every
+    //                     station is tuned ON its carrier, in IQ mode: WWV
+    //                     and WWVH as much as the LF carriers -- 60000,
+    //                     77500, 162000. A dial_hz 1 kHz below, from the
+    //                     days WWV was taken as USB audio, still works.
     //   "dial_hz"         an explicit dial, for a receiver that needs one.
     //                     0, the default, derives it.
     //

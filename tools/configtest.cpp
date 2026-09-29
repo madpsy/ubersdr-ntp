@@ -493,8 +493,27 @@ void testMinMargin() {
     bool warned = false;
     for (const std::string& w : wwv.ok ? wwv.cfg.warnings : std::vector<std::string>{})
         if (w.find("min_margin") != std::string::npos) warned = true;
-    check("on a WWV source it loads, with a warning that audio is always lossless",
-          wwv.ok && warned, "%s", wwv.why());
+    check("on a WWV source, now IQ, it applies without a warning",
+          wwv.ok && !warned && wwv.cfg.sources[0].minMarginDb == 26, "%s", wwv.why());
+    const Loaded usb = load(R"({"sources":[{"url":"http://r.example","carrier_hz":60000,"dial_hz":59000,"min_margin":26}]})");
+    warned = false;
+    for (const std::string& w : usb.ok ? usb.cfg.warnings : std::vector<std::string>{})
+        if (w.find("min_margin") != std::string::npos) warned = true;
+    check("on WWVB over USB audio it loads, with a warning that audio is always lossless",
+          usb.ok && warned, "%s", usb.why());
+
+    std::printf("\nWWV: IQ on the carrier\n");
+    const Loaded w10 = load(R"({"sources":[{"url":"http://r.example","carrier_hz":10000000}]})");
+    const SourceConfig* s10 = w10.ok && !w10.cfg.sources.empty() ? &w10.cfg.sources[0] : nullptr;
+    check("10 MHz is WWV, IQ, with the dial ON the carrier",
+          s10 && broadcastFor(s10->carrierHz, s10->dialHz) == Broadcast::Wwv &&
+              isIqBroadcast(Broadcast::Wwv) && s10->dialHz == 10000000,
+          "%s", s10 ? std::to_string(s10->dialHz).c_str() : w10.why());
+    const Loaded old = load(R"({"sources":[{"url":"http://r.example","carrier_hz":10000000,"dial_hz":9999000}]})");
+    check("the old USB dial, 1 kHz under, still loads", old.ok, "%s", old.why());
+    const Loaded far = load(R"({"sources":[{"url":"http://r.example","carrier_hz":10000000,"dial_hz":9990000}]})");
+    check("a WWV dial 10 kHz off is refused, and says why",
+          !far.ok && std::string(far.why()).find("dial_hz") != std::string::npos, "%s", far.why());
 }
 
 // A sockaddr for the limiter, from address text.

@@ -469,7 +469,12 @@ std::string renderStatusBlock(const StatusInput& in) {
           << ", tick " << f2(s.toneSnrDb, 1) << " dB"
           << (s.toneDetected ? " (detected)" : " (NOT detected)");
         if (std::isfinite(s.tickBandRatioDb)) {
-            o << ", 2000/2200 Hz " << f2(s.tickBandRatioDb, 1) << " dB";
+            o << ", 1000/1200 Hz " << f2(s.tickBandRatioDb, 1) << " dB";
+        }
+        if (std::isfinite(s.tickSnrDb) || s.tickTiming) {
+            o << ", tick " << (s.tickTiming ? "timed" : "not timed");
+            if (std::isfinite(s.tickSnrDb)) o << " at " << f2(s.tickSnrDb, 1) << " dB";
+            if (std::isfinite(s.bcdMinusTickMs)) o << ", BCD - tick " << f2(s.bcdMinusTickMs, 2) << " ms";
         }
         o
           << ", edge " << (s.phaseLocked ? "locked" : "unlocked");
@@ -863,6 +868,17 @@ json sourceJson(const SourceSnapshot& s, const Combined& combined) {
         d["pm_holding"] = s.pmHolding;
         d["pm_aided_locks"] = s.pmAidedLocks;
         dec["dcf77"] = std::move(d);
+    }
+    if (s.station == "wwv" || s.station == "wwvh" ||
+        (s.station == "unknown" && (std::isfinite(s.tickSnrDb) || s.tickTiming))) {
+        // Timed by the seconds tick, with the BCD pulse's edge as its check.
+        auto num = [](double v) { return std::isfinite(v) ? json(v) : json(nullptr); };
+        json d;
+        d["tick_timing"] = s.tickTiming;
+        d["tick_snr_db"] = num(s.tickSnrDb);
+        d["bcd_minus_tick_ms"] = num(s.bcdMinusTickMs);
+        d["carrier_offset_hz"] = num(s.carrierOffsetHz);
+        dec["wwv"] = std::move(d);
     }
     if (s.station == "allouis" || s.station == "msf") {
         // Allouis is timed by a correlation of each second's whole phase; MSF

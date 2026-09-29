@@ -651,10 +651,10 @@ def main():
                 j = json.loads(body)
                 ok = (len(j.get('sources', [])) == 1
                       and j['sources'][0]['name'] == 'selftest'
-                      and j['sources'][0]['dial_hz'] == 9999000)
+                      and j['sources'][0]['dial_hz'] == 10000000)
             except (ValueError, KeyError, IndexError):
                 pass
-        check('GET /api/status reports the source with a -1 kHz dial', ok, body[:200])
+        check('GET /api/status reports the source with the dial on the carrier', ok, body[:200])
 
         code, body, _ = http_get('/api/sources')
         check('GET /api/sources returns an array',

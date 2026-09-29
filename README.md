@@ -306,22 +306,30 @@ immediately instead of waiting for the next interval.
 ## Tuning is automatic, and not negotiable
 
 Give it the **transmitter's carrier** — `carrier_hz: 10000000` for the 10 MHz
-outlet — and it tunes USB 1 kHz below, with the passband open to 3 kHz. Do not
-subtract the kilohertz yourself. DCF77 is the exception: it is tuned on the
-carrier, as IQ.
+outlet — and it tunes **on the carrier, as IQ ±6 kHz**. Every station is taken
+this way except WWVB given the old 59 kHz dial.
 
 | Station | Carrier | Dial it tunes | Why |
 |---|---|---|---|
-| WWV / WWVH | 2.5, 5, 10, 15 MHz | carrier − 1 kHz | Puts the RF carrier at 1000 Hz audio, the 100 Hz BCD subcarrier at 900/1100 Hz, and the seconds tick at its 2000 Hz (WWV) / 2200 Hz (WWVH) image |
-| WWV only | 20, 25 MHz | carrier − 1 kHz | 25 MHz is an experimental broadcast: real, but intermittent and lower power |
-| WWVB | 60 kHz | 59 kHz | Puts the 60 kHz carrier at ~1000 Hz audio, where the PWM rides on its amplitude |
+| WWV / WWVH | 2.5, 5, 10, 15 MHz | the carrier, IQ ±6 kHz | AM demodulated coherently on the carrier's own phase: the seconds tick (1000 Hz WWV, 1200 Hz WWVH) times the second, the 100 Hz BCD subcarrier gives the time code |
+| WWV only | 20, 25 MHz | the carrier, IQ ±6 kHz | 25 MHz is an experimental broadcast: real, but intermittent and lower power |
+| WWVB | 60 kHz | 60 kHz, IQ (or 59 kHz, USB) | On the carrier as IQ it is MSF or WWVB by the receiver's location; the old 59 kHz dial keeps WWVB over USB audio |
 | DCF77 | 77.5 kHz | 77.5 kHz, **IQ ±6 kHz** | The carrier at 0 Hz in complex baseband, so its phase is there to be read; always lossless |
 
-**The passband must reach 2.2 kHz**, which is why it asks for 0–3 kHz and why
-you should not narrow it. The WWV/WWVH second edge is recovered *entirely* from
-the tick's audio image, and the station tag is decided by which of the 2000/2200
-Hz bands folds to an impulse. A 2.4 kHz SSB filter clips one or both and the
-decoder sits in `acquiring` for ever with `tone_detected: false`.
+**WWV and WWVH are timed by the seconds tick.** NIST puts the second at the
+start of the tick, a 5 ms burst, and a matched filter on it — averaged
+coherently from second to second, on the carrier's phase — puts the edge there
+to a few microseconds on synthetic signals, with no filter delay to calibrate.
+The BCD pulse's own edge is still measured, as `bcd_minus_tick_ms`, but only as
+a check: after the 25 Hz low-pass the time code needs, its edges are tens of
+milliseconds long and where they land depends on the pulse's shape on the air.
+Until the tick is timed the source is not served, even with the minute decoded
+("time code only"). A `dial_hz` 1 kHz under the carrier, from when WWV was taken
+as USB audio, still works: the carrier is then 1 kHz up in the baseband and the
+decoder is told so.
+
+The station tag is decided by which of the 1000/1200 Hz tick bands folds to an
+impulse.
 
 The tag matters beyond the display: it chooses which transmitter the
 propagation delay is modelled from, and WWV and WWVH are 14 ms apart on a

@@ -180,6 +180,14 @@ struct ClockDecoderDiagnostics {
     bool pmHolding = false;
     // PM locks found by the coherent search AM frames, rather than the plain one.
     int pmAidedLocks = 0;
+
+    // WWV/WWVH only (false / NaN from the others): the seconds tick's timer.
+    bool tickTiming = false;   // the served edges are the tick's
+    float tickSnrDb = std::numeric_limits<float>::quiet_NaN();   // its averaged correlation SNR
+    // Where the BCD pulse puts the second less where the tick does, smoothed.
+    // The check the tick timing has, as amMinusPmMs is DCF77's: a steady value
+    // is the pulse's own delay, which the tick does not depend on.
+    float bcdMinusTickMs = std::numeric_limits<float>::quiet_NaN();
 };
 
 // A complete broadcast timestamp decoded from a single frame. minute/hour are

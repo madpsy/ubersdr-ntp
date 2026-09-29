@@ -98,9 +98,8 @@ void usage() {
         "  -c, --config FILE        JSON configuration file (comments allowed)\n"
         "      --source URL@MHZ     A radio source, for a quick run without a config file.\n"
         "                           e.g. --source https://sdr.example.org@10\n"
-        "                           May be repeated. The dial is derived as 1 kHz below\n"
-        "                           the carrier, which is the tuning WWV and WWVH want.\n"
-        "                           The LF carriers are tuned on the carrier as IQ:\n"
+        "                           May be repeated. Every station is tuned ON its\n"
+        "                           carrier as IQ, WWV and WWVH included:\n"
         "                           @0.0775 is DCF77, @0.162 Allouis, and @0.06 MSF or\n"
         "                           WWVB, whichever the receiver is nearer.\n"
         "      --ntp-source HOST    An upstream NTP server, as a second class of source.\n"
@@ -133,10 +132,9 @@ void usage() {
         "  SIGHUP    reopen the log file (for logrotate)\n"
         "  SIGUSR1   write a status block immediately\n"
         "\n"
-        "Tuning is automatic and not negotiable: USB at the carrier minus 1 kHz with the\n"
-        "passband open to 3 kHz. The WWV/WWVH second tick is recovered entirely from its\n"
-        "2000 Hz (WWV) or 2200 Hz (WWVH) audio image, so a narrower filter removes the\n"
-        "only thing the decoder can find a second edge in.\n",
+        "Tuning is automatic and not negotiable: IQ, +/-6 kHz, on the carrier. WWV and\n"
+        "WWVH are timed by their 1000 / 1200 Hz seconds tick, demodulated coherently on\n"
+        "the carrier's own phase.\n",
         kVersion);
 }
 
