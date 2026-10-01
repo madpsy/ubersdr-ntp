@@ -170,7 +170,7 @@ std::string renderStatusBlock(const StatusInput& in) {
     if (in.combined.synchronised) {
         o << "stratum " << in.combined.stratum << " (" << in.combined.refid << "), offset "
           << formatOffsetMs(in.combined.hostOffsetSec) << " to this host"
-          << ", root dispersion " << f2(in.combined.dispersionSec * 1000.0, 1) << " ms";
+          << ", root dispersion " << f2(in.combined.rootDispersionSec * 1000.0, 1) << " ms";
         if (in.combined.rootDelaySec > 0.0) {
             o << ", root delay " << f2(in.combined.rootDelaySec * 1000.0, 1) << " ms";
         }
@@ -598,7 +598,7 @@ json statusJson(const StatusInput& in) {
     served["clock_rate_ppm"] = in.combined.rate * 1e6;
     served["clock_rate_uncertainty_ppm"] = in.combined.rateUncertainty * 1e6;
     served["clock_rate_measured"] = in.combined.rateMeasured;
-    served["root_dispersion_ms"] = in.combined.dispersionSec * 1000.0;
+    served["root_dispersion_ms"] = in.combined.rootDispersionSec * 1000.0;
     {
         json ag = json::array();
         for (const SourceResidual& r : in.combined.residuals) {

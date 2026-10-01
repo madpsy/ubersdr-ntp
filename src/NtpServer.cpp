@@ -487,9 +487,10 @@ void NtpServer::serve(int fd, const std::string& label) {
         // Root delay: zero while the time comes from the radio, and it means it
         // -- there is no NTP path above a radio clock. When the time has failed
         // over to an upstream there IS such a path, and this is its length. The
-        // rest of the error budget is in root dispersion either way.
+        // rest of the error budget is in root dispersion either way, less the
+        // half of the root delay a client adds back (see the Selector).
         put32(out + 4, toShortFormat(c.rootDelaySec));
-        put32(out + 8, toShortFormat(c.dispersionSec));
+        put32(out + 8, toShortFormat(c.rootDispersionSec));
 
         // Reference identifier: four ASCII characters naming the radio station
         // at stratum 1, the upstream server's address above it. Before the

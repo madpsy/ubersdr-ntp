@@ -167,6 +167,11 @@ struct Combined {
     // would need. For display and the API's offset_ms; never used to serve.
     double hostOffsetSec = 0.0;
     double dispersionSec = 0.0; // how far out that could be
+    // The ROOT DISPERSION field as RFC 5905 means it: the error budget less
+    // the half of rootDelaySec a client adds to it itself. Equal to
+    // dispersionSec while the root delay is zero; served on the wire, while
+    // dispersionSec stays the whole figure for everything that shows a ±.
+    double rootDispersionSec = 0.0;
     double ageSec = 0.0;        // since the last contributing measurement
     int used = 0;               // sources that survived the intersection
     int candidates = 0;         // sources that were eligible to be considered
@@ -292,6 +297,7 @@ private:
     double m_lastGoodRateUncertainty = 0.0;
     bool m_lastGoodRateMeasured = false;
     double m_lastGoodDispersion = 0.0;
+    double m_lastGoodRootDispersion = 0.0;
     double m_lastGoodAt = 0.0;
     // When the newest measurement behind that offset was taken. Not the same
     // as m_lastGoodAt, which is refreshed every combine while synchronised:

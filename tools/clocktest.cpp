@@ -465,6 +465,59 @@ void testStratumFromUpstream() {
           "%s", servingClassName(c.serving));
 }
 
+void testRootDispersionFromUpstreams() {
+    std::printf("\nServing from upstreams alone: the path is counted once, not twice\n");
+
+    ClockConfig k;
+    k.secondary = SecondaryMode::Always;
+    Selector sel(3600.0, 15.0, 1, k);
+
+    double now = 1000.0;
+    // Three peers whose dispersion is what NtpClient builds: root distance,
+    // (root delay + round trip)/2 + root dispersion, plus a little jitter.
+    std::vector<SourceSnapshot> snaps;
+    const double rootDelay[3] = {0.012, 0.030, 0.020};
+    const double delay[3] = {0.008, 0.024, 0.016};
+    for (int i = 0; i < 3; ++i) {
+        SourceSnapshot s = peerAt("pool-" + std::to_string(i), now, 0.100 + 0.0005 * i, now);
+        s.ntp.rootDelaySec = rootDelay[i];
+        s.ntp.delaySec = delay[i];
+        s.dispersionSec = (rootDelay[i] + delay[i]) / 2.0 + s.ntp.rootDispersionSec + 0.001;
+        s.weightDispersionSec = delay[i] / 2.0 + 0.001;
+        snaps.push_back(s);
+    }
+    Combined c = sel.combine(snaps, now);
+
+    check("all three peers are used", c.used == 3, "%d", c.used);
+    check("the root delay is the tightest peer's path",
+          std::abs(c.rootDelaySec - 0.020) < 1e-9, "%.1f ms", c.rootDelaySec * 1000.0);
+    // What a client computes from the two fields must be the budget the
+    // selector arrived at -- not that budget plus half the root delay again.
+    const double clientDistance = c.rootDelaySec / 2.0 + c.rootDispersionSec;
+    check("root delay / 2 + root dispersion is the whole budget, once",
+          std::abs(clientDistance - c.dispersionSec) < 1e-9,
+          "%.2f ms vs %.2f ms", clientDistance * 1000.0, c.dispersionSec * 1000.0);
+    check("...so the root dispersion field leaves the path out",
+          c.rootDispersionSec < c.dispersionSec - 0.009,
+          "%.2f ms of %.2f ms", c.rootDispersionSec * 1000.0, c.dispersionSec * 1000.0);
+
+    // Coasting keeps the two apart and grows them together.
+    snaps.clear();
+    c = run(sel, snaps, now, 60.0);
+    check("coasting keeps root delay / 2 + root dispersion equal to the budget",
+          c.serving == ServingClass::Coasting &&
+              std::abs(c.rootDelaySec / 2.0 + c.rootDispersionSec - c.dispersionSec) < 1e-9,
+          "%s, %.2f + %.2f vs %.2f ms", servingClassName(c.serving), c.rootDelaySec * 500.0,
+          c.rootDispersionSec * 1000.0, c.dispersionSec * 1000.0);
+
+    // A radio source in the set means no root delay, and nothing to take out.
+    snaps = {snapshotAt("wwv10", now, 0.100, 0.0, now), peerAt("pool-a", now, 0.100, now)};
+    c = sel.combine(snaps, now);
+    check("with a radio source in the answer the field is the whole budget",
+          c.rootDelaySec == 0.0 && c.rootDispersionSec == c.dispersionSec,
+          "%.2f vs %.2f ms", c.rootDispersionSec * 1000.0, c.dispersionSec * 1000.0);
+}
+
 // --- standby, and the failover ---------------------------------------------
 void testStandbyAndFailover() {
     std::printf("\nSecondary \"standby\": measured continuously, held out until needed\n");
@@ -1381,6 +1434,7 @@ int main() {
     testSelector();
     testAlwaysMode();
     testStratumFromUpstream();
+    testRootDispersionFromUpstreams();
     testStandbyAndFailover();
     testNoOscillation();
     testRefusalIsWithinAClass();

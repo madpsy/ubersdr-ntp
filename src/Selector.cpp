@@ -685,13 +685,24 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         // sources 40 ms apart would produce a result claiming 10 ms. So it is
         // the weighted dispersion plus the spread of the survivors about the
         // combined value — the select dispersion, in NTP's terms.
-        double swd = 0.0, spread = 0.0;
+        // The same sum without each upstream's path to its reference -- the
+        // (root delay + round trip)/2 its root distance carries -- for the root
+        // dispersion field below, which must not contain it.
+        auto pathHalf = [](const Candidate& k) {
+            return k.s->kind == SourceKind::Ntp ? (k.s->ntp.rootDelaySec + k.s->ntp.delaySec) / 2.0
+                                                : 0.0;
+        };
+        double swd = 0.0, swp = 0.0, spread = 0.0;
         for (const Candidate& k : survivors) {
             const double w = k.weight / (k.quality * k.quality);
             swd += w * k.dist;
+            swp += w * std::min(pathHalf(k), k.dist);
             spread = std::max(spread, std::abs(k.offset - offset));
         }
         const double dispersion = (sw > 0.0 ? swd / sw : survivors.front().dist) + spread;
+        const double offPath = dispersion - (sw > 0.0 ? swp / sw
+                                                      : std::min(pathHalf(survivors.front()),
+                                                                 survivors.front().dist));
 
         double newest = 1e9;
         for (const Candidate& k : survivors) {
@@ -798,6 +809,9 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
             c.refidIsAddress = false;
             c.refidAddress = 0;
             c.rootDelaySec = 0.0;
+            // No root delay, so nothing for a client to add: the whole budget,
+            // upstream paths in a mixed set included, belongs in the field.
+            c.rootDispersionSec = dispersion;
         } else {
             // Serving from upstreams alone. RFC 5905 wants the reference's
             // address in the refid above stratum 1, and the root delay is the
@@ -810,6 +824,13 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
             c.refidIsAddress = true;
             c.refidAddress = tightest->s->ntp.addressRefid;
             c.rootDelaySec = tightest->s->ntp.rootDelaySec + tightest->s->ntp.delaySec;
+            // A client takes root distance as root delay / 2 + root dispersion,
+            // so the half path already in every upstream's root distance has to
+            // come out of this field or it is counted twice -- RFC 5905 keeps
+            // delay out of rootdisp for exactly this reason. Never below the
+            // part that is not path: a tightest survivor with a longer path
+            // than the weighted average may only make the total larger.
+            c.rootDispersionSec = std::max(dispersion - c.rootDelaySec / 2.0, offPath);
         }
 
         // Which class the answer came from, for the status page and the log.
@@ -837,6 +858,7 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         m_lastGoodRateUncertainty = c.rateUncertainty;
         m_lastGoodRateMeasured = c.rateMeasured;
         m_lastGoodDispersion = dispersion;
+        m_lastGoodRootDispersion = c.rootDispersionSec;
         m_lastGoodAt = now;
         m_lastGoodMeasuredAt = now - newest;
         m_last = c;
@@ -867,7 +889,9 @@ Combined Selector::combine(const std::vector<SourceSnapshot>& snaps, double now)
         c.rateUncertainty = m_lastGoodRateUncertainty;
         c.rateMeasured = m_lastGoodRateMeasured;
         c.hostOffsetSec = c.offsetSec + daemonMinusRealtime();
-        c.dispersionSec = m_lastGoodDispersion + age * (m_coastDriftPpm * 1e-6 + m_lastGoodRateUncertainty);
+        const double growth = age * (m_coastDriftPpm * 1e-6 + m_lastGoodRateUncertainty);
+        c.dispersionSec = m_lastGoodDispersion + growth;
+        c.rootDispersionSec = m_lastGoodRootDispersion + growth;
         c.ageSec = now - m_lastGoodMeasuredAt;
         // The reference is still the one the last good offset came from: this
         // IS that offset, extrapolated, so naming anything else would attribute
